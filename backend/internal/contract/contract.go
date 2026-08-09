@@ -1,0 +1,479 @@
+// Package contract 定义所有模块的接口契约。
+// 模块间只认接口不认实现，实现位于 internal/<模块名>/ 下。
+package contract
+
+// ──────────────────────────── 基础类型 ────────────────────────────
+
+// FileInfo 文件元数据
+type FileInfo struct {
+	ID            int64  `json:"id"`
+	RelPath       string `json:"relPath"`
+	Size          int64  `json:"size"`
+	Mtime         int64  `json:"mtime"` // 毫秒
+	ContentHash   string `json:"contentHash,omitempty"`
+	DocType       string `json:"docType"` // pdf/docx/txt/md/doc(ignored)
+	IndexStatus   string `json:"indexStatus"`
+	LastError     string `json:"lastError,omitempty"`
+	FirstSeenAt   int64  `json:"firstSeenAt"`
+	LastIndexedAt int64  `json:"lastIndexedAt,omitempty"`
+}
+
+// Chunk 文本分块
+type Chunk struct {
+	ID       int64  `json:"id"`
+	FileID   int64  `json:"fileId"`
+	Seq      int    `json:"seq"`
+	TokenEst int    `json:"tokenEst"`
+	Text     string `json:"text"`
+}
+
+// TagInfo 标签
+type TagInfo struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Source    string `json:"source"` // predefined|auto_generated|user_confirmed
+	Count     int    `json:"count,omitempty"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+// FileTag 文件-标签关联
+type FileTag struct {
+	Name   string `json:"name"`
+	Origin string `json:"origin"` // auto|manual
+}
+
+// TagSuggestion 标签建议
+type TagSuggestion struct {
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	Reason          string `json:"reason,omitempty"`
+	SuggestedByFile int64  `json:"fileId"`
+	RelPath         string `json:"relPath,omitempty"`
+	Status          string `json:"status"` // pending|accepted|rejected
+	CreatedAt       int64  `json:"createdAt"`
+}
+
+// CommitSummary 提交摘要
+type CommitSummary struct {
+	CommitHash  string `json:"commitHash"`
+	Summary     string `json:"summary"`
+	GeneratedAt int64  `json:"generatedAt"`
+}
+
+// CommitInfo 提交信息
+type CommitInfo struct {
+	Hash    string `json:"hash"`
+	Time    int64  `json:"time"`
+	Message string `json:"message"`
+	Author  string `json:"author"`
+}
+
+// CommitFile 单个提交内改动的文件
+type CommitFile struct {
+	Path   string `json:"path"`
+	Status string `json:"status"` // added|modified|deleted
+}
+
+// HeadInfo 当前版本（HEAD）概要
+type HeadInfo struct {
+	Hash         string `json:"hash"`
+	Branch       string `json:"branch,omitempty"` // 当前分支名（无提交时为 master）
+	CountFiles   int    `json:"countFiles"`       // 当前提交树上文件总数
+	ChangedFiles int    `json:"changedFiles"`     // 相对上一提交改动的文件数
+	HasCommits   bool   `json:"hasCommits"`
+}
+
+// QASession 问答会话
+type QASession struct {
+	ID           int64  `json:"id"`
+	CreatedAt    int64  `json:"createdAt"`
+	Mode         string `json:"mode"` // file|global
+	FileID       int64  `json:"fileId,omitempty"`
+	MessageCount int    `json:"messageCount"`
+}
+
+// QAMessage 问答消息
+type QAMessage struct {
+	ID        int64  `json:"id"`
+	SessionID int64  `json:"sessionId"`
+	Role      string `json:"role"` // user|assistant
+	Content   string `json:"content"`
+	Sources   string `json:"sources,omitempty"` // JSON
+	CreatedAt int64  `json:"createdAt"`
+}
+
+// SearchResult 搜索结果项
+type SearchResult struct {
+	FileID        int64     `json:"fileId"`
+	RelPath       string    `json:"relPath"`
+	HitText       string    `json:"hitText"`
+	Score         float64   `json:"score"`
+	Tags          []FileTag `json:"tags"`
+	Mtime         int64     `json:"mtime"`
+	MatchedChunks int       `json:"matchedChunks"`
+}
+
+// TimelineNode 时间线节点
+type TimelineNode struct {
+	Bucket   string         `json:"bucket"`
+	Label    string         `json:"label"`
+	Count    int            `json:"count"`
+	Added    int            `json:"added"`
+	Modified int            `json:"modified"`
+	Deleted  int            `json:"deleted"`
+	Summary  string         `json:"summary,omitempty"`
+	Files    []TimelineFile `json:"files"`
+}
+
+// TimelineFile 时间线文件
+type TimelineFile struct {
+	RelPath    string `json:"relPath"`
+	Mtime      int64  `json:"mtime"`
+	CommitHash string `json:"commitHash,omitempty"`
+}
+
+// StatsMetrics 统计指标
+type StatsMetrics struct {
+	CommitsByDay    []DayCount  `json:"commitsByDay"`
+	FileChanges     FileChanges `json:"fileChanges"`
+	HotFiles        []HotFile   `json:"hotFiles"`
+	HourBuckets     HourBuckets `json:"hourBuckets"`
+	TagDistribution []TagCount  `json:"tagDistribution"`
+	IterationRate   float64     `json:"iterationRate"`
+}
+
+type DayCount struct {
+	Date  string `json:"date"`
+	Count int    `json:"count"`
+}
+
+type FileChanges struct {
+	Added    int `json:"added"`
+	Modified int `json:"modified"`
+	Deleted  int `json:"deleted"`
+}
+
+type HotFile struct {
+	RelPath string `json:"relPath"`
+	Count   int    `json:"count"`
+}
+
+type HourBuckets struct {
+	Morning   int `json:"morning"`
+	Afternoon int `json:"afternoon"`
+	Evening   int `json:"evening"`
+	Night     int `json:"night"`
+}
+
+type TagCount struct {
+	Tag   string `json:"tag"`
+	Count int    `json:"count"`
+}
+
+// Paginated 分页外层
+type Paginated struct {
+	Page     int `json:"page"`
+	PageSize int `json:"pageSize"`
+	Total    int `json:"total"`
+}
+
+// ──────────────────────────── 4.1 IConfig ────────────────────────────
+
+// IConfig 配置管理
+type IConfig interface {
+	Get(key string) (interface{}, error)
+	Set(key string, value interface{}) error
+	Snapshot() map[string]interface{} // 不含 apiKey
+	UpsertSecrets(llmKey, embedKey string) error
+	Workspace() string
+	Migrate() error
+	Relocate(workspace string) error
+	GetMarkitdown() (pythonPath, command, markitdownCmd string)
+}
+
+// ──────────────────────────── 4.2 IEvents ────────────────────────────
+
+// IEvents 极简发布/订阅
+type IEvents interface {
+	Notify(topic string, data interface{})
+	Subscribe(topic string, handler func(data interface{})) func()
+}
+
+// ──────────────────────────── 4.3 IStorage ────────────────────────────
+
+// IStorage 存储接口
+type IStorage interface {
+	// 文件
+	FilesUpsert(f *FileInfo) (int64, error)
+	FilesFindByRelPath(relPath string) (*FileInfo, error)
+	FilesGet(id int64) (*FileInfo, error)
+	FilesList(status, tag string, page, pageSize int, sortOrder string) ([]*FileInfo, int, error)
+	FilesMarkStatus(id int64, status, lastError string) error
+	FilesRetryStatus(id int64) error // 将 failed 重置为 pending，供用户手动重试
+
+	// 分块
+	ChunksReplaceForFile(fileID int64, chunks []*Chunk) error
+	ChunksByFile(fileID int64) ([]*Chunk, error)
+	ChunksGet(id int64) (*Chunk, error)
+
+	// 向量
+	VectorsInsert(chunkID int64, vec []float32, dim int) error
+	VectorsDelete(chunkID int64) error
+	VectorsLoadAll() ([]VectorEntry, error)
+	VectorsSearch(queryVec []float32, topK int) ([]VectorEntry, error)
+
+	// 标签
+	TagsList() ([]*TagInfo, error)
+	TagsGetByName(name string) (*TagInfo, error)
+	TagsCreate(name, source string) (int64, error)
+
+	// 文件标签
+	FileTagsReplace(fileID int64, tags []FileTag) error
+	FileTagsListByFile(fileID int64) ([]FileTag, error)
+	FileTagsListByTag(tagID int64) ([]int64, error)
+
+	// 覆盖记录
+	OverridesAppend(fileID int64, tagName, action string) error
+
+	// 建议
+	SuggestionsAdd(name, reason string, suggestedByFile int64) (int64, error)
+	SuggestionsListPending() ([]*TagSuggestion, error)
+	SuggestionsSetStatus(id int64, status string) error
+
+	// 摘要
+	SummariesUpsert(hash, summary string, genAt int64) error
+	SummariesGet(hash string) (*CommitSummary, error)
+
+	// 问答
+	QASessionsCreate(mode string, fileID int64) (int64, error)
+	QASessionsList() ([]*QASession, error)
+	QASessionsDelete(id int64) error
+	QAMessagesAppend(sessionID int64, role, content, sources string, createdAt int64) (int64, error)
+	QAMessagesBySession(sessionID int64) ([]*QAMessage, error)
+
+	// 恢复
+	RecoverPending() error
+
+	// 生命周期
+	Close() error
+}
+
+// VectorEntry 内存向量索引条目
+type VectorEntry struct {
+	ChunkID int64     `json:"chunkId"`
+	Vec     []float32 `json:"vec"`
+	Score   float64   `json:"score,omitempty"`
+}
+
+// ──────────────────────────── 4.4 ILLM ────────────────────────────
+
+type ChatOptions struct {
+	Temperature float64
+	MaxTokens   int
+	JSONMode    bool
+}
+
+// ILLM 模型网关
+type ILLM interface {
+	Chat(system, user string, opts *ChatOptions) (string, error)
+	ChatJSON(system, user, schemaDesc string, result interface{}) error
+	Embed(texts []string) ([][]float32, error)
+	TestChat() error
+	TestEmbed() error
+}
+
+// ──────────────────────────── 4.5 IGit ────────────────────────────
+
+type DiffStat struct {
+	Added    int      `json:"added"`
+	Modified int      `json:"modified"`
+	Deleted  int      `json:"deleted"`
+	Files    []string `json:"files,omitempty"`
+}
+
+// IGit 版本管理
+type IGit interface {
+	EnsureRepo(path string) error
+	Status() (map[string]string, error)              // relPath → code（??/M/D/A）
+	CommitAuto(files []string) (string, bool, error) // hash, skipped, err
+	CommitManual(message string) (string, error)
+	Log() ([]*CommitInfo, error)
+	DiffStats(hash string) (*DiffStat, error)
+	FileHistory(relPath string) ([]*CommitInfo, error)
+	ShowFileAt(relPath, hash string) (string, error)
+	RestoreFile(relPath, hash string) error
+	Head() (*HeadInfo, error)                       // 当前版本概要
+	CommitFiles(hash string) ([]*CommitFile, error) // 提交改动的文件明细
+}
+
+// ──────────────────────────── 4.6 IWatch ────────────────────────────
+
+type FileChange struct {
+	Added    []string `json:"added"`
+	Modified []string `json:"modified"`
+	Removed  []string `json:"removed"`
+}
+
+// IWatch 文件监视
+type IWatch interface {
+	Start() error
+	Stop() error
+	Pause() error
+	Resume() error
+	Changes() <-chan *FileChange
+}
+
+// ──────────────────────────── 4.7 IExtract ────────────────────────────
+
+type ProbeResult struct {
+	Ok      bool   `json:"ok"`
+	Message string `json:"message"`
+}
+
+type ExtractResult struct {
+	Text     string `json:"text"`
+	CacheKey string `json:"cacheKey"`
+}
+
+// IExtract 文本提取
+type IExtract interface {
+	Probe(pythonPath, command string) (*ProbeResult, error)
+	ExtractFile(filePath string) (text string, cacheKey string, err error)
+	Cleanup() error
+}
+
+// ───────────────────────────── 4.8 IIndex ─────────────────────────────
+
+// IIndex 索引管理
+type IIndex interface {
+	FullReindex() error
+	Incremental(changed, removed []string) error
+	ProcessFile(file *FileInfo) error
+	DeleteFile(relPath string) error
+	Query(vec []float32, topK int, tagFilter []string) ([]SearchResult, error)
+}
+
+// ──────────────────────────── 4.9 ITag ────────────────────────────
+
+// ITag 标签管理
+type ITag interface {
+	ProcessFile(file *FileInfo) error
+	ManualOverride(fileID int64, add, remove []string) error
+	ListLibrary() ([]*TagInfo, error)
+	ListSuggestions() ([]*TagSuggestion, error)
+	AcceptSuggestion(id int64) error
+	RejectSuggestion(id int64) error
+}
+
+// ───────────────────────────── 4.10 ISearch ─────────────────────────────
+
+// ISearch 搜索
+type ISearch interface {
+	Query(q string, tagFilter []string, page int) ([]*SearchResult, int, error) // results, total, err
+}
+
+// ───────────────────────────── 4.11 ITimeline ─────────────────────────────
+
+type TimelineQuery struct {
+	Granularity string // day|week|month
+	TagFilter   []string
+	From        int64 // 毫秒
+	To          int64
+}
+
+// ITimeline 时间线
+type ITimeline interface {
+	Get(q *TimelineQuery) ([]*TimelineNode, error)
+	NodeDetail(node *TimelineNode) error
+	GenerateSummary(commitHash string) (string, error)
+	SuggestCommitMessage() (string, error) // 根据当前未提交变动生成提交备注建议
+	Restore(relPath, hash string) error
+}
+
+// ───────────────────────────── 4.12 IQA ─────────────────────────────
+
+type QARequest struct {
+	SessionID int64  `json:"sessionId,omitempty"`
+	Mode      string `json:"mode"` // file|global
+	FileID    int64  `json:"fileId,omitempty"`
+	Question  string `json:"question"`
+}
+
+type QAResponse struct {
+	Answer    string     `json:"answer"`
+	Sources   []QASource `json:"sources"`
+	SessionID int64      `json:"sessionId"`
+	Error     string     `json:"error,omitempty"`
+}
+
+type QASource struct {
+	RelPath string `json:"relPath"`
+	Seq     int    `json:"seq"`
+}
+
+// IQA 问答
+type IQA interface {
+	Ask(req *QARequest) (*QAResponse, error)
+	Sessions() ([]*QASession, error)
+	NewSesion(mode string, fileID int64) (int64, error)
+	ClearSesion(id int64) error
+	DeleteSession(id int64) error
+}
+
+// ──────────────────────────── 4.13 IStats ────────────────────────────
+
+type StatsRange struct {
+	Range string `json:"range"` // week|month|quarter|custom
+	From  int64  `json:"from,omitempty"`
+	To    int64  `json:"to,omitempty"`
+}
+
+// IStats 统计
+type IStats interface {
+	Enabled() bool
+	SetEnabled(v bool) error
+	Summary(r *StatsRange) (*StatsMetrics, error)
+	Export(format string, r *StatsRange) (string, error) // 内容 + Content-Type
+	Purge() error
+}
+
+// ──────────────────────────── 4.14 ITaskQueue ────────────────────────────
+
+type Task struct {
+	Type    string      `json:"type"` // extract|tag|summarize|reindex|delete_index
+	Payload interface{} `json:"payload"`
+}
+
+type QueueStatus struct {
+	Running int `json:"running"`
+	Pending int `json:"pending"`
+}
+
+// ITaskQueue 任务队列
+type ITaskQueue interface {
+	Submit(task *Task) error
+	Pause() error
+	Resume() error
+	Status() (*QueueStatus, error)
+	CancelAll() error
+}
+
+// ──────────────────────────── 4.15 ITransport ────────────────────────────
+
+// ITransport 传输适配
+type ITransport interface {
+	Handle(routes map[string]interface{}) error
+	SSE() error
+	Addr() string // 返回监听地址
+	Stop() error
+}
+
+// ──────────────────────────── 4.16 IApp ────────────────────────────
+
+// IApp 应用装配与生命周期
+type IApp interface {
+	Run() error
+	Shutdown()
+	Quit()
+	ShowWindow()
+}

@@ -1,0 +1,36 @@
+# Windows / OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+*.log
+
+# Build outputs
+bin/
+backend/*.exe
+backend/*.test
+backend/coverage.out
+backend/out/
+
+# Backend embed output (copied from frontend/dist by build.bat)
+backend/internal/web/dist/
+
+# App runtime data (.memora/config.json holds API keys / meta.db)
+**/.memora/
+
+# Frontend (see frontend/.gitignore for the rest)
+frontend/node_modules/
+
+# Local tooling
+.claude/settings.local.json
+.meituan-catpaw/
+.reasonix/
+
+# Editor
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

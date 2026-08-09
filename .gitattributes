@@ -1,0 +1,34 @@
+# Normalize text line endings to LF in the repo
+* text=auto
+
+# Windows batch / PowerShell scripts stay CRLF on checkout
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Text files
+*.go text
+*.ts text
+*.vue text
+*.js text
+*.json text
+*.md text
+*.html text
+*.css text
+*.yml text
+*.yaml text
+*.toml text
+
+# Binary files
+*.exe binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.db binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
