@@ -5,17 +5,20 @@ package qa
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"memora/internal/contract"
+	"memora/internal/logx"
 )
 
 // IStorage qa 所需的 storage 接口
 type IStorage interface {
 	FilesGet(id int64) (*contract.FileInfo, error)
+	FilesFindByName(keyword string, limit int) ([]*contract.FileInfo, error)
 	ChunksByFile(fileID int64) ([]*contract.Chunk, error)
 	ChunksGet(id int64) (*contract.Chunk, error)
 	VectorsSearch(queryVec []float32, topK int) ([]contract.VectorEntry, error)
@@ -48,6 +51,9 @@ type Module struct {
 
 // systemPrompt 问答系统提示词（Ask 与 AskStream 共用，精简以减少输入 token）
 const systemPrompt = "你是 Memora 文档问答助手。依据下方 [文件=路径, 段落=序号] 标注的文档片段回答，引用时注明文件路径。用 Markdown 简洁作答（# 标题、- 列表、**加粗**），不要开场白与结束语。若片段中没有答案，直接说明\"根据现有文档，未找到相关信息\"，不要猜测。"
+
+// quotedKeywordRe 提取引号/书名号内文件名关键词（包级复用，避免每次编译，review nit）
+var quotedKeywordRe = regexp.MustCompile(`[“"『「《]([^”"』」》]{1,30})[”"』」》]`)
 
 // fullTextDirectLimit 单文件模式"全文直发"的 rune 上限。
 // 全文 ≤ 此值时直发（小文件保证准确）；超过则走向量检索（大文件保证速度与精准）。
@@ -112,6 +118,11 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 			_ = m.storage.QASessionsDelete(sessionID)
 		}
 		return nil, fmt.Errorf("[qa] 问答失败: %w", err)
+	}
+
+	// 空回答防御：与 AskStream 一致，LLM 返回空/纯空白时给出明确提示（review nit）
+	if strings.TrimSpace(answer) == "" {
+		answer = "（模型未返回内容。请确认文件已成功索引，或换个问法重试。）"
 	}
 
 	// 模型成功后，一次性写入用户与助手消息（避免孤立消息）
@@ -222,6 +233,12 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 
 		answer := sb.String()
 
+		// 空回答防御：LLM 返回空/纯空白时给出明确提示，避免前端出现空气泡
+		// （修复：file 模式文件未索引、上下文为空等情况曾导致 LLM 返回空内容）
+		if strings.TrimSpace(answer) == "" {
+			answer = "（模型未返回内容。请确认文件已成功索引，或换个问法重试。）"
+		}
+
 		// 保存消息（用户 + 助手）
 		m.storage.QAMessagesAppend(sessionID, "user", req.Question, "", time.Now().UnixMilli())
 		sourcesJSON := marshalSources(sources)
@@ -254,6 +271,12 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 		file, err := m.storage.FilesGet(req.FileID)
 		if err != nil || file == nil {
 			return nil, nil, fmt.Errorf("[qa] 文件不存在")
+		}
+
+		// 文件未索引（无分块）：明确提示而非用空上下文调用 LLM。
+		// 修复：此前空 fullText 会进入"全文直发"分支产生空气泡/LLM 返回空。
+		if len(chunks) == 0 {
+			return nil, nil, fmt.Errorf("[qa] 文件尚未索引，无法回答其内容（请在文档索引页确认该文件索引成功）")
 		}
 
 		// 全文 ≤ 直发上限则直发（小文件）；否则向量检索（大文件）
@@ -371,6 +394,48 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 		}
 	}
 
+	// 标题模糊搜索兜底：仅全局模式、语义检索无结果（或结果过少）时，
+	// 按问题中的关键词模糊匹配文件名，把匹配文件的片段作为补充上下文，
+	// 让 AI 至少能定位"哪个文件"（用户需求：AI 对话支持文件内容 + 标题搜索）。
+	// 单文件模式不触发：文件内容已直发/检索，全库标题搜索会混入其他文件（review 发现）。
+	if req.Mode != "file" && len(contextBlocks) < 2 {
+		keyword := extractFilenameKeyword(req.Question)
+		if keyword != "" {
+			matched, err := m.storage.FilesFindByName(keyword, 5)
+			if err != nil {
+				// 标题搜索失败不影响主流程，记录日志便于排查（review 建议）
+				logx.Warn("qa", "标题模糊搜索失败", "keyword", keyword, "err", err.Error())
+			} else {
+				usedRunes := 0
+				for _, f := range matched {
+					chunks, cerr := m.storage.ChunksByFile(f.ID)
+					if cerr != nil || len(chunks) == 0 {
+						continue
+					}
+					// 取该文件前若干分块作为标题匹配上下文（带"标题匹配"标注）
+					limit := 3
+					if len(chunks) < limit {
+						limit = len(chunks)
+					}
+					overLimit := false
+					for i := 0; i < limit; i++ {
+						block := fmt.Sprintf("[文件=%s, 段落=%d, 标题匹配]\n%s", f.RelPath, chunks[i].Seq, chunks[i].Text)
+						usedRunes += utf8.RuneCountInString(block)
+						if usedRunes > m.maxContextChars {
+							overLimit = true
+							break
+						}
+						contextBlocks = append(contextBlocks, block)
+						sources = append(sources, contract.QASource{RelPath: f.RelPath, Seq: chunks[i].Seq})
+					}
+					if overLimit {
+						break // 上下文已超限，不再处理剩余文件（review 建议）
+					}
+				}
+			}
+		}
+	}
+
 	return contextBlocks, sources, nil
 }
 
@@ -401,4 +466,36 @@ func marshalSources(sources []contract.QASource) string {
 		return "[]"
 	}
 	return string(data)
+}
+
+// extractFilenameKeyword 从问题中提取用于文件名模糊搜索的关键词。
+// 优先级：引号/书名号内的文字（如“预算表”、“方案.xlsx”）> 去疑问词后的短语。
+// 提取失败返回空串（不触发标题搜索兜底）。
+func extractFilenameKeyword(question string) string {
+	// 中文引号、英文引号、书名号内的文字优先（用户常这样指代文件）
+	if m := quotedKeywordRe.FindStringSubmatch(question); len(m) > 1 && strings.TrimSpace(m[1]) != "" {
+		return strings.TrimSpace(m[1])
+	}
+
+	// 无引号：去掉常见疑问/指示词后取核心短语（文件名通常在句末）
+	kw := strings.TrimSpace(question)
+	kw = strings.TrimRight(kw, "？?。！!，, ")
+	// 去掉句首引导词
+	for _, prefix := range []string{"帮我看看", "帮我查一下", "帮我查", "看看", "查一下", "这个", "那个", "文件", "关于"} {
+		if strings.HasPrefix(kw, prefix) {
+			kw = strings.TrimSpace(strings.TrimPrefix(kw, prefix))
+			break
+		}
+	}
+	// 若仍含"文件"字样，保留"文件"及其前面的内容（如"会议纪要文件的内容" → "会议纪要文件"），
+	// 文件名主体通常在"文件"之前
+	if idx := strings.Index(kw, "文件"); idx >= 0 {
+		kw = kw[:idx+len("文件")]
+	}
+	// 控制长度：过长关键词模糊匹配几乎必然落空，截取前 12 字
+	runes := []rune(kw)
+	if len(runes) > 12 {
+		runes = runes[:12]
+	}
+	return strings.TrimSpace(string(runes))
 }

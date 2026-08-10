@@ -128,3 +128,132 @@ func TestHeadAndCommitFiles(t *testing.T) {
 		}
 	}
 }
+
+// TestFileHistoryOnlyRealChanges 文件版本只应包含真实改动该文件的提交。
+// 场景：首次提交含 a.txt（未再改动），后续提交只改 b.txt——a.txt 的历史应只有 1 条。
+func TestFileHistoryOnlyRealChanges(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		p := filepath.Join(dir, rel)
+		os.MkdirAll(filepath.Dir(p), 0755)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repo, err := gogit.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := &object.Signature{Name: "Test", Email: "t@test.x", When: time.Now()}
+
+	// 首次提交：a.txt + b.txt
+	write("a.txt", "hello")
+	write("b.txt", "world")
+	wt.Add(".")
+	if _, err := wt.Commit("首次提交", &gogit.CommitOptions{Author: sig}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 后续 3 次提交只改 b.txt（a.txt 始终未变）
+	for i := 0; i < 3; i++ {
+		write("b.txt", "world change "+string(rune('1'+i)))
+		wt.Add(".")
+		if _, err := wt.Commit("改 b", &gogit.CommitOptions{Author: sig}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := New(testCfg{})
+	if err := m.EnsureRepo(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// a.txt 从未改动：历史应只有首次提交 1 条
+	histA, err := m.FileHistory("a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(histA) != 1 {
+		t.Fatalf("a.txt history = %d commits, want 1（未改动文件不应被后续提交计入）", len(histA))
+	}
+
+	// b.txt 改动 4 次（首次+3 次）：历史应为 4 条
+	histB, err := m.FileHistory("b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(histB) != 4 {
+		t.Fatalf("b.txt history = %d commits, want 4", len(histB))
+	}
+}
+
+// TestFileHistoryAddAndDelete 覆盖 PathFilter 边界：文件在非根提交新增、以及删除文件的提交。
+func TestFileHistoryAddAndDelete(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		p := filepath.Join(dir, rel)
+		os.MkdirAll(filepath.Dir(p), 0755)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repo, err := gogit.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := &object.Signature{Name: "Test", Email: "t@test.x", When: time.Now()}
+
+	// 根提交：只有 a.txt
+	write("a.txt", "hello")
+	wt.Add(".")
+	if _, err := wt.Commit("根提交", &gogit.CommitOptions{Author: sig}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第二次提交：新增 c.txt（非根提交新增）
+	write("c.txt", "new file")
+	wt.Add(".")
+	if _, err := wt.Commit("新增 c.txt", &gogit.CommitOptions{Author: sig}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第三次提交：删除 c.txt
+	os.Remove(filepath.Join(dir, "c.txt"))
+	wt.Add(".")
+	if _, err := wt.Commit("删除 c.txt", &gogit.CommitOptions{Author: sig}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(testCfg{})
+	if err := m.EnsureRepo(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// c.txt 非根提交新增 + 删除提交 = 2 条历史
+	histC, err := m.FileHistory("c.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(histC) != 2 {
+		t.Fatalf("c.txt history = %d commits, want 2（新增+删除）", len(histC))
+	}
+
+	// a.txt 从未改动：只有根提交 1 条
+	histA, err := m.FileHistory("a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(histA) != 1 {
+		t.Fatalf("a.txt history = %d commits, want 1", len(histA))
+	}
+}

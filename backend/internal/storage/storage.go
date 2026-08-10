@@ -230,6 +230,40 @@ func (m *Module) FilesGet(id int64) (*contract.FileInfo, error) {
 	return f, nil
 }
 
+// FilesFindByName 按文件名/路径模糊搜索（LIKE 匹配），返回已索引文件。
+// 供 AI 问答的"标题模糊搜索"兜底：语义检索无结果时用文件名匹配定位文件。
+func (m *Module) FilesFindByName(keyword string, limit int) ([]*contract.FileInfo, error) {
+	if keyword == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	// 转义 LIKE 通配符，避免用户输入 % _ 干扰匹配
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(keyword)
+	rows, err := m.db.Query(
+		`SELECT id, rel_path, size, mtime, content_hash, doc_type, index_status, COALESCE(last_error,''), first_seen_at, COALESCE(last_indexed_at,0)
+		 FROM files
+		 WHERE rel_path LIKE '%' || ? || '%' ESCAPE '\' AND index_status='indexed'
+		 ORDER BY last_indexed_at DESC LIMIT ?`,
+		escaped, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("[storage] 按名称搜索文件失败: %w", err)
+	}
+	defer rows.Close()
+
+	files := make([]*contract.FileInfo, 0)
+	for rows.Next() {
+		f := &contract.FileInfo{}
+		if err := rows.Scan(&f.ID, &f.RelPath, &f.Size, &f.Mtime, &f.ContentHash, &f.DocType, &f.IndexStatus, &f.LastError, &f.FirstSeenAt, &f.LastIndexedAt); err != nil {
+			return nil, fmt.Errorf("[storage] 扫描文件行失败: %w", err)
+		}
+		files = append(files, f)
+	}
+	return files, nil
+}
+
 // FilesList 列出文件（支持过滤和分页）
 // sortSpec 文件列表排序规则（排序字段 + 方向）
 type sortSpec struct {

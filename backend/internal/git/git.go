@@ -345,7 +345,10 @@ func (m *Module) diffStatsLocked(hash string) (*contract.DiffStat, error) {
 	return stat, nil
 }
 
-// FileHistory 获取文件的历史提交
+// FileHistory 获取文件的历史提交。
+// 用 PathFilter 仅返回真实改动该文件的提交（与父提交 diff 比较），
+// 修复：此前用 tree.File 判断"提交树中是否存在"会把从未改动的文件
+// 计入每次提交的版本（其他文件改动提交时该文件仍在树中），导致版本列表虚高。
 func (m *Module) FileHistory(relPath string) ([]*contract.CommitInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -354,7 +357,9 @@ func (m *Module) FileHistory(relPath string) ([]*contract.CommitInfo, error) {
 		return nil, fmt.Errorf("[git] 仓库未初始化")
 	}
 
-	iter, err := m.repo.Log(&gogit.LogOptions{})
+	iter, err := m.repo.Log(&gogit.LogOptions{
+		PathFilter: func(p string) bool { return p == relPath },
+	})
 	if err != nil {
 		return nil, fmt.Errorf("[git] 获取日志失败: %w", err)
 	}
@@ -362,20 +367,12 @@ func (m *Module) FileHistory(relPath string) ([]*contract.CommitInfo, error) {
 
 	var commits []*contract.CommitInfo
 	err = iter.ForEach(func(c *object.Commit) error {
-		// 检查该提交是否包含此文件
-		tree, err := c.Tree()
-		if err != nil {
-			return nil // 跳过
-		}
-		_, err = tree.File(relPath)
-		if err == nil {
-			commits = append(commits, &contract.CommitInfo{
-				Hash:    c.Hash.String(),
-				Time:    c.Author.When.UnixMilli(),
-				Message: c.Message,
-				Author:  c.Author.Name,
-			})
-		}
+		commits = append(commits, &contract.CommitInfo{
+			Hash:    c.Hash.String(),
+			Time:    c.Author.When.UnixMilli(),
+			Message: c.Message,
+			Author:  c.Author.Name,
+		})
 		return nil
 	})
 	if err != nil {
