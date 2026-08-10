@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -179,11 +180,16 @@ type chatResponse struct {
 }
 
 // streamResponse 流式聊天响应体
+// delta 为流式增量（标准 OpenAI 格式）；部分兼容端点首块用 message 字段承载完整内容，
+// 或并发返回多个 choice，故均做兼容处理。
 type streamResponse struct {
 	Choices []struct {
 		Delta struct {
 			Content string `json:"content"`
 		} `json:"delta"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
@@ -358,7 +364,6 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 	ch := make(chan string, 16)
 	go func() {
 		defer resp.Body.Close()
-		defer close(ch)
 
 		if resp.StatusCode >= 400 {
 			errBody, _ := io.ReadAll(resp.Body)
@@ -367,59 +372,99 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 			case ch <- "__ERROR__:" + errMsg:
 			case <-cancel:
 			}
+			close(ch)
 			return
 		}
 
 		reader := bufio.NewReader(resp.Body)
-		for {
-			select {
-			case <-cancel:
-				return
-			default:
-			}
+		// receivedDelta 标记是否已收到任何增量内容：用于 message 回退互斥（review 发现：
+		// 非标准端点"首块 message 发完整内容 + 后续 delta 增量"若两者都取会重复拼接）
+		receivedDelta := false
+		// messageFallback 保存首个非增量块的完整 message 内容（仅当整条流无 delta 时使用）
+		var messageFallback string
 
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					// 可能最后一个 data: [DONE]
-					line = strings.TrimSpace(line)
-					if line == "data: [DONE]" {
-						return
-					}
+		readLoop := func() {
+			for {
+				select {
+				case <-cancel:
+					return
+				default:
 				}
-				return
-			}
 
-			line = strings.TrimSpace(line)
-			if line == "" || !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-
-			data := strings.TrimPrefix(line, "data: ")
-			if data == "[DONE]" {
-				return
-			}
-
-			var streamResp streamResponse
-			if err := json.Unmarshal([]byte(data), &streamResp); err != nil {
-				continue
-			}
-
-			if len(streamResp.Choices) > 0 {
-				delta := streamResp.Choices[0].Delta.Content
-				if delta != "" {
-					select {
-					case ch <- delta:
-					case <-cancel:
-						return
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					if err == io.EOF {
+						line = strings.TrimSpace(line)
+						// EOF 时可能带最后一个 data 行（无尾随换行），处理后再结束
+						if line != "" {
+							if err := m.handleStreamLine(line, ch, cancel, &receivedDelta, &messageFallback); err != nil {
+								return
+							}
+						}
 					}
+					return
+				}
+
+				line = strings.TrimSpace(line)
+				if line == "" || !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				if err := m.handleStreamLine(line, ch, cancel, &receivedDelta, &messageFallback); err != nil {
+					return
 				}
 			}
 		}
+
+		// 读流 + 回退补发统一在当前 goroutine：结束点唯一，避免重复 close(ch)
+		readLoop()
+		// 若整条流未收到任何 delta 但存在 message 回退内容，补发一次
+		if messageFallback != "" && !receivedDelta {
+			select {
+			case ch <- messageFallback:
+			case <-cancel:
+			}
+		}
+		close(ch)
 	}()
 
 	return ch, nil
 }
+
+// handleStreamLine 解析一行 SSE data，输出 delta 增量或暂存 message 回退内容。
+// 返回 error 表示应终止读取（取消或解析终止）。
+func (m *Module) handleStreamLine(line string, ch chan<- string, cancel <-chan struct{}, receivedDelta *bool, messageFallback *string) error {
+	data := strings.TrimPrefix(line, "data: ")
+	if data == "[DONE]" {
+		return errStreamDone
+	}
+
+	var streamResp streamResponse
+	if err := json.Unmarshal([]byte(data), &streamResp); err != nil {
+		// 解析失败：记录便于排查（此前静默丢弃导致"空回答"无法诊断）
+		logx.Debug("llm", "流式行解析失败", "line", data)
+		return nil
+	}
+
+	for _, choice := range streamResp.Choices {
+		delta := choice.Delta.Content
+		if delta != "" {
+			*receivedDelta = true
+			select {
+			case ch <- delta:
+			case <-cancel:
+				return errStreamDone
+			}
+		} else if msg := choice.Message.Content; msg != "" && !*receivedDelta && *messageFallback == "" {
+			// 非标准端点：整条流首块用 message 承载完整内容。
+			// 仅在未收到任何 delta 时暂存，流结束时若仍无 delta 则整体输出。
+			*messageFallback = msg
+		}
+	}
+	return nil
+}
+
+// errStreamDone 流式读取终止信号（取消或 [DONE]）
+var errStreamDone = errors.New("[llm] 流式读取结束")
 
 // ChatJSON 聊天调用并解析 JSON 响应
 func (m *Module) ChatJSON(system, user, schemaDesc string, result interface{}) error {

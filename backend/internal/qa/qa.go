@@ -122,7 +122,7 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 
 	// 空回答防御：与 AskStream 一致，LLM 返回空/纯空白时给出明确提示（review nit）
 	if strings.TrimSpace(answer) == "" {
-		answer = "（模型未返回内容。请确认文件已成功索引，或换个问法重试。）"
+		answer = "（模型未返回内容。请确认模型服务正常、文件已成功索引，或换个问法重试。）"
 	}
 
 	// 模型成功后，一次性写入用户与助手消息（避免孤立消息）
@@ -233,10 +233,39 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 
 		answer := sb.String()
 
-		// 空回答防御：LLM 返回空/纯空白时给出明确提示，避免前端出现空气泡
-		// （修复：file 模式文件未索引、上下文为空等情况曾导致 LLM 返回空内容）
+		// 空回答防御：流式返回空/纯空白时，用非流式 Chat 重试一次兜底。
+		// 修复：部分端点流式格式不标准（如 message 字段、空 delta）导致流式内容为空，
+		// 直接给提示无法自愈；非流式重试可拿到完整回答。
 		if strings.TrimSpace(answer) == "" {
-			answer = "（模型未返回内容。请确认文件已成功索引，或换个问法重试。）"
+			// 重试前检查取消：非流式 Chat 无法中途打断，取消后不应再发起重试（review 发现）
+			select {
+			case <-cancel:
+				done <- &contract.QAResponse{Error: "已取消"}
+				return
+			default:
+			}
+
+			logx.Warn("qa", "流式回答为空，改用非流式重试", "question", req.Question)
+			retried, rerr := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 1600})
+			// 重试完成后再次检查取消：用户中止时丢弃重试结果，不写入会话（review 发现）
+			select {
+			case <-cancel:
+				done <- &contract.QAResponse{Error: "已取消"}
+				return
+			default:
+			}
+			if rerr == nil && strings.TrimSpace(retried) != "" {
+				answer = retried
+			} else if rerr != nil {
+				// 非流式也失败：返回真实错误而非"未返回内容"，便于排查
+				if newSession {
+					_ = m.storage.QASessionsDelete(sessionID)
+				}
+				done <- &contract.QAResponse{Error: fmt.Sprintf("模型未返回内容且重试失败: %v", rerr)}
+				return
+			} else {
+				answer = "（模型未返回内容。请确认模型服务正常、文件已成功索引，或换个问法重试。）"
+			}
 		}
 
 		// 保存消息（用户 + 助手）

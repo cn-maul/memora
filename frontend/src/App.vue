@@ -26,6 +26,10 @@ const filesStore = useFilesStore()
 
 // 设置页自带完整侧边栏，隐藏全局壳的两侧面板以腾出空间
 const hideSidePanels = computed(() => route.path === '/settings')
+// 右侧对话区只在主页（全部文件 /files）显示：
+// 问答/统计/提交记录/索引等页面有自己的主内容区，右侧对话会让布局拥挤
+// （需求：右侧边栏对话只在主页全部文件显示）
+const hideChatPanel = computed(() => route.path !== '/files')
 
 const queueStatus = ref<QueueStatus | null>(null)
 
@@ -532,15 +536,15 @@ onUnmounted(() => {
     </main>
 
     <div
-      v-show="!hideSidePanels"
+      v-show="!hideSidePanels && !hideChatPanel"
       class="drag-handle chat-handle"
       :class="{ dragging: dragging === 'chat' }"
       @mousedown="startDrag('chat', $event)"
     ></div>
 
-    <!-- 右侧：对话区 -->
+    <!-- 右侧：对话区（仅主页 /files 显示） -->
     <aside
-      v-show="!hideSidePanels"
+      v-show="!hideSidePanels && !hideChatPanel"
       ref="chatRef"
       class="chat-panel"
       :style="{ width: chatWidth + 'px' }"
