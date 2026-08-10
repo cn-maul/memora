@@ -63,9 +63,9 @@ export const useFilesStore = defineStore('files', () => {
         pageSize: params?.pageSize ?? pageSize.value,
         sort: params?.sort ?? sortParam(),
       })
-      items.value = res.items
-      total.value = res.total
-      page.value = res.page
+      items.value = res.items ?? []
+      total.value = res.total ?? 0
+      page.value = res.page ?? 0
     } catch (e: any) {
       // 加载失败：记录错误供页面区分"无数据"与"加载失败"，避免误导为空列表
       error.value = e?.message || '加载文件列表失败'

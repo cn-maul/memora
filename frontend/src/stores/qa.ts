@@ -15,9 +15,12 @@ export const useQAStore = defineStore('qa', () => {
   const sending = ref(false)
   const abortCtrl = ref<AbortController | null>(null)
 
+  // 上次活跃会话 ID 持久化（localStorage），重启后自动恢复（需求：再次打开加载上一次对话）
+  const LAST_SESSION_KEY = 'memora.lastSessionId'
+
   async function fetchSessions() {
     try {
-      sessions.value = await listQASessions()
+      sessions.value = (await listQASessions()) ?? []
     } catch {
       sessions.value = []
     }
@@ -26,10 +29,52 @@ export const useQAStore = defineStore('qa', () => {
   async function selectSession(id: number) {
     currentSessionId.value = id
     try {
-      messages.value = await getQAMessages(id)
+      localStorage.setItem(LAST_SESSION_KEY, String(id))
+    } catch {
+      // localStorage 不可用时忽略（隐私模式等）
+    }
+    try {
+      messages.value = (await getQAMessages(id)) ?? []
     } catch {
       messages.value = []
     }
+  }
+
+  // 恢复去重与共享：App.vue（根组件挂载）与 QAPage（普通进入）都会调用 restoreLastSession，
+  // 用模块级共享 Promise 保证整次页面生命周期只恢复一次，后续调用 await 同一结果，
+  // 避免并发重复拉取或读到来恢复的状态（review 发现：双调竞态）。
+  // 文件问答跳转需跳过自动恢复（见 skipRestore），否则 App.vue 冷启动恢复会覆盖跳转目标。
+  let restorePromise: Promise<void> | null = null
+
+  async function doRestore() {
+    await fetchSessions()
+    if (sessions.value.length === 0) return
+    let target: number | null = null
+    try {
+      const saved = localStorage.getItem(LAST_SESSION_KEY)
+      if (saved) {
+        const id = Number(saved)
+        if (sessions.value.some((s) => s.id === id)) target = id
+      }
+    } catch {
+      // 忽略读取失败
+    }
+    if (target === null) target = sessions.value[0].id // 无记录时取最近会话
+    await selectSession(target)
+  }
+
+  // 重启后自动恢复上次会话：存在持久化 ID 且仍在会话列表则恢复，否则取最新会话。
+  // 所有调用方共享同一个恢复 Promise。
+  function restoreLastSession(): Promise<void> {
+    if (!restorePromise) restorePromise = doRestore()
+    return restorePromise
+  }
+
+  // 跳过自动恢复：文件问答跳转（含冷启动直接命中 /qa?mode=file）时调用，
+  // 阻止 App.vue 随后执行的恢复把上次会话覆盖到文件问答目标（review 发现）。
+  // 设计取舍：此场景下侧栏聊天同样不恢复上次会话（保持空态），属预期行为。
+  function skipRestore() {
+    if (!restorePromise) restorePromise = Promise.resolve()
   }
 
   const sendSeq = ref(0)
@@ -170,6 +215,8 @@ export const useQAStore = defineStore('qa', () => {
     sending,
     fetchSessions,
     selectSession,
+    restoreLastSession,
+    skipRestore,
     send,
     cancel,
     removeSession,

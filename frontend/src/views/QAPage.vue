@@ -44,13 +44,31 @@ watch(
 )
 
 onMounted(async () => {
-  await qa.fetchSessions()
-  // 支持从文档索引/资源管理器跳转到文件问答（H-07）
+  // 自动恢复上一次 AI 对话（需求：再次打开加载上次会话，而不是新建）
   const q = route.query
   if (q.mode === 'file' && q.fileId) {
+    // 从文档索引/资源管理器跳转到文件问答：优先使用跳转目标。
+    // 显式清空会话状态并跳过自动恢复：App.vue 挂载时可能随后恢复上次会话，
+    // 若不清空/不跳过，文件问答会被覆盖或写进上次会话（review 发现：冷启动模式混合污染）
+    qa.skipRestore()
+    qa.currentSessionId = null
+    qa.messages = []
+    await qa.fetchSessions()
     mode.value = 'file'
     selectedFileId.value = Number(q.fileId)
     await loadIndexedFiles()
+  } else {
+    // 普通进入问答页：恢复上次活跃会话（无记录时取最新会话）。
+    // doRestore 内部已 try/catch 不会 reject，此处 catch 仅为防御（review nit）
+    await qa.restoreLastSession().catch(() => {})
+    if (qa.currentSessionId) {
+      const s = qa.sessions.find((x) => x.id === qa.currentSessionId)
+      if (s) {
+        mode.value = s.mode
+        selectedFileId.value = s.fileId ?? null
+        if (mode.value === 'file') await loadIndexedFiles()
+      }
+    }
   }
   scrollToBottom()
 })
@@ -101,11 +119,18 @@ async function handleSend() {
     return
   }
   qaError.value = ''
+  // 会话模式一致性：若当前会话与发送模式不符（如恢复的 global 会话切到文件问答），
+  // 必须新建会话，避免把消息写进模式不符的旧会话（review 发现：模式混合污染）
+  let sessionId: number | undefined = qa.currentSessionId ?? undefined
+  if (sessionId !== undefined) {
+    const cur = qa.sessions.find((s) => s.id === sessionId)
+    if (!cur || cur.mode !== mode.value) sessionId = undefined
+  }
   await qa.send({
     question: question.value,
     mode: mode.value,
     fileId: mode.value === 'file' ? selectedFileId.value ?? undefined : undefined,
-    sessionId: qa.currentSessionId ?? undefined,
+    sessionId,
   })
   question.value = ''
   scrollToBottom()

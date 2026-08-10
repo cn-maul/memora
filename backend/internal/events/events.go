@@ -5,6 +5,8 @@ package events
 import (
 	"fmt"
 	"sync"
+
+	"memora/internal/logx"
 )
 
 // Handler 事件处理函数
@@ -38,7 +40,7 @@ func (m *Module) Notify(topic string, data interface{}) {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Printf("[events] 订阅者处理 [%s] 时崩溃: %v\n", topic, r)
+					logx.Error("events", "订阅者处理崩溃", "topic", topic, "panic", fmt.Sprintf("%v", r))
 				}
 			}()
 			h(data)

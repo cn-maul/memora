@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"memora/internal/contract"
+	"memora/internal/logx"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -96,7 +97,7 @@ func (m *Module) Start() error {
 	go m.eventLoop(m.watcher)
 	go m.debounceLoop()
 
-	fmt.Printf("[watch] 开始监视: %s\n", m.workspace)
+	logx.Info("watch", "开始监视", "workspace", m.workspace)
 	return nil
 }
 
@@ -132,7 +133,7 @@ func isIgnored(path string) bool {
 func isSupportedDoc(relPath string) bool {
 	ext := strings.ToLower(filepath.Ext(relPath))
 	switch ext {
-	case ".pdf", ".docx", ".txt", ".md":
+	case ".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md":
 		return true
 	default:
 		return false
@@ -182,7 +183,7 @@ func (m *Module) eventLoop(watcher *fsnotify.Watcher) {
 			if !ok {
 				return
 			}
-			fmt.Printf("[watch] 监视错误: %v\n", err)
+			logx.Warn("watch", "监视错误", "err", err.Error())
 
 		case <-m.done:
 			return
@@ -279,7 +280,7 @@ func (m *Module) flushChanges(timer *time.Timer) {
 		select {
 		case m.changeCh <- change:
 		default:
-			fmt.Printf("[watch] 变更通道已满，丢弃 %d 个事件\n", len(files))
+			logx.Warn("watch", "变更通道已满，丢弃事件", "count", len(files))
 		}
 	}
 	m.mu.Unlock()
@@ -312,7 +313,7 @@ func (m *Module) Stop() error {
 	// done 已关闭，eventLoop/debounceLoop/flushChanges 不再向 changeCh 发送，无发送 panic 风险
 	close(m.changeCh)
 
-	fmt.Println("[watch] 监视已停止")
+	logx.Info("watch", "监视已停止")
 	return nil
 }
 
@@ -321,7 +322,7 @@ func (m *Module) Pause() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.paused = true
-	fmt.Println("[watch] 监视已暂停")
+	logx.Info("watch", "监视已暂停")
 	return nil
 }
 
@@ -330,6 +331,6 @@ func (m *Module) Resume() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.paused = false
-	fmt.Println("[watch] 监视已恢复")
+	logx.Info("watch", "监视已恢复")
 	return nil
 }

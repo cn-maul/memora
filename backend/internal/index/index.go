@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"memora/internal/contract"
+	"memora/internal/logx"
 )
 
 // IStorage index 模块所需的 storage 接口
@@ -291,7 +292,7 @@ func (m *Module) chunkText(text string) []string {
 
 // FullReindex 全量重建索引
 func (m *Module) FullReindex() error {
-	fmt.Println("[index] 开始全量重建索引")
+	logx.Info("index", "开始全量重建索引")
 
 	// 遍历工作目录下的所有文件
 	files, err := m.scanWorkspaceFiles()
@@ -300,11 +301,11 @@ func (m *Module) FullReindex() error {
 	}
 
 	total := len(files)
-	fmt.Printf("[index] 发现 %d 个文件\n", total)
+	logx.Info("index", "发现待索引文件", "total", total)
 
 	// 重建开始：先将所有文件状态重置为 pending（让重建过程在列表中可见）
 	if err := m.storage.FilesMarkAllPending(); err != nil {
-		fmt.Printf("[index] 重置文件状态失败: %v\n", err)
+		logx.Warn("index", "重置文件状态失败", "err", err.Error())
 	}
 	m.events.Notify("index_progress", map[string]interface{}{
 		"phase": "reset",
@@ -338,14 +339,14 @@ func (m *Module) FullReindex() error {
 		// 写入文件元数据
 		id, err := m.storage.FilesUpsert(fileInfo)
 		if err != nil {
-			fmt.Printf("[index] 写入文件元数据失败 %s: %v\n", relPath, err)
+			logx.Warn("index", "写入文件元数据失败", "relPath", relPath, "err", err.Error())
 			continue
 		}
 		fileInfo.ID = id
 
 		// 处理单个文件
 		if err := m.ProcessFile(fileInfo); err != nil {
-			fmt.Printf("[index] 处理文件失败 %s: %v\n", relPath, err)
+			logx.Warn("index", "处理文件失败", "relPath", relPath, "err", err.Error())
 		}
 
 		// 广播进度
@@ -366,10 +367,10 @@ func (m *Module) FullReindex() error {
 	// 清理幽灵索引：磁盘上已不存在的文件，从索引中移除其 chunks/vectors
 	// （修复审计发现：FullReindex 仅 upsert 现有文件，若 watch 漏删则旧向量仍参与检索）
 	if err := m.cleanupMissingFiles(files); err != nil {
-		fmt.Printf("[index] 清理已删除文件索引警告: %v\n", err)
+		logx.Warn("index", "清理已删除文件索引警告", "err", err.Error())
 	}
 
-	fmt.Println("[index] 全量重建索引完成")
+	logx.Info("index", "全量重建索引完成")
 	return nil
 }
 
@@ -396,13 +397,13 @@ func (m *Module) cleanupMissingFiles(onDisk []string) error {
 			continue
 		}
 		if err := m.DeleteFile(f.RelPath); err != nil {
-			fmt.Printf("[index] 清理幽灵文件 %s 失败: %v\n", f.RelPath, err)
+			logx.Warn("index", "清理幽灵文件失败", "relPath", f.RelPath, "err", err.Error())
 			continue
 		}
 		removed++
 	}
 	if removed > 0 {
-		fmt.Printf("[index] 已清理 %d 个已删除文件的索引\n", removed)
+		logx.Info("index", "已清理已删除文件的索引", "count", removed)
 	}
 	return nil
 }
@@ -428,7 +429,7 @@ func (m *Module) Incremental(changed, removed []string) error {
 
 		fileInfo, err := m.storage.FilesFindByRelPath(relPath)
 		if err != nil {
-			fmt.Printf("[index] 查找文件失败 %s: %v\n", relPath, err)
+			logx.Warn("index", "查找文件失败", "relPath", relPath, "err", err.Error())
 			continue
 		}
 
@@ -443,7 +444,7 @@ func (m *Module) Incremental(changed, removed []string) error {
 			}
 			id, err := m.storage.FilesUpsert(fileInfo)
 			if err != nil {
-				fmt.Printf("[index] 插入新文件失败 %s: %v\n", relPath, err)
+				logx.Warn("index", "插入新文件失败", "relPath", relPath, "err", err.Error())
 				continue
 			}
 			fileInfo.ID = id
@@ -492,7 +493,7 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 			return nil
 		}
 		// hash 相同但无分块：上次索引未完成，继续走完整流程以自愈
-		fmt.Printf("[index] 文件 %s 幂等跳过失效（无分块），重新索引\n", file.RelPath)
+		logx.Info("index", "幂等跳过失效，重新索引", "relPath", file.RelPath)
 	}
 
 	// Step 3: 分块
@@ -681,6 +682,10 @@ func detectDocType(relPath string) string {
 		return "pdf"
 	case ".docx":
 		return "docx"
+	case ".pptx":
+		return "pptx"
+	case ".xlsx":
+		return "xlsx"
 	case ".txt":
 		return "txt"
 	case ".md":

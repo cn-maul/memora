@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"memora/internal/contract"
+	"memora/internal/logx"
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -149,14 +150,14 @@ func (m *Module) CommitAuto(files []string) (string, bool, error) {
 		for f, s := range status {
 			if s.Worktree != ' ' && s.Worktree != 0 {
 				if _, err := wt.Add(f); err != nil {
-					fmt.Printf("[git] add %s 失败: %v\n", f, err)
+					logx.Warn("git", "add 失败", "file", f, "err", err.Error())
 				}
 			}
 		}
 	} else {
 		for _, f := range files {
 			if _, err := wt.Add(f); err != nil {
-				fmt.Printf("[git] add %s 失败: %v\n", f, err)
+				logx.Warn("git", "add 失败", "file", f, "err", err.Error())
 			}
 		}
 	}

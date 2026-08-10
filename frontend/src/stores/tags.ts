@@ -9,7 +9,7 @@ export const useTagsStore = defineStore('tags', () => {
 
   async function fetchTags() {
     try {
-      tags.value = await listTags()
+      tags.value = (await listTags()) ?? []
     } catch {
       tags.value = []
     }
@@ -17,7 +17,7 @@ export const useTagsStore = defineStore('tags', () => {
 
   async function fetchSuggestions() {
     try {
-      suggestions.value = await listTagSuggestions()
+      suggestions.value = (await listTagSuggestions()) ?? []
     } catch {
       suggestions.value = []
     }

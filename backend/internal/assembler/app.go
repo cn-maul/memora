@@ -19,6 +19,7 @@ import (
 	"memora/internal/git"
 	"memora/internal/index"
 	"memora/internal/llm"
+	"memora/internal/logx"
 	"memora/internal/qa"
 	"memora/internal/search"
 	"memora/internal/stats"
@@ -261,19 +262,19 @@ func (a *App) RebuildWorkspace(workspace string) error {
 
 	// 5. 确保 Git 仓库并恢复待处理任务
 	if err := a.Git.EnsureRepo(workspace); err != nil {
-		fmt.Printf("[app] Git 初始化警告: %v\n", err)
+		logx.Warn("app", "Git 初始化警告", "err", err.Error())
 	}
 	if err := a.Storage.RecoverPending(); err != nil {
-		fmt.Printf("[app] 恢复待处理任务警告: %v\n", err)
+		logx.Warn("app", "恢复待处理任务警告", "err", err.Error())
 	}
 	if _, err := a.Storage.VectorsLoadAll(); err != nil {
-		fmt.Printf("[app] 加载向量索引警告: %v\n", err)
+		logx.Warn("app", "加载向量索引警告", "err", err.Error())
 	}
 
 	// 6. 启动新监视器
 	if a.Watch != nil {
 		if err := a.Watch.Start(); err != nil {
-			fmt.Printf("[app] 文件监视启动警告: %v\n", err)
+			logx.Warn("app", "文件监视启动警告", "err", err.Error())
 		}
 		go a.consumeWatchChanges()
 	}
@@ -281,7 +282,7 @@ func (a *App) RebuildWorkspace(workspace string) error {
 	// 7. 触发全量重建索引
 	go func() {
 		if err := a.Index.FullReindex(); err != nil {
-			fmt.Printf("[app] 全量重建索引警告: %v\n", err)
+			logx.Warn("app", "全量重建索引警告", "err", err.Error())
 		}
 	}()
 
@@ -296,7 +297,7 @@ func (a *App) createTaskHandler() taskqueue.TaskHandler {
 					return a.Index.Incremental([]string{relPath}, nil)
 				}
 			}
-			fmt.Printf("[app] 提取任务: %v\n", task.Payload)
+			logx.Warn("app", "提取任务无法解析", "payload", fmt.Sprintf("%v", task.Payload))
 		case "tag":
 			if payload, ok := task.Payload.(map[string]interface{}); ok {
 				if fileID, ok := asInt64(payload["fileId"]); ok && fileID > 0 {
@@ -396,7 +397,7 @@ func (a *App) createTransport(evt *events.Module) *transport.Module {
 
 // Run 启动应用
 func (a *App) Run() error {
-	fmt.Println("[app] Memora 启动中...")
+	logx.Info("app", "Memora 启动中")
 
 	// 1. 注册路由
 	if err := a.Transport.Handle(nil); err != nil {
@@ -406,19 +407,19 @@ func (a *App) Run() error {
 	// 2. 初始化 Git 仓库
 	if a.wsPath != "" {
 		if err := a.Git.EnsureRepo(a.wsPath); err != nil {
-			fmt.Printf("[app] Git 初始化警告: %v\n", err)
+			logx.Warn("app", "Git 初始化警告", "err", err.Error())
 		}
 
 		// 3. 启动文件监视
 		if a.Watch != nil {
 			if err := a.Watch.Start(); err != nil {
-				fmt.Printf("[app] 文件监视启动警告: %v\n", err)
+				logx.Warn("app", "文件监视启动警告", "err", err.Error())
 			}
 		}
 
 		// 4. 恢复待处理任务并重新入队
 		if err := a.Storage.RecoverPending(); err != nil {
-			fmt.Printf("[app] 恢复待处理任务警告: %v\n", err)
+			logx.Warn("app", "恢复待处理任务警告", "err", err.Error())
 		}
 		// 将所有 pending 文件重新入队
 		pendingFiles, _, err := a.Storage.FilesList("pending", "", 0, 5000, "")
@@ -430,13 +431,13 @@ func (a *App) Run() error {
 				})
 			}
 			if len(pendingFiles) > 0 {
-				fmt.Printf("[app] 已重新入队 %d 个待处理文件\n", len(pendingFiles))
+				logx.Info("app", "已重新入队待处理文件", "count", len(pendingFiles))
 			}
 		}
 
 		// 5. 加载内存向量索引
 		if _, err := a.Storage.VectorsLoadAll(); err != nil {
-			fmt.Printf("[app] 加载向量索引警告: %v\n", err)
+			logx.Warn("app", "加载向量索引警告", "err", err.Error())
 		}
 	}
 
@@ -457,13 +458,13 @@ func (a *App) Run() error {
 	// 9. 打开浏览器进入前端界面（自包含模式，纯网页形态）
 	if addr := a.Transport.Addr(); addr != "" {
 		url := "http://" + addr
-		fmt.Printf("[app] 前端地址: %s\n", url)
+		logx.Info("app", "前端地址", "url", url)
 		if err := openBrowser(url); err != nil {
-			fmt.Printf("[app] 打开浏览器失败: %v\n", err)
+			logx.Warn("app", "打开浏览器失败", "err", err.Error())
 		}
 	}
 
-	fmt.Println("[app] Memora 已就绪")
+	logx.Info("app", "Memora 已就绪")
 	return nil
 }
 
@@ -578,7 +579,7 @@ func (a *App) pollPendingFiles() {
 				// 只处理支持的文件类型
 				ext := strings.ToLower(filepath.Ext(relPath))
 				switch ext {
-				case ".pdf", ".docx", ".txt", ".md":
+				case ".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md":
 				default:
 					return nil
 				}
@@ -612,7 +613,7 @@ func (a *App) pollPendingFiles() {
 
 // Shutdown 优雅关闭
 func (a *App) Shutdown() {
-	fmt.Println("[app] 正在关闭...")
+	logx.Info("app", "正在关闭")
 
 	if a.Watch != nil {
 		a.Watch.Stop()
@@ -623,7 +624,7 @@ func (a *App) Shutdown() {
 	// 等待当前正在执行的任务完成，避免运行中的任务访问已关闭的 SQLite（修复 M-08）
 	drained := a.TaskQueue.Wait(3 * time.Second)
 	if !drained {
-		fmt.Println("[app] 等待任务结束超时，仍有任务在执行")
+		logx.Warn("app", "等待任务结束超时，仍有任务在执行")
 	}
 
 	if a.Storage != nil {
@@ -634,7 +635,7 @@ func (a *App) Shutdown() {
 		a.Transport.Stop()
 	}
 
-	fmt.Println("[app] 已关闭")
+	logx.Info("app", "已关闭")
 }
 
 // Quit 退出

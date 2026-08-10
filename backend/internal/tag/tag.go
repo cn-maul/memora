@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"memora/internal/contract"
+	"memora/internal/logx"
 )
 
 // IStorage tag 模块所需的 storage 接口
@@ -71,7 +72,7 @@ func (m *Module) seedPredefined() {
 			continue
 		}
 		if _, err := m.storage.TagsCreate(name, "predefined"); err != nil {
-			fmt.Printf("[tag] 种子化标签 %s 失败: %v\n", name, err)
+			logx.Warn("tag", "种子化标签失败", "name", name, "err", err.Error())
 		}
 	}
 }
@@ -131,7 +132,7 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 	err = m.llm.ChatJSON(systemPrompt, sample, "标签JSON", &result)
 	if err != nil {
 		// 模型不可用 → 保留未打标，不阻塞
-		fmt.Printf("[tag] LLM 打标失败（跳过）: %v\n", err)
+		logx.Warn("tag", "LLM 打标失败（跳过）", "err", err.Error())
 		return nil
 	}
 
@@ -160,7 +161,7 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 		}
 		id, err := m.storage.SuggestionsAdd(nt.Name, nt.Reason, file.ID)
 		if err != nil {
-			fmt.Printf("[tag] 写入标签建议失败: %v\n", err)
+			logx.Warn("tag", "写入标签建议失败", "err", err.Error())
 			continue
 		}
 		m.events.Notify("suggestion_new", map[string]interface{}{

@@ -235,7 +235,14 @@ async function send() {
   chatInput.value = ''
   autosize()
   chatError.value = ''
-  await qa.send({ question: text, mode: 'global', sessionId: qa.currentSessionId ?? undefined })
+  // 侧栏始终按全局问答发送：若当前恢复的会话是 file 模式，先新建会话，
+  // 避免把全局消息写进文件问答会话（review 发现：复用 sessionId 会混合模式）
+  let sessionId: number | undefined = qa.currentSessionId ?? undefined
+  if (sessionId !== undefined) {
+    const cur = qa.sessions.find((s) => s.id === sessionId)
+    if (cur && cur.mode === 'file') sessionId = undefined
+  }
+  await qa.send({ question: text, mode: 'global', sessionId })
   // 注：错误提示由 qa store 写入助手消息气泡，此处不再需要空消息兜底分支
 }
 function cancelSend() {
@@ -334,6 +341,8 @@ let incrementalRefreshTimer: ReturnType<typeof setTimeout> | null = null
 onMounted(async () => {
   applyTheme(theme.value)
   await ws.fetchInfo()
+  // 自动恢复上一次 AI 对话到侧栏聊天（需求：再次打开软件显示上次会话，而不是空的新对话）
+  qa.restoreLastSession().catch(() => {})
   // 挂载文件导航函数到 window，供 renderAnswer 生成的链接使用
   ;(window as any).__navigateToFile = (relPath: string) => {
     ;(window as any).__highlightFile = relPath

@@ -158,6 +158,10 @@ func detectDocType(name string) string {
 		return "pdf"
 	case ".docx":
 		return "docx"
+	case ".pptx":
+		return "pptx"
+	case ".xlsx":
+		return "xlsx"
 	case ".txt":
 		return "txt"
 	case ".md":

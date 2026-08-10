@@ -24,6 +24,7 @@ import (
 	"memora/internal/browser"
 	"memora/internal/contract"
 	"memora/internal/events"
+	"memora/internal/logx"
 	"memora/internal/taskqueue"
 	"memora/internal/timeline"
 )
@@ -284,9 +285,9 @@ func (m *Module) Handle(routes map[string]interface{}) error {
 	}
 
 	go func() {
-		fmt.Printf("[transport] HTTP 服务启动于 %s\n", addr)
+		logx.Info("transport", "HTTP 服务启动", "addr", addr)
 		if err := m.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Printf("[transport] 服务异常: %v\n", err)
+			logx.Error("transport", "服务异常", "err", err.Error())
 		}
 	}()
 
@@ -797,7 +798,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 		// 异步触发全量重建索引
 		go func() {
 			if err := m.handler.Index.FullReindex(); err != nil {
-				fmt.Printf("[transport] 全量重建索引警告: %v\n", err)
+				logx.Warn("transport", "全量重建索引警告", "err", err.Error())
 			}
 		}()
 	}
@@ -1120,7 +1121,7 @@ func (m *Module) handleIndexReindex(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() {
 		if err := m.handler.Index.FullReindex(); err != nil {
-			fmt.Printf("[transport] 全量重建索引警告: %v\n", err)
+			logx.Warn("transport", "全量重建索引警告", "err", err.Error())
 		}
 	}()
 	writeOK(w, map[string]bool{"ok": true})

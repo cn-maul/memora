@@ -16,6 +16,8 @@ import (
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
+
+	"memora/internal/logx"
 )
 
 // Module 文本提取模块
@@ -234,7 +236,7 @@ func (m *Module) ExtractFile(filePath string) (text string, cacheKey string, err
 
 	// 写入缓存
 	if err := os.WriteFile(cacheFile, []byte(text), 0644); err != nil {
-		fmt.Printf("[extract] 写入缓存失败: %v\n", err)
+		logx.Warn("extract", "写入缓存失败", "err", err.Error())
 	}
 
 	return text, cacheKey, nil

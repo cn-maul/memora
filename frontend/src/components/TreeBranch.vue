@@ -49,7 +49,7 @@ const icon = computed<IconName>(() => {
     db: 'db',
     zip: 'archive', tar: 'archive', gz: 'archive',
     png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', svg: 'image', webp: 'image',
-    md: 'file', txt: 'file', doc: 'file', docx: 'file',
+    md: 'file', txt: 'file', doc: 'file', docx: 'file', pptx: 'file', xlsx: 'file',
     bat: 'archive', sh: 'archive',
     ts: 'go', js: 'go', vue: 'go',
     css: 'json', html: 'json',

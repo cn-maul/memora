@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"memora/internal/contract"
+	"memora/internal/logx"
 )
 
 // ConfigProvider LLM 配置获取接口
@@ -139,7 +140,7 @@ func (m *Module) retry(fn func() ([]byte, error)) ([]byte, error) {
 		// 可重试错误：退避等待
 		if i < 2 {
 			wait := time.Duration(1<<uint(i)) * time.Second
-			fmt.Printf("[llm] 重试 %d/3，等待 %v: %v\n", i+1, wait, err)
+			logx.Warn("llm", "重试", "attempt", i+1, "wait", wait.String(), "err", err.Error())
 			time.Sleep(wait)
 		}
 	}
@@ -342,7 +343,7 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 
 		if attempt < 2 {
 			wait := time.Duration(1<<uint(attempt)) * time.Second
-			fmt.Printf("[llm] 流式请求重试 %d/3，等待 %v: %v\n", attempt+1, wait, lastErr)
+			logx.Warn("llm", "流式请求重试", "attempt", attempt+1, "wait", wait.String(), "err", lastErr.Error())
 			select {
 			case <-time.After(wait):
 			case <-cancel:

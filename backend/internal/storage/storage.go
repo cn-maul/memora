@@ -327,7 +327,8 @@ func (m *Module) FilesList(status, tag string, page, pageSize int, sortOrder str
 	}
 	defer rows.Close()
 
-	var files []*contract.FileInfo
+	// 空结果返回空切片而非 nil，避免 JSON 序列化为 null（修复：前端模板 .length 崩溃）
+	files := make([]*contract.FileInfo, 0)
 	for rows.Next() {
 		f := &contract.FileInfo{}
 		if err := rows.Scan(&f.ID, &f.RelPath, &f.Size, &f.Mtime, &f.ContentHash, &f.DocType, &f.IndexStatus, &f.LastError, &f.FirstSeenAt, &f.LastIndexedAt); err != nil {
@@ -652,7 +653,8 @@ func (m *Module) TagsList() ([]*contract.TagInfo, error) {
 	}
 	defer rows.Close()
 
-	var tags []*contract.TagInfo
+	// 空结果返回空切片而非 nil，避免 JSON 序列化为 null（与建议列表一致的防御）
+	tags := make([]*contract.TagInfo, 0)
 	for rows.Next() {
 		t := &contract.TagInfo{}
 		if err := rows.Scan(&t.ID, &t.Name, &t.Source, &t.CreatedAt, &t.Count); err != nil {
@@ -839,7 +841,8 @@ func (m *Module) SuggestionsListPending() ([]*contract.TagSuggestion, error) {
 	}
 	defer rows.Close()
 
-	var suggestions []*contract.TagSuggestion
+	// 空结果返回空切片而非 nil，避免 JSON 序列化为 null 导致前端崩溃（修复：接受建议后白屏）
+	suggestions := make([]*contract.TagSuggestion, 0)
 	for rows.Next() {
 		s := &contract.TagSuggestion{}
 		if err := rows.Scan(
@@ -917,7 +920,8 @@ func (m *Module) QASessionsList() ([]*contract.QASession, error) {
 	}
 	defer rows.Close()
 
-	var sessions []*contract.QASession
+	// 空结果返回空切片而非 nil，避免 JSON 序列化为 null（修复：前端模板 .length 崩溃）
+	sessions := make([]*contract.QASession, 0)
 	for rows.Next() {
 		s := &contract.QASession{}
 		if err := rows.Scan(&s.ID, &s.CreatedAt, &s.Mode, &s.FileID, &s.MessageCount); err != nil {

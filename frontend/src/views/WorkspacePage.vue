@@ -177,7 +177,7 @@ function formatSize(bytes?: number) {
 
 function docIcon(e: BrowseEntry) {
   if (e.isDir) return 'folder'
-  const map: Record<string, IconName> = { pdf: 'file', docx: 'file', txt: 'file', md: 'file' }
+  const map: Record<string, IconName> = { pdf: 'file-pdf', docx: 'file-word', pptx: 'file-ppt', xlsx: 'file-excel', txt: 'file-text', md: 'file-text' }
   return map[e.docType || ''] || 'file'
 }
 </script>

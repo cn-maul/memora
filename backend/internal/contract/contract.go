@@ -11,7 +11,7 @@ type FileInfo struct {
 	Size          int64  `json:"size"`
 	Mtime         int64  `json:"mtime"` // 毫秒
 	ContentHash   string `json:"contentHash,omitempty"`
-	DocType       string `json:"docType"` // pdf/docx/txt/md/doc(ignored)
+	DocType       string `json:"docType"` // pdf/docx/pptx/xlsx/txt/md/doc(ignored)
 	IndexStatus   string `json:"indexStatus"`
 	LastError     string `json:"lastError,omitempty"`
 	FirstSeenAt   int64  `json:"firstSeenAt"`

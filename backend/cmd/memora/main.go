@@ -5,12 +5,12 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"memora/internal/assembler"
+	"memora/internal/logx"
 )
 
 func main() {
@@ -26,18 +26,18 @@ func main() {
 
 	app, err := assembler.NewApp(ctx, *configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[致命] 装配失败: %v\n", err)
+		logx.Error("app", "装配失败", "err", err.Error())
 		os.Exit(1)
 	}
 
 	// 启动
 	if err := app.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "[致命] 启动失败: %v\n", err)
+		logx.Error("app", "启动失败", "err", err.Error())
 		os.Exit(1)
 	}
 
 	// 等待退出信号
 	<-sigCh
-	fmt.Println("\n[app] 收到退出信号，正在关闭...")
+	logx.Info("app", "收到退出信号，正在关闭")
 	app.Shutdown()
 }

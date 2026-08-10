@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"memora/internal/logx"
 )
 
 // Task 任务
@@ -154,7 +156,7 @@ func (m *Module) processLoop() {
 		// 导致 running 卡在 1、队列永久停摆、Wait 永远超时（修复 review 发现）
 		err := m.safeHandle(task)
 		if err != nil {
-			fmt.Printf("[taskqueue] 任务失败 [%s]: %v\n", task.Type, err)
+			logx.Error("taskqueue", "任务失败", "type", task.Type, "err", err.Error())
 			m.mu.Lock()
 			m.consecutiveFails[task.Type]++
 			if m.consecutiveFails[task.Type] >= 5 {
@@ -162,7 +164,7 @@ func (m *Module) processLoop() {
 				if key != "" {
 					delete(m.pending, key)
 				}
-				fmt.Printf("[taskqueue] 类型 %s 连续 %d 次失败，临时封禁该类型 %v\n", task.Type, m.consecutiveFails[task.Type], typeBanCooldown)
+				logx.Warn("taskqueue", "类型连续失败，临时封禁", "type", task.Type, "fails", m.consecutiveFails[task.Type], "cooldown", typeBanCooldown.String())
 				// 临时封禁该类型（跳过后续该类型任务），不再暂停整个队列（修复 should-fix）
 				m.failedTypes[task.Type] = true
 				m.failedSince[task.Type] = time.Now()
@@ -228,7 +230,7 @@ func (m *Module) safeHandle(task *Task) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("handler panic: %v", r)
-			fmt.Printf("[taskqueue] 任务 %s panic: %v\n", task.Type, r)
+			logx.Error("taskqueue", "任务 panic", "type", task.Type, "panic", fmt.Sprintf("%v", r))
 		}
 	}()
 	return m.handler(task)
@@ -239,7 +241,7 @@ func (m *Module) Pause() error {
 	m.mu.Lock()
 	m.paused = true
 	m.mu.Unlock()
-	fmt.Println("[taskqueue] 已暂停")
+	logx.Info("taskqueue", "队列已暂停")
 	return nil
 }
 
@@ -255,7 +257,7 @@ func (m *Module) Resume() error {
 		go m.processLoop()
 	}
 
-	fmt.Println("[taskqueue] 已恢复")
+	logx.Info("taskqueue", "队列已恢复")
 	return nil
 }
 
@@ -284,7 +286,7 @@ func (m *Module) CancelAll() error {
 	m.paused = false
 	m.cond.Broadcast()
 
-	fmt.Println("[taskqueue] 已清空所有待处理任务")
+	logx.Info("taskqueue", "已清空所有待处理任务")
 	return nil
 }
 
