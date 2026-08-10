@@ -29,6 +29,7 @@ type IStorage interface {
 	VectorsInsert(chunkID int64, vec []float32, dim int) error
 	VectorsDelete(chunkID int64) error
 	VectorsSearch(queryVec []float32, topK int) ([]contract.VectorEntry, error)
+	FileVectorDim(fileID int64) (int, bool, error)
 	FileTagsReplace(fileID int64, tags []contract.FileTag) error
 }
 
@@ -451,7 +452,12 @@ func (m *Module) Incremental(changed, removed []string) error {
 		} else {
 			fileInfo.Size = stat.Size()
 			fileInfo.Mtime = stat.ModTime().UnixMilli()
-			m.storage.FilesUpsert(fileInfo)
+			id, err := m.storage.FilesUpsert(fileInfo)
+			if err != nil {
+				logx.Warn("index", "更新文件元数据失败", "relPath", relPath, "err", err.Error())
+				continue
+			}
+			fileInfo.ID = id
 		}
 
 		m.ProcessFile(fileInfo)
@@ -487,13 +493,25 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 	// 幂等检查：content_hash 相同且已有分块则跳过。
 	// 校验分块存在是为了避免自愈失效：若上次在嵌入/写向量阶段失败（状态 failed，
 	// 但 content_hash 已保留旧值），仅凭 hash 相同会错误跳过，缺失的向量永远补不齐。
+	// 额外校验向量维度：切换嵌入模型后维度变化（如 bge 1024 → Qwen 4096），
+	// 旧向量与查询维度不匹配导致检索恒为空，必须强制重新嵌入（修复）。
 	if file.ContentHash == cacheKey {
+		skip := false
 		if existingChunks, cerr := m.storage.ChunksByFile(file.ID); cerr == nil && len(existingChunks) > 0 {
+			dim, hasVec, derr := m.storage.FileVectorDim(file.ID)
+			if derr == nil && hasVec && dim == m.embedDim {
+				skip = true
+			} else {
+				logx.Info("index", "幂等跳过失效（维度变化），重新索引", "relPath", file.RelPath, "storedDim", dim, "expectDim", m.embedDim, "hasVec", hasVec)
+			}
+		} else {
+			// hash 相同但无分块：上次索引未完成，继续走完整流程以自愈
+			logx.Info("index", "幂等跳过失效，重新索引", "relPath", file.RelPath)
+		}
+		if skip {
 			m.storage.FilesMarkStatus(file.ID, "indexed", "")
 			return nil
 		}
-		// hash 相同但无分块：上次索引未完成，继续走完整流程以自愈
-		logx.Info("index", "幂等跳过失效，重新索引", "relPath", file.RelPath)
 	}
 
 	// Step 3: 分块
@@ -539,6 +557,8 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 		if len(vec) != m.embedDim {
 			errMsg := fmt.Sprintf("向量维度不匹配: 期望 %d, 实际 %d (第 %d 块)", m.embedDim, len(vec), i+1)
 			m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
+			// 控制台同步输出：排查"找不到文件"的关键日志（sources=[] 时查文件是否 failed）
+			logx.Error("index", "向量维度不匹配，文件标记失败", "relPath", file.RelPath, "expect", m.embedDim, "actual", len(vec))
 			return fmt.Errorf("[index] %s", errMsg)
 		}
 	}

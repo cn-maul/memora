@@ -74,6 +74,13 @@ type CommitFile struct {
 	Status string `json:"status"` // added|modified|deleted
 }
 
+// VersionFile 某提交快照中的文件条目（用于"查看该提交的全部文件"）
+type VersionFile struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	DocType string `json:"docType,omitempty"` // pdf/docx/pptx/xlsx/txt/md/doc(ignored)；空表示不支持
+}
+
 // HeadInfo 当前版本（HEAD）概要
 type HeadInfo struct {
 	Hash         string `json:"hash"`
@@ -184,7 +191,7 @@ type IConfig interface {
 	Get(key string) (interface{}, error)
 	Set(key string, value interface{}) error
 	Snapshot() map[string]interface{} // 不含 apiKey
-	UpsertSecrets(llmKey, embedKey string) error
+	UpsertSecrets(llmKey, embedKey, rerankKey string) error
 	Workspace() string
 	Migrate() error
 	Relocate(workspace string) error
@@ -210,6 +217,7 @@ type IStorage interface {
 	FilesList(status, tag string, page, pageSize int, sortOrder string) ([]*FileInfo, int, error)
 	FilesMarkStatus(id int64, status, lastError string) error
 	FilesRetryStatus(id int64) error // 将 failed 重置为 pending，供用户手动重试
+	FilesRecent(sinceMs int64, limit int) ([]*FileInfo, error) // 最近修改的文件（按 mtime 倒序）
 
 	// 分块
 	ChunksReplaceForFile(fileID int64, chunks []*Chunk) error
@@ -304,6 +312,7 @@ type IGit interface {
 	RestoreFile(relPath, hash string) error
 	Head() (*HeadInfo, error)                       // 当前版本概要
 	CommitFiles(hash string) ([]*CommitFile, error) // 提交改动的文件明细
+	ListTreeAt(hash string) ([]*VersionFile, error) // 提交快照的全部文件
 }
 
 // ──────────────────────────── 4.6 IWatch ────────────────────────────

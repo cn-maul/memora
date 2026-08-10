@@ -60,9 +60,24 @@ func (m *Module) addRecursiveWatch(watcher *fsnotify.Watcher, dir string) error 
 		if base == ".git" || base == ".memora" || strings.HasPrefix(base, ".") {
 			return filepath.SkipDir
 		}
+		// 重型/非文档目录（node_modules/dist/build 等）：不监视，
+		// 否则大项目会注册海量 watcher 耗尽文件描述符（修复 review 发现：与索引扫描规则对齐）
+		if isHeavyDirName(base) {
+			return filepath.SkipDir
+		}
 
 		return watcher.Add(path)
 	})
+}
+
+// isHeavyDirName 判断是否为应跳过的重型/非文档目录（与 index.scanWorkspaceFiles 一致）
+func isHeavyDirName(name string) bool {
+	switch name {
+	case "node_modules", "bin", "obj", "dist", "build", "out", "target", "vendor",
+		"__pycache__", ".venv", "venv", ".idea", ".vscode", ".mvn", ".gradle":
+		return true
+	}
+	return false
 }
 
 // Start 启动文件监视
@@ -93,9 +108,10 @@ func (m *Module) Start() error {
 	m.running = true
 
 	// goroutine 捕获当前 watcher 引用：Stop→Start 重建 watcher 后，旧 goroutine 仍读旧实例，
-	// 避免无锁读 m.watcher 与 Start 持锁写的理论 race（review should-fix）
+	// 避免无锁读 m.watcher 与 Start 持锁写的理论 race（review should-fix）。
+	// done 同理按实例捕获：旧 debounceLoop 在旧 done 上退出，不再误读重建后的新 done（review 发现泄漏）
 	go m.eventLoop(m.watcher)
-	go m.debounceLoop()
+	go m.debounceLoop(m.done)
 
 	logx.Info("watch", "开始监视", "workspace", m.workspace)
 	return nil
@@ -191,8 +207,9 @@ func (m *Module) eventLoop(watcher *fsnotify.Watcher) {
 	}
 }
 
-// debounceLoop 防抖到期后发送变更
-func (m *Module) debounceLoop() {
+// debounceLoop 防抖到期后发送变更。
+// done 为启动时捕获的实例级 done：Stop→Start 重建 done 后旧 goroutine 不会误读新通道而残留（review 发现）
+func (m *Module) debounceLoop(done chan struct{}) {
 	for {
 		m.mu.Lock()
 		timer := m.dirtyTimer
@@ -206,7 +223,7 @@ func (m *Module) debounceLoop() {
 		select {
 		case <-timer.C:
 			m.flushChanges(timer)
-		case <-m.done:
+		case <-done:
 			return
 		default:
 			// 循环重新取当前 timer：eventLoop 可能已 Stop 旧 timer 并替换为新 timer，

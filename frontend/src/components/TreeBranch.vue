@@ -8,6 +8,7 @@ export interface TreeNode {
   relPath: string
   isDir?: boolean
   docType?: string
+  empty?: boolean // 目录是否完全为空（无子文件夹也无文件）；仅此才显示"空文件夹"
   expanded: boolean
   loading: boolean
   hasLoaded: boolean
@@ -91,7 +92,10 @@ const match = computed(() => {
 })
 
 const isActive = computed(() => props.currentPath === props.node.relPath)
-const indent = computed(() => `${8 + props.depth * 18}px`)
+// 缩进按深度推导（不再依赖零散 magic number）；空文件夹占位与同层标签对齐
+const indent = computed(() => `${10 + props.depth * 16}px`)
+// 行首 = caret(14) + gap(4) + icon(16) + gap(4) = 38px
+const emptyIndent = computed(() => `${10 + (props.depth + 1) * 16 + 38}px`)
 </script>
 
 <template>
@@ -116,7 +120,7 @@ const indent = computed(() => `${8 + props.depth * 18}px`)
       <span v-if="node.loading" class="tree-spinner"></span>
     </div>
 
-    <div v-if="node.expanded && node.children.length === 0 && !node.loading" class="tree-empty" :style="{ paddingLeft: `${8 + (depth + 1) * 18 + 26}px` }">
+    <div v-if="node.expanded && node.children.length === 0 && !node.loading && node.empty" class="tree-empty" :style="{ paddingLeft: emptyIndent }">
       空文件夹
     </div>
 
@@ -145,7 +149,7 @@ const indent = computed(() => `${8 + props.depth * 18}px`)
   cursor: pointer;
   font-size: 13px;
   color: var(--c-text-secondary);
-  transition: background 0.1s;
+  transition: background 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
   white-space: nowrap;
   overflow: hidden;
 }
@@ -158,10 +162,12 @@ const indent = computed(() => `${8 + props.depth * 18}px`)
   background: var(--c-brand-soft);
 }
 
+/* 激活项：品牌色左强调条 + 柔和底色（与侧栏 / 问答会话激活态同一视觉语言） */
 .tree-row--active {
   background: var(--c-brand-soft);
   color: var(--c-brand);
   font-weight: 600;
+  box-shadow: inset 2px 0 0 var(--c-brand);
 }
 
 .tree-row--dir {
@@ -176,6 +182,7 @@ const indent = computed(() => `${8 + props.depth * 18}px`)
   justify-content: center;
   flex-shrink: 0;
   color: var(--c-text-tertiary);
+  transition: transform 0.15s ease;
 }
 
 .tree-row:hover .tree-caret {

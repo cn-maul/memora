@@ -21,6 +21,10 @@ const embedModel = ref('')
 const embedDimensions = ref(1024)
 const embedApiKey = ref('')
 
+const rerankBaseUrl = ref('')
+const rerankModel = ref('Pro/BAAI/bge-reranker-v2-m3')
+const rerankApiKey = ref('')
+
 const pythonPath = ref('')
 const command = ref('')
 const markitdownCmd = ref('')
@@ -30,10 +34,12 @@ const pythonDetectError = ref('')
 
 const workspacePath = ref('')
 const scanIntervalSec = ref(8)
+const recentWindowHours = ref(24)
 
 const testing = ref('')
 const testChatResult = ref('')
 const testEmbedResult = ref('')
+const testRerankResult = ref('')
 const testMarkitdownResult = ref('')
 const saving = ref(false)
 const savedMsg = ref('')
@@ -67,6 +73,7 @@ const navSections: NavSection[] = [
     label: '模型',
     items: [
       { id: 'sec-embed', label: '嵌入模型', icon: 'search' },
+      { id: 'sec-rerank', label: '重排模型', icon: 'search' },
       { id: 'sec-llm', label: '大语言模型', icon: 'chat' },
     ],
   },
@@ -150,10 +157,13 @@ function loadFromSettings() {
   embedBaseUrl.value = s.embed?.baseUrl || s.embedBaseUrl || ''
   embedModel.value = s.embed?.model || s.embedModel || ''
   embedDimensions.value = s.embed?.dimensions ?? s.embedDimensions ?? 1024
+  rerankBaseUrl.value = s.rerank?.baseUrl || ''
+  rerankModel.value = s.rerank?.model || 'Pro/BAAI/bge-reranker-v2-m3'
   pythonPath.value = s.markitdown?.pythonPath || s.markitdownPythonPath || ''
   command.value = s.markitdown?.command || s.markitdownCommand || ''
   markitdownCmd.value = s.markitdown?.markitdownCmd || ''
   scanIntervalSec.value = s.index?.scanIntervalSec ?? 8
+  recentWindowHours.value = s.recent?.windowHours ?? 24
   workspacePath.value = s.workspace?.path || s.workspacePath || ws.info?.workspacePath || ''
 }
 
@@ -161,9 +171,10 @@ async function handleSaveSecrets() {
   saving.value = true
   saveError.value = ''
   try {
-    await settings.saveSecrets(llmApiKey.value || undefined, embedApiKey.value || undefined)
+    await settings.saveSecrets(llmApiKey.value || undefined, embedApiKey.value || undefined, rerankApiKey.value || undefined)
     llmApiKey.value = ''
     embedApiKey.value = ''
+    rerankApiKey.value = ''
     savedMsg.value = '密钥已保存'
     setTimeout(() => (savedMsg.value = ''), 3000)
   } catch (e: any) {
@@ -185,12 +196,28 @@ async function handleSaveSettings() {
       'embed.baseUrl': embedBaseUrl.value,
       'embed.model': embedModel.value,
       'embed.dimensions': embedDimensions.value,
+      'rerank.baseUrl': rerankBaseUrl.value,
+      'rerank.model': rerankModel.value,
       'markitdown.pythonPath': pythonPath.value,
-      'markitdown.command': command.value,
-      'markitdown.markitdownCmd': markitdownCmd.value,
-      'index.scanIntervalSec': scanIntervalSec.value,
-      'workspace.path': workspacePath.value ?? undefined,
+'markitdown.command': command.value,
+	      'markitdown.markitdownCmd': markitdownCmd.value,
+	      'index.scanIntervalSec': scanIntervalSec.value,
+	      'recent.windowHours': recentWindowHours.value,
+	      'workspace.path': workspacePath.value ?? undefined,
     })
+    // 顺带保存表单里填写的密钥（非空才覆盖，保持"留空不修改"语义）。
+    // 修复：此前"保存设置"不保存 API Key，用户测试通过但真正请求仍用旧 key 导致 401。
+    const hasKeys = llmApiKey.value || embedApiKey.value || rerankApiKey.value
+    if (hasKeys) {
+      await settings.saveSecrets(
+        llmApiKey.value || undefined,
+        embedApiKey.value || undefined,
+        rerankApiKey.value || undefined,
+      )
+      llmApiKey.value = ''
+      embedApiKey.value = ''
+      rerankApiKey.value = ''
+    }
     savedMsg.value =
       restartList && restartList.length > 0 ? '已保存（部分配置需重启应用后生效）' : '已保存'
     setTimeout(() => (savedMsg.value = ''), 5000)
@@ -227,6 +254,11 @@ async function handleInitWorkspace() {
         apiKey: embedApiKey.value || undefined,
         model: embedModel.value || undefined,
         dimensions: embedDimensions.value || undefined,
+      },
+      rerank: {
+        baseUrl: rerankBaseUrl.value || undefined,
+        apiKey: rerankApiKey.value || undefined,
+        model: rerankModel.value || undefined,
       },
     })
     initMsg.value = ws.initialized ? '✓ 工作区已初始化并开始索引' : '✓ 配置已应用'
@@ -322,6 +354,7 @@ async function handleTest(type: string) {
   testing.value = type
   if (type === 'chat') testChatResult.value = ''
   else if (type === 'embed') testEmbedResult.value = ''
+  else if (type === 'rerank') testRerankResult.value = ''
   else testMarkitdownResult.value = ''
   try {
     if (type === 'markitdown') {
@@ -335,6 +368,14 @@ async function handleTest(type: string) {
         apiKey: embedApiKey.value || undefined,
       })
       testEmbedResult.value = res.ok ? '✓ 测试通过' : `✗ ${res.message}`
+    } else if (type === 'rerank') {
+      const res = await testLLM({
+        type: 'rerank',
+        baseUrl: rerankBaseUrl.value,
+        model: rerankModel.value,
+        apiKey: rerankApiKey.value || undefined,
+      })
+      testRerankResult.value = res.ok ? '✓ 测试通过' : `✗ ${res.message}`
     } else {
       const res = await testLLM({
         type: 'chat',
@@ -349,6 +390,7 @@ async function handleTest(type: string) {
     const msg = `✗ ${e.message}`
     if (type === 'chat') testChatResult.value = msg
     else if (type === 'embed') testEmbedResult.value = msg
+    else if (type === 'rerank') testRerankResult.value = msg
     else testMarkitdownResult.value = msg
   } finally {
     testing.value = ''
@@ -601,6 +643,20 @@ async function handleTest(type: string) {
                   />
                 </div>
               </div>
+              <div class="settings-row">
+                <div class="settings-row__text">
+                  <div class="settings-row__title">最近文件时间窗</div>
+                  <div class="settings-row__desc">「最近文件」页展示的时间范围，修改后实时生效</div>
+                </div>
+                <div class="settings-row__control settings-row__control--narrow">
+                  <select v-model.number="recentWindowHours" class="select">
+                    <option :value="5">最近 5 小时</option>
+                    <option :value="24">最近 24 小时</option>
+                    <option :value="168">最近 7 天</option>
+                    <option :value="0">全部</option>
+                  </select>
+                </div>
+              </div>
             </div>
           </section>
 
@@ -682,6 +738,75 @@ async function handleTest(type: string) {
                     :class="{ 'settings-row__msg--ok': testEmbedResult.startsWith('✓') }"
                   >
                     {{ testEmbedResult }}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ── Rerank ── -->
+          <section id="sec-rerank" class="settings-section">
+            <h3 class="settings-section__title">重排模型</h3>
+            <div class="settings-card card">
+              <div class="settings-row">
+                <div class="settings-row__text">
+                  <div class="settings-row__title">接口地址</div>
+                  <div class="settings-row__desc">Rerank 端点（Jina / Cohere / SiliconFlow 兼容），留空则不启用重排</div>
+                </div>
+                <div class="settings-row__control settings-row__control--wide">
+                  <input
+                    v-model="rerankBaseUrl"
+                    class="input"
+                    placeholder="https://api.siliconflow.cn/v1"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-row">
+                <div class="settings-row__text">
+                  <div class="settings-row__title">API Key</div>
+                  <div class="settings-row__desc">留空不修改已保存的密钥</div>
+                </div>
+                <div class="settings-row__control settings-row__control--wide">
+                  <input
+                    v-model="rerankApiKey"
+                    class="input"
+                    type="password"
+                    placeholder="留空不修改"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-row">
+                <div class="settings-row__text">
+                  <div class="settings-row__title">模型</div>
+                  <div class="settings-row__desc">交叉编码器重排模型，用于问答与搜索的候选精排</div>
+                </div>
+                <div class="settings-row__control settings-row__control--wide">
+                  <input
+                    v-model="rerankModel"
+                    class="input"
+                    placeholder="Pro/BAAI/bge-reranker-v2-m3"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-row settings-row--action">
+                <div class="settings-row__text"></div>
+                <div class="settings-row__control settings-row__control--action">
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    :disabled="testing === 'rerank'"
+                    @click="handleTest('rerank')"
+                  >
+                    {{ testing === 'rerank' ? '测试中…' : '测试 Rerank' }}
+                  </button>
+                  <span
+                    v-if="testRerankResult"
+                    class="settings-row__msg settings-row__msg--inline"
+                    :class="{ 'settings-row__msg--ok': testRerankResult.startsWith('✓') }"
+                  >
+                    {{ testRerankResult }}
                   </span>
                 </div>
               </div>

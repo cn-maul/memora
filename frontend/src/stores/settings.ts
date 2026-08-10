@@ -31,10 +31,10 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  async function saveSecrets(llmKey?: string, embedKey?: string) {
+  async function saveSecrets(llmKey?: string, embedKey?: string, rerankKey?: string) {
     loading.value = true
     try {
-      await updateSecrets(llmKey, embedKey)
+      await updateSecrets(llmKey, embedKey, rerankKey)
       await fetch()
     } finally {
       loading.value = false

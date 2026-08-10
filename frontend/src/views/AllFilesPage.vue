@@ -4,6 +4,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { browseDir, browseSearch, browseOpen, getFileHistory, downloadHistoryVersion, resolveFileId } from '@/api/client'
 import type { BrowseEntry, BrowseSearchItem } from '@/types'
+import Crumbs from '@/components/Crumbs.vue'
 import Icon, { type IconName } from '@/components/Icon.vue'
 
 const router = useRouter()
@@ -321,14 +322,16 @@ function fileExt(name: string): string {
   return name.slice(i).toLowerCase()
 }
 
-// 索引状态文案与样式
+// 索引状态文案与样式（与后端状态机一致：pending/extracting/embedding/indexed/failed/ignored。
+// 此前缺失 extracting/embedding，提取中/嵌入中的文件被误显示为"待索引"）
 function statusLabel(e: BrowseEntry): string {
   if (e.isDir) return ''
   if (!e.indexable) return '不支持'
   const map: Record<string, string> = {
     indexed: '已索引',
     pending: '待索引',
-    indexing: '索引中',
+    extracting: '提取中',
+    embedding: '嵌入中',
     failed: '失败',
     ignored: '已忽略',
   }
@@ -337,14 +340,16 @@ function statusLabel(e: BrowseEntry): string {
 
 function statusClass(e: BrowseEntry): string {
   if (e.isDir) return ''
-  if (!e.indexable) return 'idx--unsupported'
+  if (!e.indexable) return 'status-chip--muted'
   const map: Record<string, string> = {
-    indexed: 'idx--ok',
-    indexing: 'idx--busy',
-    failed: 'idx--err',
-    pending: 'idx--pending',
+    indexed: 'status-chip--ok',
+    extracting: 'status-chip--busy',
+    embedding: 'status-chip--busy',
+    failed: 'status-chip--err',
+    pending: 'status-chip--muted',
+    ignored: 'status-chip--muted',
   }
-  return map[e.indexStatus || ''] || 'idx--pending'
+  return map[e.indexStatus || ''] || 'status-chip--muted'
 }
 </script>
 
@@ -399,12 +404,14 @@ function statusClass(e: BrowseEntry): string {
       <div v-if="openError" class="alert alert--error">{{ openError }}</div>
       <div v-if="browseError" class="alert alert--error">{{ browseError }}</div>
 
-      <!-- 搜索结果 -->
+      <!-- 搜索结果（独立滚动区） -->
       <div v-if="showSearch" class="search-results">
         <div v-if="searching" class="loading">加载中…</div>
         <div v-else-if="searchError" class="alert alert--error">{{ searchError }}</div>
-        <div v-else-if="searchResults.length === 0" class="empty-state">
-          未找到匹配「{{ searchQuery }}」的文件
+        <div v-else-if="searchResults.length === 0" class="empty-state empty-state--icon">
+          <span class="empty-state__icon"><Icon name="search" :size="20" /></span>
+          <span class="empty-state__title">未找到匹配的文件</span>
+          <span class="empty-state__desc">「{{ searchQuery }}」没有命中，换个关键词试试</span>
         </div>
         <div v-else>
           <div v-for="r in searchResults" :key="r.relPath" class="search-item card">
@@ -437,68 +444,60 @@ function statusClass(e: BrowseEntry): string {
 
       <!-- 文件列表：显示工作区全部文件 -->
       <div v-else class="file-browser">
-        <nav class="breadcrumb">
-          <span v-if="currentPath" class="crumb" @click="goUp">
-            <Icon name="arrow-left" :size="13" />
-            上一级
-          </span>
-          <span
-            v-for="(c, i) in crumbs"
-            :key="c.path"
-            class="crumb"
-            :class="{ 'crumb--current': i === crumbs.length - 1 }"
-            @click="i < crumbs.length - 1 && refreshDir(c.path)"
-          >
-            <template v-if="i > 0"><Icon name="chevron-right" :size="12" /></template>
-            {{ c.label }}
-          </span>
-        </nav>
-
-        <div class="file-list">
-          <div class="file-list-head">
-            <span>名称</span>
-            <span>类型</span>
-            <span>大小</span>
-            <span>修改时间</span>
-            <span>索引状态</span>
-            <span>操作</span>
+        <div class="file-list file-list--panel">
+          <div class="file-toolbar">
+            <Crumbs :items="crumbs" :up="!!currentPath" @navigate="refreshDir" @up="goUp" />
           </div>
-
-          <div v-if="listing" class="loading">加载中…</div>
-          <div v-else-if="entries.length === 0" class="empty-state">此目录为空</div>
-          <template v-else>
-            <div
-              v-for="e in entries"
-              :key="e.relPath"
-              class="file-row"
-              :class="{ 'file-row--dir': e.isDir, 'file-row--highlight': e.relPath === highlightPath }"
-              @click="e.isDir && refreshDir(e.relPath)"
-            >
-              <span class="file-row-name" :title="e.relPath">
-                <Icon :name="docIcon(e)" :size="16" :color="iconColor(e)" class="file-row-icon" />
-                {{ e.name }}
-              </span>
-              <span class="file-row-cell">
-                <span v-if="!e.isDir" class="doc-badge">{{ fileExt(e.name) }}</span>
-              </span>
-              <span class="file-row-cell file-row-size">{{ e.isDir ? '' : formatSize(e.size) }}</span>
-              <span class="file-row-cell file-row-time">{{ formatTime(e.mtime) }}</span>
-              <span class="file-row-cell">
-                <span v-if="!e.isDir" class="idx-badge" :class="statusClass(e)">{{ statusLabel(e) }}</span>
-              </span>
-              <span class="file-row-cell file-row-actions">
-                <button
-                  v-if="!e.isDir"
-                  class="btn btn-ghost btn-mini"
-                  @click.stop="openFile(e.relPath)"
-                  :disabled="openingPath === e.relPath"
-                >
-                  {{ openingPath === e.relPath ? '打开中…' : '打开' }}
-                </button>
-                <button v-if="!e.isDir" class="btn btn-ghost btn-mini" @click.stop="openDetailModal(e)">详情</button>
-              </span>
+          <div class="file-rows">
+            <div class="file-list-head list-head">
+              <span class="file-col-name">名称</span>
+              <span>类型</span>
+              <span class="file-col-right">大小</span>
+              <span class="file-col-right">修改时间</span>
+              <span>索引状态</span>
+              <span class="file-col-right">操作</span>
             </div>
-          </template>
+
+            <div v-if="listing" class="loading">加载中…</div>
+            <div v-else-if="entries.length === 0" class="empty-state empty-state--icon">
+              <span class="empty-state__icon"><Icon name="folder-open" :size="20" /></span>
+              <span class="empty-state__title">此目录为空</span>
+              <span class="empty-state__desc">将文档放入该目录后会自动加入索引</span>
+            </div>
+            <template v-else>
+              <div
+                v-for="e in entries"
+                :key="e.relPath"
+                class="file-row"
+                :class="{ 'file-row--dir': e.isDir, 'file-row--highlight': e.relPath === highlightPath }"
+                @click="e.isDir && refreshDir(e.relPath)"
+              >
+                <span class="file-row-name" :title="e.relPath">
+                  <Icon :name="docIcon(e)" :size="16" :color="iconColor(e)" class="file-row-icon" />
+                  {{ e.name }}
+                </span>
+                <span class="file-row-cell">
+                  <span v-if="!e.isDir" class="doc-badge">{{ fileExt(e.name) }}</span>
+                </span>
+                <span class="file-row-cell file-row-size">{{ e.isDir ? '' : formatSize(e.size) }}</span>
+                <span class="file-row-cell file-row-time">{{ formatTime(e.mtime) }}</span>
+                <span class="file-row-cell">
+                  <span v-if="!e.isDir" class="status-chip" :class="statusClass(e)">{{ statusLabel(e) }}</span>
+                </span>
+                <span class="file-row-cell file-row-actions">
+                  <button
+                    v-if="!e.isDir"
+                    class="btn btn-ghost btn-mini"
+                    @click.stop="openFile(e.relPath)"
+                    :disabled="openingPath === e.relPath"
+                  >
+                    {{ openingPath === e.relPath ? '打开中…' : '打开' }}
+                  </button>
+                  <button v-if="!e.isDir" class="btn btn-ghost btn-mini" @click.stop="openDetailModal(e)">详情</button>
+                </span>
+              </div>
+            </template>
+          </div>
         </div>
 
         <p class="file-hint">全部文件均显示；仅受支持的文档类型（PDF / DOCX / TXT / MD）会建立索引。</p>
@@ -514,6 +513,22 @@ function statusClass(e: BrowseEntry): string {
         <div class="modal-title">
           <Icon :name="docIcon(detailEntry)" :size="16" :color="iconColor(detailEntry)" />
           <span class="modal-title__name" :title="detailEntry.name">{{ detailEntry.name }}</span>
+        </div>
+
+        <!-- 元信息行：类型 / 大小 / 修改时间 -->
+        <div class="modal-meta">
+          <span class="modal-meta__item">
+            <Icon :name="detailEntry.isDir ? 'folder' : docIcon(detailEntry)" :size="12" :color="detailEntry.isDir ? undefined : iconColor(detailEntry)" />
+            {{ detailEntry.isDir ? '文件夹' : (fileExt(detailEntry.name) || '文件') }}
+          </span>
+          <span v-if="!detailEntry.isDir" class="modal-meta__item">
+            <Icon name="file" :size="12" />
+            {{ formatSize(detailEntry.size) }}
+          </span>
+          <span class="modal-meta__item">
+            <Icon name="clock" :size="12" />
+            {{ formatTime(detailEntry.mtime) }}
+          </span>
         </div>
 
         <!-- 版本历史 -->
@@ -562,10 +577,13 @@ function statusClass(e: BrowseEntry): string {
 </template>
 
 <style scoped>
+/* 页面不再整体滚动：工具栏固定，列表/搜索区各自独立滚动 */
 .all-files-page {
-  padding: 20px 24px 28px;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
   height: 100%;
+  padding: 20px 24px 28px;
+  overflow: hidden;
 }
 
 .page-sub {
@@ -588,6 +606,7 @@ function statusClass(e: BrowseEntry): string {
   border-color: transparent;
   font-size: 14px;
   color: var(--c-info);
+  flex-shrink: 0;
 }
 
 .init-banner__content {
@@ -605,6 +624,7 @@ function statusClass(e: BrowseEntry): string {
   display: flex;
   gap: 8px;
   margin-bottom: 14px;
+  flex-shrink: 0;
 }
 
 .search-input-wrap {
@@ -625,8 +645,11 @@ function statusClass(e: BrowseEntry): string {
   padding-left: 34px;
 }
 
+/* 搜索结果：独立滚动区 */
 .search-results {
-  margin-bottom: 16px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .search-item {
@@ -658,57 +681,53 @@ function statusClass(e: BrowseEntry): string {
   font-size: 12px;
 }
 
-/* 文件列表 */
+/* 文件列表：一体式面板（面包屑栏 + 可滚动行区 + 吸顶表头） */
 .file-browser {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
-.breadcrumb {
+.file-list--panel {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  align-items: center;
-  gap: 2px;
-  font-size: 13px;
-  flex-wrap: wrap;
-  color: var(--c-info);
-  min-height: 24px;
-}
-
-.crumb {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  cursor: pointer;
-  padding: 2px 6px;
-  border-radius: var(--r-xs);
-  color: var(--c-info);
-  transition: background 0.14s;
-}
-
-.crumb:hover {
-  background: var(--c-info-soft);
-  text-decoration: none;
-}
-
-.crumb--current {
-  color: var(--c-text-primary);
-  font-weight: 600;
-  cursor: default;
-}
-
-.crumb--current:hover {
-  background: transparent;
-}
-
-.file-list {
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--c-bg-panel);
   border: 1px solid var(--c-border);
   border-radius: var(--r-lg);
-  background: var(--c-bg-panel);
-  overflow: hidden;
 }
 
-.file-list-head,
+.file-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--c-border);
+  flex-shrink: 0;
+}
+
+.file-rows {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.file-list-head {
+  grid-template-columns: minmax(200px, 1fr) 72px 84px 150px 96px auto;
+}
+
+.file-col-name {
+  padding-left: 24px; /* 与行内 16px 图标 + 8px 间距对齐 */
+}
+
+.file-col-right {
+  text-align: right;
+}
+
 .file-row {
   display: grid;
   grid-template-columns: minmax(200px, 1fr) 72px 84px 150px 96px auto;
@@ -716,28 +735,6 @@ function statusClass(e: BrowseEntry): string {
   gap: 10px;
   padding: 9px 14px;
   font-size: 13px;
-}
-
-.file-list-head {
-  font-weight: 600;
-  color: var(--c-text-tertiary);
-  background: var(--c-bg-secondary);
-  border-bottom: 1px solid var(--c-border);
-  font-size: 12px;
-  letter-spacing: 0.02em;
-}
-
-/* 表头与数据列对齐：首项偏移匹配文件名前的图标宽度+间距，右值列右对齐 */
-.file-list-head span:first-child {
-  padding-left: 24px; /* 16px icon + 8px gap */
-}
-.file-list-head span:nth-child(3),
-.file-list-head span:nth-child(4),
-.file-list-head span:nth-child(6) {
-  text-align: right;
-}
-
-.file-row {
   border-bottom: 1px solid var(--c-border);
   transition: background 0.12s ease;
 }
@@ -813,45 +810,11 @@ function statusClass(e: BrowseEntry): string {
   text-transform: uppercase;
 }
 
-.idx-badge {
-  display: inline-block;
-  padding: 1px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  border-radius: var(--r-full);
-  white-space: nowrap;
-}
-
-.idx--ok {
-  background: var(--c-success-soft);
-  color: var(--c-success);
-}
-
-.idx--busy {
-  background: var(--c-info-soft);
-  color: var(--c-info);
-}
-
-.idx--err {
-  background: var(--c-danger-soft, rgba(224, 108, 117, 0.14));
-  color: var(--c-danger);
-}
-
-.idx--pending {
-  background: var(--c-bg-elevated);
-  color: var(--c-text-secondary);
-}
-
-.idx--unsupported {
-  background: transparent;
-  color: var(--c-text-tertiary);
-  font-weight: 400;
-}
-
 .file-hint {
   font-size: 12px;
   color: var(--c-text-tertiary);
-  margin: 4px 2px 0;
+  margin: 0 2px;
+  flex-shrink: 0;
 }
 
 /* ──────── 文件详情弹窗 ──────── */
@@ -884,13 +847,35 @@ function statusClass(e: BrowseEntry): string {
   gap: 8px;
   font-size: 15px;
   font-weight: 600;
-  margin-bottom: 16px;
+  margin-bottom: 8px;
 }
 
 .modal-title__name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 元信息行：类型 / 大小 / 修改时间 */
+.modal-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  color: var(--c-text-tertiary);
+}
+
+.modal-meta__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.modal-meta__item svg {
+  color: var(--c-icon-secondary);
 }
 
 .detail-grid {

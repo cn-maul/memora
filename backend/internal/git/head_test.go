@@ -3,6 +3,7 @@ package git
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,6 +190,61 @@ func TestFileHistoryOnlyRealChanges(t *testing.T) {
 	}
 	if len(histB) != 4 {
 		t.Fatalf("b.txt history = %d commits, want 4", len(histB))
+	}
+}
+
+// TestSubdirPathsWithOSSeparators 覆盖 Windows 分隔符回归：storage 的 rel_path 用系统分隔符
+// （Windows 反斜杠），go-git 的树路径恒为 "/"；FileHistory/ShowFileAt 必须归一化后匹配，
+// 否则子目录文件的版本历史与内容读取全部失效（review 发现）。
+func TestSubdirPathsWithOSSeparators(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		p := filepath.Join(dir, rel)
+		os.MkdirAll(filepath.Dir(p), 0755)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repo, err := gogit.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := &object.Signature{Name: "Test", Email: "t@test.x", When: time.Now()}
+
+	write(filepath.Join("sub", "c.txt"), "hello sub")
+	write("root.txt", "hello root")
+	wt.Add(".")
+	if _, err := wt.Commit("根提交", &gogit.CommitOptions{Author: sig}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(testCfg{})
+	if err := m.EnsureRepo(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// 用 OS 分隔符路径（模拟 storage 中存的样子：Windows 下是反斜杠）
+	osRel := filepath.Join("sub", "c.txt")
+
+	hist, err := m.FileHistory(osRel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 1 {
+		t.Fatalf("FileHistory(%q) = %d commits, want 1", osRel, len(hist))
+	}
+
+	content, err := m.ShowFileAt(osRel, hist[0].Hash)
+	if err != nil {
+		t.Fatalf("ShowFileAt(%q) 失败: %v", osRel, err)
+	}
+	if strings.TrimSpace(content) != "hello sub" {
+		t.Fatalf("ShowFileAt content = %q, want %q", content, "hello sub")
 	}
 }
 

@@ -345,6 +345,14 @@ func (m *Module) diffStatsLocked(hash string) (*contract.DiffStat, error) {
 	return stat, nil
 }
 
+// toSlash 将 OS 分隔符路径转成 go-git 树路径（正斜杠）。
+// storage 的 rel_path 在 Windows 上是反斜杠，而 go-git 的 Tree.File / Log PathFilter
+// 一律按 "/" 分隔匹配，直接传入会导致子目录文件的版本历史/内容/还原查不到（review 发现）。
+// 在非 Windows 上是幂等操作。
+func toSlash(p string) string {
+	return strings.ReplaceAll(p, "\\", "/")
+}
+
 // FileHistory 获取文件的历史提交。
 // 用 PathFilter 仅返回真实改动该文件的提交（与父提交 diff 比较），
 // 修复：此前用 tree.File 判断"提交树中是否存在"会把从未改动的文件
@@ -357,8 +365,9 @@ func (m *Module) FileHistory(relPath string) ([]*contract.CommitInfo, error) {
 		return nil, fmt.Errorf("[git] 仓库未初始化")
 	}
 
+	treePath := toSlash(relPath)
 	iter, err := m.repo.Log(&gogit.LogOptions{
-		PathFilter: func(p string) bool { return p == relPath },
+		PathFilter: func(p string) bool { return p == treePath },
 	})
 	if err != nil {
 		return nil, fmt.Errorf("[git] 获取日志失败: %w", err)
@@ -404,7 +413,8 @@ func (m *Module) showFileAtLocked(relPath, hash string) (string, error) {
 		return "", fmt.Errorf("[git] 获取树失败: %w", err)
 	}
 
-	file, err := tree.File(relPath)
+	// 树路径用正斜杠；Windows 下传入的反斜杠 relPath 需归一化（review 发现）
+	file, err := tree.File(toSlash(relPath))
 	if err != nil {
 		return "", fmt.Errorf("[git] 在提交中查找文件失败: %w", err)
 	}
@@ -652,6 +662,65 @@ func (m *Module) CommitFiles(hash string) ([]*contract.CommitFile, error) {
 			status = "added"
 		}
 		files = append(files, &contract.CommitFile{Path: fileName, Status: status})
+	}
+
+	return files, nil
+}
+
+// versionDocType 根据文件扩展名返回文档类型（与 browser.detectDocType 一致）
+func versionDocType(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".pdf":
+		return "pdf"
+	case ".docx":
+		return "docx"
+	case ".pptx":
+		return "pptx"
+	case ".xlsx":
+		return "xlsx"
+	case ".txt":
+		return "txt"
+	case ".md":
+		return "md"
+	case ".doc":
+		return "ignored"
+	default:
+		return ""
+	}
+}
+
+// ListTreeAt 列出某提交快照中的全部文件（递归整树）。
+// 返回文件路径、大小、文档类型，供前端浏览该提交的全部文件。
+func (m *Module) ListTreeAt(hash string) ([]*contract.VersionFile, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.repo == nil {
+		return nil, fmt.Errorf("[git] 仓库未初始化")
+	}
+
+	commit, err := m.repo.CommitObject(plumbing.NewHash(hash))
+	if err != nil {
+		return nil, fmt.Errorf("[git] 获取提交失败: %w", err)
+	}
+
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, fmt.Errorf("[git] 获取树失败: %w", err)
+	}
+
+	var files []*contract.VersionFile
+	err = tree.Files().ForEach(func(f *object.File) error {
+		files = append(files, &contract.VersionFile{
+			Path:    f.Name,
+			Size:    f.Size, // File 内嵌 Blob，Size 为 int64 字段
+			DocType: versionDocType(f.Name),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("[git] 遍历树文件失败: %w", err)
 	}
 
 	return files, nil

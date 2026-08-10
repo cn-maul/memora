@@ -84,6 +84,7 @@ type StorageAPI interface {
 	QASessionsList() ([]*contract.QASession, error)
 	QASessionsDelete(id int64) error
 	QAMessagesBySession(sessionID int64) ([]*contract.QAMessage, error)
+	FilesRecent(sinceMs int64, limit int) ([]*contract.FileInfo, error)
 }
 
 // GitAPI git 模块接口
@@ -99,6 +100,7 @@ type GitAPI interface {
 	RestoreFile(relPath, hash string) error
 	Head() (*contract.HeadInfo, error)
 	CommitFiles(hash string) ([]*contract.CommitFile, error)
+	ListTreeAt(hash string) ([]*contract.VersionFile, error)
 }
 
 // WatchAPI watch 模块接口
@@ -162,7 +164,7 @@ type ConfigAPI interface {
 	Get(key string) (interface{}, error)
 	Set(key string, value interface{}) error
 	Snapshot() map[string]interface{}
-	UpsertSecrets(llmKey, embedKey string) error
+	UpsertSecrets(llmKey, embedKey, rerankKey string) error
 	Relocate(workspace string) error
 }
 
@@ -172,6 +174,7 @@ type LLMAPI interface {
 	TestEmbed() error
 	TestChatWith(baseURL, apiKey, model string, temperature float64) error
 	TestEmbedWith(baseURL, apiKey, model string) error
+	TestRerankWith(baseURL, apiKey, model string) error
 }
 
 // BrowserAPI 文件浏览模块接口
@@ -389,6 +392,9 @@ func (m *Module) registerRoutes() {
 
 	// 文件历史版本下载
 	m.mux.HandleFunc("/api/files/download-history", m.handleFileDownloadHistory)
+
+	// 最近文件（时间窗筛选，按 mtime 倒序）
+	m.mux.HandleFunc("/api/files/recent", m.handleFilesRecent)
 
 	// 按相对路径解析文件 id（供详情弹窗关联版本历史用）
 	m.mux.HandleFunc("/api/files/resolve", m.handleFileResolve)
@@ -652,6 +658,11 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 			Model      string `json:"model"`
 			Dimensions int    `json:"dimensions"`
 		} `json:"embed"`
+		Rerank struct {
+			BaseURL string `json:"baseUrl"`
+			APIKey  string `json:"apiKey"`
+			Model   string `json:"model"`
+		} `json:"rerank"`
 	}
 	if err := readBody(r, &req); err != nil {
 		writeError(w, "bad_request", "请求体解析失败", http.StatusBadRequest)
@@ -734,7 +745,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if req.LLM.APIKey != "" {
-			if err := m.handler.Config.UpsertSecrets(req.LLM.APIKey, ""); err != nil {
+			if err := m.handler.Config.UpsertSecrets(req.LLM.APIKey, "", ""); err != nil {
 				writeError(w, "internal", fmt.Sprintf("保存 LLM 密钥失败: %v", err), http.StatusInternalServerError)
 				return
 			}
@@ -763,7 +774,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.Embed.APIKey != "" {
-		if err := m.handler.Config.UpsertSecrets("", req.Embed.APIKey); err != nil {
+		if err := m.handler.Config.UpsertSecrets("", req.Embed.APIKey, ""); err != nil {
 			writeError(w, "internal", fmt.Sprintf("保存 Embed 密钥失败: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -777,6 +788,26 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 	if req.Embed.Dimensions != 0 {
 		if err := m.handler.Config.Set("embed.dimensions", float64(req.Embed.Dimensions)); err != nil {
 			writeError(w, "internal", fmt.Sprintf("保存 Embed 维度失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// 4.5 保存 Rerank 配置（错误须检查）
+	if req.Rerank.BaseURL != "" {
+		if err := m.handler.Config.Set("rerank.baseUrl", req.Rerank.BaseURL); err != nil {
+			writeError(w, "internal", fmt.Sprintf("保存 Rerank 接口失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+	if req.Rerank.APIKey != "" {
+		if err := m.handler.Config.UpsertSecrets("", "", req.Rerank.APIKey); err != nil {
+			writeError(w, "internal", fmt.Sprintf("保存 Rerank 密钥失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+	if req.Rerank.Model != "" {
+		if err := m.handler.Config.Set("rerank.model", req.Rerank.Model); err != nil {
+			writeError(w, "internal", fmt.Sprintf("保存 Rerank 模型失败: %v", err), http.StatusInternalServerError)
 			return
 		}
 	}
@@ -923,6 +954,9 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 	idStr := getPathParam(path, "/api/files/")
 
 	if idStr == "" || idStr == "search" {
+		// /api/files/search 与 /api/files/ 无对应资源：
+		// 此前直接 return 留下空 200 响应体，前端拿到 undefined 再点属性会白屏（review 发现）
+		writeError(w, "not_found", "文件不存在", http.StatusNotFound)
 		return
 	}
 
@@ -1380,12 +1414,50 @@ func (m *Module) handleFileResolve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "bad_request", "缺少 relPath 参数", http.StatusBadRequest)
 		return
 	}
-	file, err := m.handler.Storage.FilesFindByRelPath(relPath)
+	// 前端传的是浏览器模块的正斜杠路径，数据库 rel_path 在 Windows 上是反斜杠，
+	// 需归一化后再查，否则子目录文件恒返回"未索引"（review 发现）
+	file, err := m.handler.Storage.FilesFindByRelPath(filepath.FromSlash(relPath))
 	if err != nil || file == nil {
 		writeError(w, "not_found", "文件未索引", http.StatusNotFound)
 		return
 	}
 	writeOK(w, map[string]interface{}{"fileId": file.ID})
+}
+
+// handleFilesRecent GET /api/files/recent?window=24&limit=50
+// 返回最近 window 小时内修改的文件（按 mtime 倒序）。window=0 表示不限制时间窗。
+func (m *Module) handleFilesRecent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, "bad_request", "仅支持 GET", http.StatusBadRequest)
+		return
+	}
+	// 工作区未初始化无意义
+	if m.workspacePath() == "" {
+		writeError(w, "not_configured", "工作区未初始化", http.StatusBadRequest)
+		return
+	}
+
+	window := getQueryInt(r, "window", 24) // 小时；0 = 全部
+	limit := getQueryInt(r, "limit", 50)
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+
+	var since int64
+	if window > 0 {
+		since = time.Now().Add(-time.Duration(window) * time.Hour).UnixMilli()
+	}
+
+	files, err := m.handler.Storage.FilesRecent(since, limit)
+	if err != nil {
+		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeOK(w, map[string]interface{}{
+		"window": window,
+		"items":  files,
+	})
 }
 
 // handleTimeline GET /api/timeline
@@ -1810,9 +1882,28 @@ func (m *Module) handleCommitList(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]interface{}{"commits": items})
 }
 
-// handleCommitByHash POST /api/commits/{hash}/summary
+// handleCommitByHash GET /api/commits/{hash}/files、POST /api/commits/{hash}/summary
 func (m *Module) handleCommitByHash(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+
+	// GET /api/commits/{hash}/files —— 列出该提交快照的全部文件
+	if strings.HasSuffix(path, "/files") && r.Method == http.MethodGet {
+		hash := getPathParam(path, "/api/commits/")
+		hash = strings.TrimSuffix(hash, "/files")
+		if !isHexSHA1(hash) {
+			writeError(w, "bad_request", "无效提交哈希", http.StatusBadRequest)
+			return
+		}
+		files, err := m.handler.Git.ListTreeAt(hash)
+		if err != nil {
+			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeOK(w, map[string]interface{}{"hash": hash, "files": files})
+		return
+	}
+
+	// POST /api/commits/{hash}/summary
 	if strings.HasSuffix(path, "/summary") && r.Method == http.MethodPost {
 		hash := getPathParam(path, "/api/commits/")
 		hash = strings.TrimSuffix(hash, "/summary")
@@ -1924,14 +2015,15 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 		// PUT /api/settings/secrets
 		if strings.HasSuffix(r.URL.Path, "/secrets") {
 			var req struct {
-				LLMApiKey   string `json:"llmApiKey"`
-				EmbedApiKey string `json:"embedApiKey"`
+				LLMApiKey    string `json:"llmApiKey"`
+				EmbedApiKey  string `json:"embedApiKey"`
+				RerankApiKey string `json:"rerankApiKey"`
 			}
 			if err := readBody(r, &req); err != nil {
 				writeError(w, "bad_request", "请求体解析失败", http.StatusBadRequest)
 				return
 			}
-			if err := m.handler.Config.UpsertSecrets(req.LLMApiKey, req.EmbedApiKey); err != nil {
+			if err := m.handler.Config.UpsertSecrets(req.LLMApiKey, req.EmbedApiKey, req.RerankApiKey); err != nil {
 				writeError(w, "internal", err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -1984,7 +2076,10 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 				}
 			default:
 				// 其余配置项属于需重启生效项（或已由特定模块热更新）
-				if key != "stats.enabled" {
+				// recent.windowHours 由最近文件页实时读取；rerank.* 由 llm 模块每次调用实时读取
+				switch key {
+				case "stats.enabled", "recent.windowHours", "rerank.baseUrl", "rerank.model":
+				default:
 					restartKeys[key] = true
 				}
 			}
@@ -2047,9 +2142,12 @@ func (m *Module) handleTest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var err error
-		if req.Type == "embed" {
+		switch req.Type {
+		case "embed":
 			err = m.handler.LLM.TestEmbedWith(req.BaseURL, req.ApiKey, req.Model)
-		} else {
+		case "rerank":
+			err = m.handler.LLM.TestRerankWith(req.BaseURL, req.ApiKey, req.Model)
+		default:
 			err = m.handler.LLM.TestChatWith(req.BaseURL, req.ApiKey, req.Model, req.Temperature)
 		}
 		if err != nil {

@@ -432,6 +432,7 @@ textarea.input {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 18px;
+  flex-shrink: 0; /* 供全高 flex 布局页面（资源管理器/全部文件）使用，其余页面无副作用 */
 }
 
 .page-header h2 {
@@ -504,6 +505,90 @@ textarea.input {
   height: 1px;
   background: var(--c-border);
   margin: 12px 0;
+}
+
+/* ──────────────────────── 文件管理器（资源管理器 / 全部文件共用） ──────────────────────── */
+
+/* 一体化浏览面板：内部 240px 目录树 + 1px 分隔线 + 文件列表，各自独立滚动。
+   替换旧的两张割裂圆角卡片 + sticky/calc 高度 hack（review 改造）。 */
+.file-manager__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  background: var(--c-bg-panel);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+
+.file-manager__tree {
+  width: 240px;
+  flex-shrink: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--c-bg-secondary);
+  border-right: 1px solid var(--c-border);
+}
+
+.file-manager__list {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 列表表头：吸顶（相对各自滚动容器），与行网格对齐 */
+.list-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: grid;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--c-text-tertiary);
+  background: var(--c-bg-secondary);
+  border-bottom: 1px solid var(--c-border);
+  white-space: nowrap; /* 表头文字不换行 */
+}
+
+/* 带图标的空态（替代纯灰字） */
+.empty-state--icon {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.empty-state--icon .empty-state__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  border-radius: var(--r-xl);
+  background: var(--c-bg-secondary);
+  color: var(--c-icon-secondary);
+  margin-bottom: 8px;
+}
+
+.empty-state__title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--c-text-secondary);
+}
+
+.empty-state__desc {
+  font-size: 12px;
+  color: var(--c-text-tertiary);
 }
 /* 明暗主题通过 data-theme 属性切换；浅色模式在此统一覆盖颜色变量 */
 [data-theme="light"] {

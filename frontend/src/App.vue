@@ -26,7 +26,7 @@ const filesStore = useFilesStore()
 
 // 设置页自带完整侧边栏，隐藏全局壳的两侧面板以腾出空间
 const hideSidePanels = computed(() => route.path === '/settings')
-// 右侧对话区只在主页（全部文件 /files）显示：
+// 右侧对话区只在主页（最近文件 /files）显示：
 // 问答/统计/提交记录/索引等页面有自己的主内容区，右侧对话会让布局拥挤
 // （需求：右侧边栏对话只在主页全部文件显示）
 const hideChatPanel = computed(() => route.path !== '/files')
@@ -44,10 +44,10 @@ async function refreshQueue() {
 let queueTimer: ReturnType<typeof setInterval> | null = null
 
 const navItems: { path: string; label: string; icon: IconName }[] = [
-  { path: '/files', label: '全部文件', icon: 'folder' },
-  { path: '/workspace', label: '资源管理器', icon: 'folder-open' },
+  { path: '/files', label: '最近文件', icon: 'clock' },
+  { path: '/workspace', label: '全部文件', icon: 'folder' },
   { path: '/index', label: '文档索引', icon: 'search' },
-  { path: '/timeline', label: '提交记录', icon: 'clock' },
+  { path: '/timeline', label: '提交记录', icon: 'git-branch' },
   { path: '/qa', label: '问答', icon: 'chat' },
   { path: '/stats', label: '统计', icon: 'chart' },
   { path: '/settings', label: '设置', icon: 'settings' },
@@ -428,16 +428,18 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <nav class="nav" v-show="!sidebarCollapsed">
+      <nav class="nav">
         <router-link
           v-for="item in navItems"
           :key="item.path"
           :to="item.path"
           class="nav-item"
+          :class="{ 'nav-item--collapsed': sidebarCollapsed }"
+          :title="sidebarCollapsed ? item.label : undefined"
           active-class="nav-item--active"
         >
           <Icon :name="item.icon" :size="16" />
-          <span class="nav-label">{{ item.label }}</span>
+          <span v-show="!sidebarCollapsed" class="nav-label">{{ item.label }}</span>
         </router-link>
       </nav>
 
@@ -825,6 +827,11 @@ onUnmounted(() => {
 .nav-item svg {
   color: var(--c-icon-secondary);
   flex-shrink: 0;
+}
+/* 折叠态：仅居中显示图标，仍可点击切换页面 */
+.nav-item--collapsed {
+  justify-content: center;
+  padding: 7px 0;
 }
 .nav-item--active {
   background: var(--c-bg-hover);

@@ -17,6 +17,7 @@ import type {
   BrowseSearchResponse,
   BrowsePickDirResponse,
   CommitItem,
+  VersionFile,
 } from '@/types'
 
 const http = axios.create({
@@ -53,6 +54,14 @@ export async function listFiles(params: {
   sort?: string
 }): Promise<PaginatedData<FileItem>> {
   const { data } = await http.get<ApiResponse<PaginatedData<FileItem>>>('/files', { params })
+  return data.data!
+}
+
+export async function getRecentFiles(params?: {
+  window?: number
+  limit?: number
+}): Promise<{ items: FileItem[]; window: number }> {
+  const { data } = await http.get<ApiResponse<{ items: FileItem[]; window: number }>>('/files/recent', { params })
   return data.data!
 }
 
@@ -326,6 +335,11 @@ export async function getCommitList(): Promise<CommitItem[]> {
   return data.data!.commits || []
 }
 
+export async function getCommitFiles(commitHash: string): Promise<VersionFile[]> {
+  const { data } = await http.get<ApiResponse<{ files: VersionFile[] }>>(`/commits/${commitHash}/files`)
+  return data.data?.files || []
+}
+
 // ──────── 设置 ────────
 
 export async function getSettings(): Promise<Record<string, any>> {
@@ -338,8 +352,8 @@ export async function updateSettings(settings: Record<string, any>): Promise<{ r
   return data.data ?? { restartRequired: [] }
 }
 
-export async function updateSecrets(llmApiKey?: string, embedApiKey?: string): Promise<void> {
-  await http.put('/settings/secrets', { llmApiKey, embedApiKey })
+export async function updateSecrets(llmApiKey?: string, embedApiKey?: string, rerankApiKey?: string): Promise<void> {
+  await http.put('/settings/secrets', { llmApiKey, embedApiKey, rerankApiKey })
 }
 
 // ──────── 测试 ────────
@@ -350,7 +364,7 @@ export async function testMarkitdown(pythonPath: string, command: string): Promi
 }
 
 export interface LLMTestParams {
-  type: 'chat' | 'embed'
+  type: 'chat' | 'embed' | 'rerank'
   baseUrl?: string
   model?: string
   apiKey?: string

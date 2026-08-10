@@ -60,6 +60,12 @@ export interface CommitFile {
   status: string // added|modified|deleted
 }
 
+export interface VersionFile {
+  path: string
+  size: number
+  docType?: string
+}
+
 export interface CommitItem extends CommitInfo {
   files?: CommitFile[]
 }
@@ -202,6 +208,11 @@ export interface InitRequest {
     apiKey?: string
     model?: string
     dimensions?: number
+  }
+  rerank?: {
+    baseUrl?: string
+    apiKey?: string
+    model?: string
   }
 }
 

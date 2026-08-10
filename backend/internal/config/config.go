@@ -54,6 +54,16 @@ type Config struct {
 		ScanIntervalSec int `json:"scan_interval_sec"`
 	} `json:"index"`
 
+	Recent struct {
+		WindowHours int `json:"window_hours"`
+	} `json:"recent"`
+
+	Rerank struct {
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+		Model   string `json:"model"`
+	} `json:"rerank"`
+
 	QA struct {
 		MaxContextChars int    `json:"max_context_chars"`
 		SystemPrompt    string `json:"system_prompt"`
@@ -108,6 +118,8 @@ func defaultConfig() *Config {
 	c.Index.ChunkSize = 2000
 	c.Index.ChunkOverlap = 256
 	c.Index.ScanIntervalSec = 8
+	c.Recent.WindowHours = 24 // 最近文件默认展示"最近 24 小时"内修改的文件
+	c.Rerank.Model = "Pro/BAAI/bge-reranker-v2-m3" // 重排模型默认值（SiliconFlow）
 	c.QA.MaxContextChars = 30000
 	c.Stats.Enabled = true
 	c.Tray.Enabled = true
@@ -281,6 +293,14 @@ func (m *Module) getByPath(key string) (interface{}, error) {
 		return m.cfg.Index.ChunkOverlap, nil
 	case "index.scanIntervalSec":
 		return m.cfg.Index.ScanIntervalSec, nil
+	case "recent.windowHours":
+		return m.cfg.Recent.WindowHours, nil
+	case "rerank.baseUrl":
+		return m.cfg.Rerank.BaseURL, nil
+	case "rerank.apiKey":
+		return nil, fmt.Errorf("[config] 密钥不通过 Get 读取，使用 UpsertSecrets")
+	case "rerank.model":
+		return m.cfg.Rerank.Model, nil
 	case "qa.maxContextChars":
 		return m.cfg.QA.MaxContextChars, nil
 	case "qa.systemPrompt":
@@ -425,6 +445,24 @@ func (m *Module) setByPath(key string, value interface{}) error {
 			return fmt.Errorf("[config] index.scanIntervalSec 需要数字类型")
 		}
 		m.cfg.Index.ScanIntervalSec = int(vFloat)
+	case "recent.windowHours":
+		vFloat, ok := value.(float64)
+		if !ok {
+			return fmt.Errorf("[config] recent.windowHours 需要数字类型")
+		}
+		m.cfg.Recent.WindowHours = int(vFloat)
+	case "rerank.baseUrl":
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("[config] rerank.baseUrl 需要 string 类型")
+		}
+		m.cfg.Rerank.BaseURL = v
+	case "rerank.model":
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("[config] rerank.model 需要 string 类型")
+		}
+		m.cfg.Rerank.Model = v
 	case "qa.maxContextChars":
 		vFloat, ok := value.(float64)
 		if !ok {
@@ -491,6 +529,13 @@ func (m *Module) Snapshot() map[string]interface{} {
 			"chunkOverlap":    m.cfg.Index.ChunkOverlap,
 			"scanIntervalSec": m.cfg.Index.ScanIntervalSec,
 		},
+		"recent": map[string]interface{}{
+			"windowHours": m.cfg.Recent.WindowHours,
+		},
+		"rerank": map[string]interface{}{
+			"baseUrl": m.cfg.Rerank.BaseURL,
+			"model":   m.cfg.Rerank.Model,
+		},
 		"qa": map[string]interface{}{
 			"maxContextChars": m.cfg.QA.MaxContextChars,
 			"systemPrompt":    m.cfg.QA.SystemPrompt,
@@ -505,7 +550,7 @@ func (m *Module) Snapshot() map[string]interface{} {
 }
 
 // UpsertSecrets 更新密钥（不回显）
-func (m *Module) UpsertSecrets(llmKey, embedKey string) error {
+func (m *Module) UpsertSecrets(llmKey, embedKey, rerankKey string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -514,6 +559,9 @@ func (m *Module) UpsertSecrets(llmKey, embedKey string) error {
 	}
 	if embedKey != "" {
 		m.cfg.Embed.APIKey = embedKey
+	}
+	if rerankKey != "" {
+		m.cfg.Rerank.APIKey = rerankKey
 	}
 	return m.save()
 }
@@ -545,6 +593,13 @@ func (m *Module) GetEmbedConfig() (baseURL, apiKey, model string, dimensions int
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.cfg.Embed.BaseURL, m.cfg.Embed.APIKey, m.cfg.Embed.Model, m.cfg.Embed.Dimensions
+}
+
+// GetRerankConfig 获取重排配置（供 llm 模块使用）
+func (m *Module) GetRerankConfig() (baseURL, apiKey, model string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg.Rerank.BaseURL, m.cfg.Rerank.APIKey, m.cfg.Rerank.Model
 }
 
 // GetAutoCommitConfig 获取自动提交配置

@@ -49,6 +49,8 @@ type Module struct {
 }
 
 // New 创建标签模块
+// 标签库不再预置海量标签：仅在 AI 自动打标/用户手动添加时创建（修复：预置标签过多）。
+// predefinedTags 仍作为 AI 提示词的候选池，但不会提前写入数据库。
 func New(storage IStorage, llm ILLM, events IEvents) *Module {
 	m := &Module{
 		storage:     storage,
@@ -58,26 +60,10 @@ func New(storage IStorage, llm ILLM, events IEvents) *Module {
 		rejectCount: make(map[string]int),
 	}
 
-	// 种子化预定义标签
-	m.seedPredefined()
-
 	return m
 }
 
-// seedPredefined 将预定义标签写入标签库（幂等）
-func (m *Module) seedPredefined() {
-	for _, name := range predefinedTags {
-		existing, err := m.storage.TagsGetByName(name)
-		if err != nil || existing != nil {
-			continue
-		}
-		if _, err := m.storage.TagsCreate(name, "predefined"); err != nil {
-			logx.Warn("tag", "种子化标签失败", "name", name, "err", err.Error())
-		}
-	}
-}
-
-// predefinedTags 预定义标签库
+// predefinedTags 预定义标签库（仅作为 AI 提示词的候选池，不预写入数据库）
 var predefinedTags = []string{
 	"合同", "报告", "会议纪要", "数据", "图纸", "简历", "发票",
 	"方案", "清单", "学习笔记", "通知", "制度", "流程", "分析",
@@ -147,6 +133,29 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 			Name:   tagName,
 			Origin: "auto",
 		})
+	}
+
+	// 保留用户手动添加/确认的标签：自动打标走 FileTagsReplace 全量替换，
+	// 直接写入会抹掉 manual/user_confirmed 标签（文件每次变更重索引都会重新打标，问题必然复现）。
+	// 合并规则：origin 非 auto 的原样保留；auto 标签与保留标签按名字去重。
+	if existing, lerr := m.storage.FileTagsListByFile(file.ID); lerr == nil {
+		merged := make([]contract.FileTag, 0, len(existing)+len(fileTags))
+		seen := make(map[string]bool, len(existing)+len(fileTags))
+		for _, t := range existing {
+			if t.Origin == "auto" {
+				continue
+			}
+			merged = append(merged, t)
+			seen[t.Name] = true
+		}
+		for _, t := range fileTags {
+			if seen[t.Name] {
+				continue
+			}
+			merged = append(merged, t)
+			seen[t.Name] = true
+		}
+		fileTags = merged
 	}
 
 	if err := m.storage.FileTagsReplace(file.ID, fileTags); err != nil {

@@ -34,6 +34,8 @@ type ILLM interface {
 	Chat(system, user string, opts *contract.ChatOptions) (string, error)
 	ChatStream(system, user string, opts *contract.ChatOptions, cancel <-chan struct{}) (<-chan string, error)
 	Embed(texts []string) ([][]float32, error)
+	EmbedQuery(text string) ([]float32, error)             // 查询嵌入（自动加检索指令前缀）
+	Rerank(query string, docs []string) ([]float64, error) // 可选：未配置时返回错误
 }
 
 // IEvents qa 所需的事件接口
@@ -111,7 +113,7 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 
 	userPrompt := fmt.Sprintf("%s\n\n问题：%s", contextStr, req.Question)
 
-	answer, err := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 1600})
+	answer, err := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 2400})
 	if err != nil {
 		// 失败回滚：若是本次新建的会话则整会话删除，避免留下孤立空会话（修复 M-03）
 		if newSession {
@@ -192,6 +194,10 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 			case ch <- notFound:
 			case <-cancel:
 				// 取消：发取消响应，避免 transport 走"成功完成"流程（修复 review should-fix）
+				// 若为本轮新建会话则整会话删除，避免留下孤立空会话（与 M-03 一致）
+				if newSession {
+					_ = m.storage.QASessionsDelete(sessionID)
+				}
 				done <- &contract.QAResponse{Error: "已取消"}
 				return
 			}
@@ -201,7 +207,7 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 
 		userPrompt := fmt.Sprintf("%s\n\n问题：%s", contextStr, req.Question)
 
-		chunks, err := m.llm.ChatStream(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 1600}, cancel)
+		chunks, err := m.llm.ChatStream(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 2400}, cancel)
 		if err != nil {
 			if newSession {
 				_ = m.storage.QASessionsDelete(sessionID)
@@ -225,7 +231,11 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 			case ch <- chunk:
 			case <-cancel:
 				// 客户端取消：向 done 发送取消响应而非直接 return，
-				// 否则 done 通道关闭时 transport 收到 nil 会 panic（修复审计高危）
+				// 否则 done 通道关闭时 transport 收到 nil 会 panic（修复审计高危）。
+				// 本轮新建的会话尚未写入任何消息，删除避免留下孤立空会话。
+				if newSession {
+					_ = m.storage.QASessionsDelete(sessionID)
+				}
 				done <- &contract.QAResponse{Error: "已取消"}
 				return
 			}
@@ -240,16 +250,22 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 			// 重试前检查取消：非流式 Chat 无法中途打断，取消后不应再发起重试（review 发现）
 			select {
 			case <-cancel:
+				if newSession {
+					_ = m.storage.QASessionsDelete(sessionID)
+				}
 				done <- &contract.QAResponse{Error: "已取消"}
 				return
 			default:
 			}
 
 			logx.Warn("qa", "流式回答为空，改用非流式重试", "question", req.Question)
-			retried, rerr := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 1600})
+			retried, rerr := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 2400})
 			// 重试完成后再次检查取消：用户中止时丢弃重试结果，不写入会话（review 发现）
 			select {
 			case <-cancel:
+				if newSession {
+					_ = m.storage.QASessionsDelete(sessionID)
+				}
 				done <- &contract.QAResponse{Error: "已取消"}
 				return
 			default:
@@ -324,101 +340,121 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 			sources = append(sources, contract.QASource{RelPath: file.RelPath, Seq: 0})
 		} else {
 			// 超限：嵌入查询后仅在该文件的分块中搜索 top-K
-			vecs, err := m.llm.Embed([]string{req.Question})
+			queryVec, err := m.llm.EmbedQuery(req.Question)
 			if err != nil {
 				return nil, nil, fmt.Errorf("[qa] 嵌入问题失败: %w", err)
 			}
-			if len(vecs) > 0 {
-				// 全库搜索取回 2×块数，容忍其他文件高分块挤占，再按 fileID 过滤
-				entries, err := m.storage.VectorsSearch(vecs[0], len(chunks)*2)
-				if err == nil {
-					type scoredChunk struct {
-						chunk *contract.Chunk
-						score float64
-					}
-					var scored []scoredChunk
-					for _, e := range entries {
-						if e.ChunkID == 0 || e.Score < 0.3 {
-							continue
-						}
-						chunk, err := m.storage.ChunksGet(e.ChunkID)
-						if err != nil || chunk == nil || chunk.FileID != req.FileID {
-							continue
-						}
-						scored = append(scored, scoredChunk{chunk: chunk, score: e.Score})
-					}
-					sort.Slice(scored, func(i, j int) bool {
-						return scored[i].score > scored[j].score
-					})
-					topK := 8
-					if len(scored) < topK {
-						topK = len(scored)
-					}
-					// 按 maxContextChars 累计裁剪，防止上下文超限拖慢首 token
-					usedRunes := 0
-					for i := 0; i < topK; i++ {
-						c := scored[i].chunk
-						block := fmt.Sprintf("[文件=%s, 段落=%d]\n%s", file.RelPath, c.Seq, c.Text)
-						usedRunes += utf8.RuneCountInString(block)
-						if usedRunes > m.maxContextChars {
-							break
-						}
-						contextBlocks = append(contextBlocks, block)
-						sources = append(sources, contract.QASource{RelPath: file.RelPath, Seq: c.Seq})
-					}
-				}
-			}
-		}
-	} else {
-		// 全局模式：Embed 查询 + 全库 top-K（40块），按相似度阈值过滤
-		vecs, err := m.llm.Embed([]string{req.Question})
-		if err != nil {
-			return nil, nil, fmt.Errorf("[qa] 嵌入问题失败: %w", err)
-		}
-		if len(vecs) > 0 {
-			entries, err := m.storage.VectorsSearch(vecs[0], 40)
+			// 全库搜索取回 2×块数，容忍其他文件高分块挤占，再按 fileID 过滤
+			entries, err := m.storage.VectorsSearch(queryVec, len(chunks)*2)
 			if err == nil {
-				type scored struct {
+				type scoredChunk struct {
 					chunk *contract.Chunk
-					file  *contract.FileInfo
 					score float64
 				}
-				// 按分数排序，过滤掉相似度极低的
-				var scoredChunks []scored
+				var scored []scoredChunk
 				for _, e := range entries {
-					if e.Score < 0.3 {
+					// 宽召回不过滤余弦分：阈值（此前 0.3/0.1）会在重排前丢掉相关块，
+					// 即使配了重排也"找不到"。全部候选交给重排精排决定。
+					if e.ChunkID == 0 {
 						continue
 					}
 					chunk, err := m.storage.ChunksGet(e.ChunkID)
-					if err != nil || chunk == nil {
+					if err != nil || chunk == nil || chunk.FileID != req.FileID {
 						continue
 					}
-					file, err := m.storage.FilesGet(chunk.FileID)
-					if err != nil || file == nil {
-						continue
-					}
-					scoredChunks = append(scoredChunks, scored{chunk: chunk, file: file, score: e.Score})
+					scored = append(scored, scoredChunk{chunk: chunk, score: e.Score})
 				}
-				sort.Slice(scoredChunks, func(i, j int) bool {
-					return scoredChunks[i].score > scoredChunks[j].score
+				// 重排精排（若已配置）：交叉编码器对候选块重新打分，替代余弦分数
+				if len(scored) > 1 {
+					texts := make([]string, len(scored))
+					for i := range scored {
+						texts[i] = scored[i].chunk.Text
+					}
+					if rs, rerr := m.llm.Rerank(req.Question, texts); rerr == nil && len(rs) == len(scored) {
+						for i := range scored {
+							scored[i].score = rs[i]
+						}
+					}
+				}
+				sort.Slice(scored, func(i, j int) bool {
+					return scored[i].score > scored[j].score
 				})
-				// 最多取 8 块最相关的
-				maxBlocks := 8
-				if len(scoredChunks) < maxBlocks {
-					maxBlocks = len(scoredChunks)
+				topK := 8
+				if len(scored) < topK {
+					topK = len(scored)
 				}
 				// 按 maxContextChars 累计裁剪，防止上下文超限拖慢首 token
 				usedRunes := 0
-				for i := 0; i < maxBlocks; i++ {
-					c := scoredChunks[i]
-					block := fmt.Sprintf("[文件=%s, 段落=%d]\n%s", c.file.RelPath, c.chunk.Seq, c.chunk.Text)
+				for i := 0; i < topK; i++ {
+					c := scored[i].chunk
+					block := fmt.Sprintf("[文件=%s, 段落=%d]\n%s", file.RelPath, c.Seq, c.Text)
 					usedRunes += utf8.RuneCountInString(block)
 					if usedRunes > m.maxContextChars {
 						break
 					}
 					contextBlocks = append(contextBlocks, block)
-					sources = append(sources, contract.QASource{RelPath: c.file.RelPath, Seq: c.chunk.Seq})
+					sources = append(sources, contract.QASource{RelPath: file.RelPath, Seq: c.Seq})
 				}
+			}
+		}
+	} else {
+		// 全局模式：Embed 查询 + 全库宽召回（top-100），再用重排精排取前 8
+		queryVec, err := m.llm.EmbedQuery(req.Question)
+		if err != nil {
+			return nil, nil, fmt.Errorf("[qa] 嵌入问题失败: %w", err)
+		}
+		entries, err := m.storage.VectorsSearch(queryVec, 100)
+		if err == nil {
+			type scored struct {
+				chunk *contract.Chunk
+				file  *contract.FileInfo
+				score float64
+			}
+			// 宽召回不过滤余弦分：阈值（此前 0.3/0.1）会在重排前丢掉相关块，
+			// 且维度不匹配时余弦全为 0 会被阈值清空导致"检索为空"。全部候选交给重排精排决定。
+			var scoredChunks []scored
+			for _, e := range entries {
+				chunk, err := m.storage.ChunksGet(e.ChunkID)
+				if err != nil || chunk == nil {
+					continue
+				}
+				file, err := m.storage.FilesGet(chunk.FileID)
+				if err != nil || file == nil {
+					continue
+				}
+				scoredChunks = append(scoredChunks, scored{chunk: chunk, file: file, score: e.Score})
+			}
+			// 重排精排（若已配置）：交叉编码器对候选块重新打分，替代余弦分数
+			if len(scoredChunks) > 1 {
+				texts := make([]string, len(scoredChunks))
+				for i := range scoredChunks {
+					texts[i] = scoredChunks[i].chunk.Text
+				}
+				if rs, rerr := m.llm.Rerank(req.Question, texts); rerr == nil && len(rs) == len(scoredChunks) {
+					for i := range scoredChunks {
+						scoredChunks[i].score = rs[i]
+					}
+				}
+			}
+			sort.Slice(scoredChunks, func(i, j int) bool {
+				return scoredChunks[i].score > scoredChunks[j].score
+			})
+			// 最多取 8 块最相关的
+			maxBlocks := 8
+			if len(scoredChunks) < maxBlocks {
+				maxBlocks = len(scoredChunks)
+			}
+			// 按 maxContextChars 累计裁剪，防止上下文超限拖慢首 token
+			usedRunes := 0
+			for i := 0; i < maxBlocks; i++ {
+				c := scoredChunks[i]
+				block := fmt.Sprintf("[文件=%s, 段落=%d]\n%s", c.file.RelPath, c.chunk.Seq, c.chunk.Text)
+				usedRunes += utf8.RuneCountInString(block)
+				if usedRunes > m.maxContextChars {
+					break
+				}
+				contextBlocks = append(contextBlocks, block)
+				sources = append(sources, contract.QASource{RelPath: c.file.RelPath, Seq: c.chunk.Seq})
 			}
 		}
 	}
@@ -463,6 +499,20 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 				}
 			}
 		}
+	}
+
+	// 检索诊断日志：便于排查"找不到文件"——命中块数 / 命中文件，配合 llm 模块的重排日志定位环节
+	if len(contextBlocks) > 0 {
+		var topPaths []string
+		for i, s := range sources {
+			if i >= 3 {
+				break
+			}
+			topPaths = append(topPaths, s.RelPath)
+		}
+		logx.Debug("qa", "检索命中", "mode", req.Mode, "blocks", len(contextBlocks), "top", strings.Join(topPaths, ","))
+	} else {
+		logx.Warn("qa", "检索为空", "mode", req.Mode, "question", req.Question)
 	}
 
 	return contextBlocks, sources, nil

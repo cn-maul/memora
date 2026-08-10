@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"memora/internal/contract"
+	"memora/internal/logx"
 )
 
 // IIndex search 模块所需的 index 接口
@@ -18,6 +19,8 @@ type IIndex interface {
 // ILLM search 模块所需的 llm 接口
 type ILLM interface {
 	Embed(texts []string) ([][]float32, error)
+	EmbedQuery(text string) ([]float32, error)             // 查询嵌入（自动加检索指令前缀）
+	Rerank(query string, docs []string) ([]float64, error) // 可选：未配置时返回错误
 }
 
 // IStorage search 模块所需的 storage 接口
@@ -81,17 +84,14 @@ func (m *Module) Query(q string, tagFilter []string, page int) ([]*contract.Sear
 		return m.queryByTagsOnly(allTags, page)
 	}
 
-	vecs, err := m.llm.Embed([]string{queryText})
+	queryVec, err := m.llm.EmbedQuery(queryText)
 	if err != nil {
 		return nil, 0, fmt.Errorf("[search] 嵌入查询失败: %w", err)
 	}
-	if len(vecs) == 0 {
-		return nil, 0, nil
-	}
 
-	// 向量检索 top-K=20
-	topK := 20
-	entries, err := m.storage.VectorsSearch(vecs[0], topK)
+	// 宽召回：向量检索 top-100 分块，避免相关文件排在 20 名后被漏掉
+	topK := 100
+	entries, err := m.storage.VectorsSearch(queryVec, topK)
 	if err != nil {
 		return nil, 0, fmt.Errorf("[search] 向量检索失败: %w", err)
 	}
@@ -131,6 +131,20 @@ func (m *Module) Query(q string, tagFilter []string, page int) ([]*contract.Sear
 				matchedChunks: 1,
 			}
 			fileOrder = append(fileOrder, chunk.FileID)
+		}
+	}
+
+	// 重排精排（若已配置）：对每个文件的最高分块用交叉编码器重新打分，
+	// 替代余弦分数作为主要排序依据（重排失败时保持原分数，回退现有逻辑）
+	if len(fileOrder) > 1 {
+		texts := make([]string, len(fileOrder))
+		for i, fid := range fileOrder {
+			texts[i] = fileMap[fid].bestChunk.Text
+		}
+		if rs, rerr := m.llm.Rerank(queryText, texts); rerr == nil && len(rs) == len(fileOrder) {
+			for i, fid := range fileOrder {
+				fileMap[fid].bestScore = rs[i]
+			}
 		}
 	}
 
@@ -180,14 +194,14 @@ func (m *Module) Query(q string, tagFilter []string, page int) ([]*contract.Sear
 		fileOrder = filtered
 	}
 
-	// 排序：命中块数优先、其次最高分
+	// 排序：相关性分（重排或余弦）优先，命中块数其次
 	sort.Slice(fileOrder, func(i, j int) bool {
 		ri := fileMap[fileOrder[i]]
 		rj := fileMap[fileOrder[j]]
-		if ri.matchedChunks != rj.matchedChunks {
-			return ri.matchedChunks > rj.matchedChunks
+		if ri.bestScore != rj.bestScore {
+			return ri.bestScore > rj.bestScore
 		}
-		return ri.bestScore > rj.bestScore
+		return ri.matchedChunks > rj.matchedChunks
 	})
 
 	// 组装结果（分页）
@@ -219,6 +233,18 @@ func (m *Module) Query(q string, tagFilter []string, page int) ([]*contract.Sear
 			Mtime:         fr.file.Mtime,
 			MatchedChunks: fr.matchedChunks,
 		})
+	}
+
+	// 检索诊断日志：便于排查"找不到文件"——命中文件数与 top 结果
+	if len(results) > 0 {
+		var top []string
+		for i, r := range results {
+			if i >= 3 {
+				break
+			}
+			top = append(top, r.RelPath)
+		}
+		logx.Debug("search", "检索命中", "total", len(fileOrder), "top", strings.Join(top, ","))
 	}
 
 	return results, len(fileOrder), nil

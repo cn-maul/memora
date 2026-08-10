@@ -4,6 +4,7 @@ package timeline
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -221,7 +222,9 @@ func (m *Module) getUntrackedFiles() []*contract.FileInfo {
 		return nil
 	}
 
-	// 按 relPath 集合过滤 storage 中的文件
+	// 按 relPath 集合过滤 storage 中的文件。
+	// git.Status() 的键恒为 "/" 分隔（go-git 内部统一正斜杠），而 storage 的 rel_path
+	// 在 Windows 上是反斜杠，需归一化后再比对（review 发现：Windows 下未跟踪文件不显示）。
 	fileSet := make(map[string]bool, len(relPaths))
 	for _, p := range relPaths {
 		fileSet[p] = true
@@ -232,7 +235,7 @@ func (m *Module) getUntrackedFiles() []*contract.FileInfo {
 	}
 	var untracked []*contract.FileInfo
 	for _, f := range files {
-		if fileSet[f.RelPath] {
+		if fileSet[filepath.ToSlash(f.RelPath)] {
 			untracked = append(untracked, f)
 		}
 	}
@@ -350,10 +353,12 @@ func (m *Module) GenerateSummary(commitHash string) (string, error) {
 		return "", fmt.Errorf("提交不存在")
 	}
 
-	// 获取 diff 统计中的文件列表
-	// 简化：从 DiffStats 获取文件列表（目前 DiffStats 只有计数）
-	// 后续可扩展 DiffStats 增加文件名列表
-	filesChanged := fmt.Sprintf("%s", targetCommit.Message)
+	// 用真实改动文件清单喂给 AI。此前误把提交备注当"修改文件"传入，
+	// 生成的摘要等于复述备注，信息量不足（review 发现）。
+	filesChanged := strings.Join(stat.Files, ", ")
+	if filesChanged == "" {
+		filesChanged = targetCommit.Message
+	}
 
 	// 用 LLM 生成摘要
 	system := "你是版本记录助手。根据一次 Git 提交的文件改动，用 1~2 句中文总结这次提交做了什么。只输出总结文本，不要输出其他内容。"

@@ -8,11 +8,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"memora/internal/contract"
+	"memora/internal/logx"
 
 	_ "modernc.org/sqlite"
 )
@@ -196,6 +198,57 @@ func (m *Module) FilesUpsert(f *contract.FileInfo) (int64, error) {
 		return 0, fmt.Errorf("[storage] 写入后未找到文件 %s", f.RelPath)
 	}
 	return row.ID, nil
+}
+
+// FilesRecent 返回最近修改的文件（按 mtime 倒序）。
+// sinceMs > 0 时仅返回 mtime >= sinceMs 的文件（供"最近 X 小时"时间窗）；
+// limit <= 0 时钳制为 50（上限 200）。
+func (m *Module) FilesRecent(sinceMs int64, limit int) ([]*contract.FileInfo, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	query := `SELECT id, rel_path, size, mtime, content_hash, doc_type, index_status, COALESCE(last_error,''), first_seen_at, COALESCE(last_indexed_at,0)
+		FROM files`
+	var args []interface{}
+	if sinceMs > 0 {
+		query += ` WHERE mtime >= ?`
+		args = append(args, sinceMs)
+	}
+	query += ` ORDER BY mtime DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := m.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("[storage] 查询最近文件失败: %w", err)
+	}
+	defer rows.Close()
+
+	// 空结果返回空切片而非 nil，避免 JSON 序列化为 null
+	files := make([]*contract.FileInfo, 0)
+	for rows.Next() {
+		f := &contract.FileInfo{}
+		if err := rows.Scan(&f.ID, &f.RelPath, &f.Size, &f.Mtime, &f.ContentHash, &f.DocType, &f.IndexStatus, &f.LastError, &f.FirstSeenAt, &f.LastIndexedAt); err != nil {
+			return nil, fmt.Errorf("[storage] 扫描最近文件行失败: %w", err)
+		}
+		files = append(files, f)
+	}
+	return files, nil
+}
+
+// FileVectorDim 返回文件任一向量的维度；文件无向量时返回 (0, false, nil)。
+// 用于幂等跳过校验：切换嵌入模型后维度变化时强制重新嵌入（修复：维度不匹配导致检索为空）。
+func (m *Module) FileVectorDim(fileID int64) (int, bool, error) {
+	var dim int
+	err := m.db.QueryRow(
+		`SELECT cv.dim FROM chunk_vectors cv JOIN chunks c ON c.id=cv.chunk_id WHERE c.file_id=? LIMIT 1`,
+		fileID).Scan(&dim)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("[storage] 查询向量维度失败: %w", err)
+	}
+	return dim, true, nil
 }
 
 // FilesFindByRelPath 按路径查找
@@ -611,6 +664,14 @@ func (m *Module) VectorsLoadAll() ([]contract.VectorEntry, error) {
 	}
 	m.mu.Unlock()
 
+	// 诊断日志：确认内存向量索引规模（"找不到文件"且 sources=[] 时先看这里）
+	logx.Info("storage", "内存向量索引已加载", "count", len(entries), "dim", func() int {
+		if len(entries) > 0 {
+			return len(entries[0].Vec)
+		}
+		return 0
+	}())
+
 	return entries, nil
 }
 
@@ -632,7 +693,13 @@ func cosineSimilarity(a, b []float32) float64 {
 }
 
 // VectorsSearch 在内存索引中做余弦相似度线性扫描，返回 top-K
+// 先整体排序再取前 K，替代逐趟挑选的 O(n·K) 实现：
+// K 接近 n（如单文件问答按 chunk 数放大 topK）时旧实现退化为 O(n²)，大索引下明显卡顿（review 发现）。
 func (m *Module) VectorsSearch(queryVec []float32, topK int) ([]contract.VectorEntry, error) {
+	if topK <= 0 {
+		return []contract.VectorEntry{}, nil
+	}
+
 	m.mu.RLock()
 	index := make([]vectorEntry, len(m.vectorIndex))
 	copy(index, m.vectorIndex)
@@ -643,34 +710,20 @@ func (m *Module) VectorsSearch(queryVec []float32, topK int) ([]contract.VectorE
 		index[i].Score = cosineSimilarity(queryVec, index[i].Vec)
 	}
 
-	// 排序（选择 top-K，简单冒泡风格）
-	// 实际可以用 sort.Slice，但为了简单优先手动选
-	n := len(index)
-	if topK > n {
-		topK = n
+	// 按相似度降序排序，截取前 topK
+	sort.Slice(index, func(i, j int) bool { return index[i].Score > index[j].Score })
+	if topK > len(index) {
+		topK = len(index)
 	}
+
 	result := make([]contract.VectorEntry, 0, topK)
-	used := make([]bool, n)
-
-	for k := 0; k < topK; k++ {
-		bestIdx := -1
-		bestScore := -1.0
-		for i := 0; i < n; i++ {
-			if !used[i] && index[i].Score > bestScore {
-				bestScore = index[i].Score
-				bestIdx = i
-			}
-		}
-		if bestIdx >= 0 {
-			used[bestIdx] = true
-			result = append(result, contract.VectorEntry{
-				ChunkID: index[bestIdx].ChunkID,
-				Vec:     index[bestIdx].Vec,
-				Score:   bestScore,
-			})
-		}
+	for i := 0; i < topK; i++ {
+		result = append(result, contract.VectorEntry{
+			ChunkID: index[i].ChunkID,
+			Vec:     index[i].Vec,
+			Score:   index[i].Score,
+		})
 	}
-
 	return result, nil
 }
 
