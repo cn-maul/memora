@@ -170,7 +170,8 @@ type chatMessage struct {
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content   string `json:"content"`
+			Reasoning string `json:"reasoning"` // 推理模型非流式的思维链（商汤/DeepSeek-R1 等）
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -184,10 +185,13 @@ type chatResponse struct {
 // streamResponse 流式聊天响应体
 // delta 为流式增量（标准 OpenAI 格式）；部分兼容端点首块用 message 字段承载完整内容，
 // 或并发返回多个 choice，故均做兼容处理。
+// Reasoning 为推理模型的思维链增量（delta.reasoning，如 SenseNova reasoning 系列）：
+// 这类模型先整段输出思维链、最后才输出 delta.content，若不解析则思考期流式无任何输出。
 type streamResponse struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   string `json:"content"`
+			Reasoning string `json:"reasoning"`
 		} `json:"delta"`
 		Message struct {
 			Content string `json:"content"`
@@ -296,9 +300,10 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
 
 	// 绑定取消上下文：client.Do 在 cancel 触发时中断挂起的 HTTP 请求，
-	// 否则取消时连接一直挂着直到响应（修复 review should-fix）
+	// 否则取消时连接一直挂着直到响应（修复 review should-fix）。
+	// 注意：cancelReq 不能在 ChatStream 返回时立即触发（defer），否则响应体流尚未读完
+	// 就被 context canceled 打断——流式输出会被截断（修复：由下方读取 goroutine 在自己结束时释放）。
 	reqCtx, cancelReq := context.WithCancel(context.Background())
-	defer cancelReq()
 	go func() {
 		select {
 		case <-cancel:
@@ -314,12 +319,14 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 	for attempt := 0; attempt < 3; attempt++ {
 		select {
 		case <-cancel:
+			cancelReq()
 			return nil, fmt.Errorf("[llm] 流式请求已取消")
 		default:
 		}
 
 		req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
 		if err != nil {
+			cancelReq()
 			return nil, fmt.Errorf("[llm] 创建流式请求失败: %w", err)
 		}
 		req = req.WithContext(reqCtx) // 绑定取消上下文，client.Do 可被 cancel 中断
@@ -349,6 +356,7 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 
 		// 4xx（除 429）为致命错误，不重试
 		if statusCode >= 400 && statusCode < 500 && statusCode != http.StatusTooManyRequests {
+			cancelReq()
 			return nil, lastErr
 		}
 
@@ -358,16 +366,19 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 			select {
 			case <-time.After(wait):
 			case <-cancel:
+				cancelReq()
 				return nil, fmt.Errorf("[llm] 流式请求已取消")
 			}
 		}
 	}
 	if resp == nil {
+		cancelReq()
 		return nil, fmt.Errorf("[llm] 流式请求重试耗尽: %w", lastErr)
 	}
 
 	ch := make(chan string, 16)
 	go func() {
+		defer cancelReq() // 流结束时释放请求上下文（同时让上方 select goroutine 退出）
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 400 {
@@ -393,9 +404,45 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 					case ch <- content:
 					case <-cancel:
 					}
+				} else if think := plain.Choices[0].Message.Reasoning; think != "" {
+					// 推理模型非流式响应只含思维链、无最终内容时，至少把思考过程发出去
+					select {
+					case ch <- contract.ThinkChunkPrefix + think:
+					case <-cancel:
+					}
 				}
 			} else {
-				logx.Warn("llm", "流式端点返回非 SSE 且解析失败", "contentType", ct, "bodyLen", len(body))
+				// 场景：端点实际是流式（SSE 行）但 Content-Type 标注错误（如 application/json）。
+				// 此前 io.ReadAll 等完整流结束后整体 JSON 解析必然失败，流式内容被整段丢弃。
+				// 修复：整体内容按 SSE 行重新走 handleStreamLine 解析，至少恢复完整回答。
+				var fb string
+				received := false
+				sent := false
+				for _, l := range strings.Split(string(body), "\n") {
+					l = strings.TrimSpace(l)
+					if !strings.HasPrefix(l, "data: ") {
+						continue
+					}
+					if strings.TrimPrefix(l, "data: ") == "[DONE]" {
+						break
+					}
+					s, err := m.handleStreamLine(l, ch, cancel, &received, &fb)
+					if err != nil {
+						break
+					}
+					// sent 需覆盖思考块（带前缀）与内容块，否则纯思考流会被误判"解析失败"
+					sent = sent || s
+				}
+				if !received && fb != "" {
+					select {
+					case ch <- fb:
+						sent = true
+					case <-cancel:
+					}
+				}
+				if !sent {
+					logx.Warn("llm", "流式端点返回非 SSE 且解析失败", "contentType", ct, "bodyLen", len(body))
+				}
 			}
 			close(ch)
 			return
@@ -420,6 +467,11 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 
 				line, err := reader.ReadString('\n')
 				if err != nil {
+					if err != io.EOF {
+						// 非 EOF 读取错误（连接中断/被取消）：此前静默丢弃，导致流式回答在
+						// 中途被截断却无任何痕迹。记录日志便于排查（修复测试发现）。
+						logx.Warn("llm", "流式读取中断", "err", err.Error())
+					}
 					if err == io.EOF {
 						line = strings.TrimSpace(line)
 						// EOF 时可能带最后一个 data 行（无尾随换行），处理后再结束
@@ -427,7 +479,7 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 							if rawSample == "" && strings.HasPrefix(line, "data: ") {
 								rawSample = clipSample(line)
 							}
-							if err := m.handleStreamLine(line, ch, cancel, &receivedDelta, &messageFallback); err != nil {
+							if _, err := m.handleStreamLine(line, ch, cancel, &receivedDelta, &messageFallback); err != nil {
 								return
 							}
 						}
@@ -442,7 +494,7 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 				if rawSample == "" {
 					rawSample = clipSample(line)
 				}
-				if err := m.handleStreamLine(line, ch, cancel, &receivedDelta, &messageFallback); err != nil {
+				if _, err := m.handleStreamLine(line, ch, cancel, &receivedDelta, &messageFallback); err != nil {
 					return
 				}
 			}
@@ -465,29 +517,41 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 	return ch, nil
 }
 
-// handleStreamLine 解析一行 SSE data，输出 delta 增量或暂存 message 回退内容。
-// 返回 error 表示应终止读取（取消或解析终止）。
-func (m *Module) handleStreamLine(line string, ch chan<- string, cancel <-chan struct{}, receivedDelta *bool, messageFallback *string) error {
+// handleStreamLine 解析一行 SSE data，输出 delta 增量（内容或思考过程）或暂存 message 回退内容。
+// 返回 sent 表示本行是否向 ch 发出了内容（含带前缀的思考块）；error 表示应终止读取（取消或解析终止）。
+func (m *Module) handleStreamLine(line string, ch chan<- string, cancel <-chan struct{}, receivedDelta *bool, messageFallback *string) (bool, error) {
 	data := strings.TrimPrefix(line, "data: ")
 	if data == "[DONE]" {
-		return errStreamDone
+		return false, errStreamDone
 	}
 
 	var streamResp streamResponse
 	if err := json.Unmarshal([]byte(data), &streamResp); err != nil {
 		// 解析失败：记录便于排查（此前静默丢弃导致"空回答"无法诊断）
 		logx.Debug("llm", "流式行解析失败", "line", data)
-		return nil
+		return false, nil
 	}
 
+	sent := false
 	for _, choice := range streamResp.Choices {
 		delta := choice.Delta.Content
 		if delta != "" {
 			*receivedDelta = true
+			sent = true
 			select {
 			case ch <- delta:
 			case <-cancel:
-				return errStreamDone
+				return sent, errStreamDone
+			}
+		} else if think := choice.Delta.Reasoning; think != "" {
+			// 推理模型思维链（delta.reasoning）：带前缀标记发出，前端单独渲染"思考过程"。
+			// 修复：此前未解析，整段思考期流式无输出，用户误以为对话卡死/未流式。
+			// 注意不计入 receivedDelta / messageFallback，最终回答仍以 delta.content 为准。
+			sent = true
+			select {
+			case ch <- contract.ThinkChunkPrefix + think:
+			case <-cancel:
+				return sent, errStreamDone
 			}
 		} else if msg := choice.Message.Content; msg != "" && !*receivedDelta && *messageFallback == "" {
 			// 非标准端点：整条流首块用 message 承载完整内容。
@@ -495,7 +559,7 @@ func (m *Module) handleStreamLine(line string, ch chan<- string, cancel <-chan s
 			*messageFallback = msg
 		}
 	}
-	return nil
+	return sent, nil
 }
 
 // errStreamDone 流式读取终止信号（取消或 [DONE]）
@@ -697,6 +761,54 @@ func (m *Module) TestEmbedWith(baseURL, apiKey, model string) error {
 		return fmt.Errorf("[llm] 嵌入响应无数据")
 	}
 	return nil
+}
+
+// ListModels 列出端点支持的模型（GET /models，OpenAI 兼容）。
+// kind 用于回退正确的已保存密钥（chat→LLM、embed→嵌入、rerank→重排），
+// 修复：此前统一回退 LLM 密钥，在嵌入/重排端点（如 SiliconFlow）上会 401 误报。
+// 供设置页「获取模型」按钮使用：拿到列表后模型字段从下拉中选择。
+func (m *Module) ListModels(kind, baseURL, apiKey string) ([]string, error) {
+	if baseURL == "" {
+		return nil, fmt.Errorf("[llm] 请先填写接口地址")
+	}
+	if apiKey == "" {
+		switch kind {
+		case "embed":
+			_, savedKey, _, _ := m.config.GetEmbedConfig()
+			apiKey = savedKey
+		case "rerank":
+			_, savedKey, _ := m.config.GetRerankConfig()
+			apiKey = savedKey
+		default:
+			_, savedKey, _, _ := m.config.GetLLMConfig()
+			apiKey = savedKey
+		}
+	}
+
+	url := strings.TrimRight(baseURL, "/") + "/models"
+
+	data, err := m.doRequest("GET", url, nil, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("[llm] 解析模型列表失败: %w", err)
+	}
+	models := make([]string, 0, len(resp.Data))
+	for _, d := range resp.Data {
+		if d.ID != "" {
+			models = append(models, d.ID)
+		}
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("[llm] 该端点未返回可用模型")
+	}
+	return models, nil
 }
 
 // ──────────────────── 重排（Rerank）────────────────────

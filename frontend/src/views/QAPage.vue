@@ -1,16 +1,19 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useQAStore } from '@/stores/qa'
 import { useFilesStore } from '@/stores/files'
+import { useWorkspaceStore } from '@/stores/workspace'
 import type { QASession } from '@/types'
 import Icon from '@/components/Icon.vue'
 import { marked } from 'marked'
 import { getFile } from '@/api/client'
 
 const route = useRoute()
+const router = useRouter()
 const qa = useQAStore()
 const files = useFilesStore()
+const ws = useWorkspaceStore()
 
 const question = ref('')
 const mode = ref('global')
@@ -44,6 +47,8 @@ watch(
 )
 
 onMounted(async () => {
+  // 读取工作区初始化/AI 配置状态，用于顶部引导横幅
+  ws.fetchInfo()
   // 自动恢复上一次 AI 对话（需求：再次打开加载上次会话，而不是新建）
   const q = route.query
   if (q.mode === 'file' && q.fileId) {
@@ -71,6 +76,12 @@ onMounted(async () => {
     }
   }
   scrollToBottom()
+  // 消息内文件引用链接的事件委托
+  document.addEventListener('click', handleFileLinkClick)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('click', handleFileLinkClick)
 })
 
 async function loadIndexedFiles() {
@@ -179,13 +190,52 @@ function parseSources(raw?: string) {
 // 移除预转义——它会破坏 # / - / ** / 代码块 等 Markdown 语法的解析；
 // marked 默认只解析文本级 Markdown，不会执行 <script> 等 raw HTML（safe 默认关闭但无副作用），
 // 再通过 DOMParser 剥离潜在危险标签实现 XSS 防护
+// [文件=路径, 段落=N] 引用标记转成可点击链接（后端已把回答里的文件路径规整为标记）
+const FILE_REF_RE = /\[文件=([^\]]+?)(?:,\s*段落=(\d+))?\]/g
+const FILE_REF_PLACEHOLDER = '\u0000REF\u0000'
+
 function renderMarkdown(text: string): string {
   if (!text) return ''
-  let html = marked.parse(text, { async: false }) as string
+  const refs: { path: string; seq: string }[] = []
+  // 先把引用标记换成占位符（避免 marked 破坏链接 HTML），再在 XSS 剥离前还原为链接
+  const withPlaceholders = text.replace(FILE_REF_RE, (_full, path, seq) => {
+    refs.push({ path: (path || '').trim(), seq: seq || '' })
+    return FILE_REF_PLACEHOLDER
+  })
+  let html = marked.parse(withPlaceholders, { async: false }) as string
   if (!html) return ''
-  // XSS 防护：剥离 script/iframe/object 等危险标签与 onclick/onerror 等属性
+  // 先还原链接再做 XSS 剥离：链接本身安全（href 仅 #，真实路径在 data-path），
+  // 且占位符若先过 DOMParser 会被替换为 U+FFFD 导致匹配失败
+  html = html.replace(new RegExp(FILE_REF_PLACEHOLDER, 'g'), () => {
+    const ref = refs.shift()
+    if (!ref) return ''
+    const safePath = ref.path
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+    // 链接文本 HTML 转义，路径经 URL 编码放 data-path，点击由事件委托处理（防注入）
+    return `<a class="msg-file-link" href="#qa-file" data-path="${encodeURIComponent(ref.path)}">📄 ${safePath}${ref.seq ? ` (§${ref.seq})` : ''}</a>`
+  })
   html = stripDangerousHtml(html)
   return html
+}
+
+// 消息内文件链接的点击委托（读取 data-path 跳转，避免把用户数据拼进内联 JS）
+function handleFileLinkClick(e: MouseEvent) {
+  const target = (e.target as HTMLElement | null)?.closest?.('a.msg-file-link') as HTMLAnchorElement | null
+  if (!target) return
+  e.preventDefault()
+  const raw = target.getAttribute('data-path')
+  if (!raw) return
+  let relPath = ''
+  try {
+    relPath = decodeURIComponent(raw)
+  } catch {
+    return
+  }
+  router.push({ path: '/files', query: { highlight: relPath } })
 }
 
 function stripDangerousHtml(html: string): string {
@@ -261,6 +311,18 @@ function stripDangerousHtml(html: string): string {
 
     <!-- 右侧：对话面板 -->
     <section class="qa-chat">
+      <!-- 未选文件夹 / AI 未配置引导 -->
+      <div v-if="!ws.initialized" class="qa-guide banner-warn">
+        <Icon name="folder" :size="14" />
+        <span>还没有选择要管理的文件夹</span>
+        <button class="btn btn-primary btn-sm" @click="router.push('/settings')">去设置</button>
+      </div>
+      <div v-else-if="!ws.info?.llmConfigured" class="qa-guide banner-warn">
+        <Icon name="chat" :size="14" />
+        <span>问答需要先连接 AI 助手（对话模型），连接后即可向文档提问</span>
+        <button class="btn btn-primary btn-sm" @click="router.push('/settings')">去设置</button>
+      </div>
+
       <header class="qa-chat__header">
         <button
           class="btn btn-ghost btn-sm qa-chat__toggle"
@@ -326,6 +388,11 @@ function stripDangerousHtml(html: string): string {
                 <span class="message-role">{{ msg.role === 'user' ? '你' : 'Memora' }}</span>
                 <span class="message-time">{{ formatTime(msg.createdAt) }}</span>
               </div>
+              <!-- 思考过程：推理模型思维链（流式期间实时展示，不落库，刷新后消失） -->
+              <details v-if="msg.thinking" class="thinking-box" open>
+                <summary>思考过程</summary>
+                <div class="thinking-content">{{ msg.thinking }}</div>
+              </details>
               <div class="message-content" v-if="msg.role === 'assistant'" v-html="renderMarkdown(msg.content)"></div>
               <div class="message-content" v-else>{{ msg.content }}</div>
               <span
@@ -367,6 +434,23 @@ function stripDangerousHtml(html: string): string {
 </template>
 
 <style scoped>
+/* 顶部引导横幅（未选文件夹 / AI 未配置） */
+.qa-guide {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--c-warning);
+  background: var(--c-warning-soft);
+  font-size: 13px;
+  color: var(--c-text-secondary);
+  flex-shrink: 0;
+}
+.qa-guide span {
+  flex: 1;
+}
+
 .qa-page {
   display: flex;
   height: 100%;
@@ -676,6 +760,47 @@ function stripDangerousHtml(html: string): string {
   border: 1px solid var(--c-border);
   border-top-left-radius: var(--r-xs);
   color: var(--c-text-primary);
+}
+
+/* 消息内的文件引用链接 */
+.msg-file-link {
+  display: inline-block;
+  margin: 2px 0;
+  padding: 1px 8px;
+  border-radius: var(--r-full);
+  background: var(--c-info-soft);
+  color: var(--c-info);
+  font-size: 12.5px;
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: border-color 0.12s;
+}
+.msg-file-link:hover {
+  border-color: var(--c-info);
+}
+
+/* 思考过程折叠区（推理模型思维链，流式期间实时展示） */
+.thinking-box {
+  background: var(--c-bg-secondary);
+  border: 1px dashed var(--c-border);
+  border-radius: var(--r-md);
+  padding: 6px 10px;
+  font-size: 12.5px;
+  color: var(--c-text-tertiary);
+  line-height: 1.6;
+}
+
+.thinking-box summary {
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  color: var(--c-text-secondary);
+}
+
+.thinking-content {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* 流式输出等待期的打字光标 */

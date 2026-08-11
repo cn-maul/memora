@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
-import { browseDir, browseSearch, browseOpen, getFileHistory, downloadHistoryVersion, resolveFileId } from '@/api/client'
+import { browseDir, browseSearch, browseOpen, getFileHistory, downloadHistoryVersion, resolveFileId, restoreFile } from '@/api/client'
 import type { BrowseEntry, BrowseSearchItem } from '@/types'
 import Crumbs from '@/components/Crumbs.vue'
 import Icon, { type IconName } from '@/components/Icon.vue'
@@ -154,7 +154,11 @@ const detailEntry = ref<BrowseEntry | null>(null)
 const detailVersions = ref<Array<{ hash: string; time: number; message: string; author: string }>>([])
 const detailLoadingHistory = ref(false)
 const detailDownloading = ref<string | null>(null)
+const detailRestoring = ref<string | null>(null)
+const detailConfirmRestore = ref<{ hash: string; time: number; message: string } | null>(null)
+const detailFileId = ref(0)
 const detailError = ref('')
+const detailNotice = ref('')
 
 async function openFile(relPath: string) {
   openingPath.value = relPath
@@ -172,9 +176,12 @@ async function openDetailModal(e: BrowseEntry) {
   detailEntry.value = e
   detailVersions.value = []
   detailError.value = ''
+  detailNotice.value = ''
+  detailConfirmRestore.value = null
   detailLoadingHistory.value = true
   try {
     const fileId = await resolveFileId(e.relPath)
+    detailFileId.value = fileId
     const history = await getFileHistory(fileId)
     detailVersions.value = history.commits
       .map((c: any) => ({
@@ -188,6 +195,30 @@ async function openDetailModal(e: BrowseEntry) {
     // 文件未索引则无版本历史，静默
   } finally {
     detailLoadingHistory.value = false
+  }
+}
+
+// 一键恢复：小白点「恢复」→ 行内确认 → 后端自动先保存当前状态再恢复
+function askRestore(v: { hash: string; time: number; message: string }) {
+  detailError.value = ''
+  detailNotice.value = ''
+  detailConfirmRestore.value = v
+}
+
+async function doRestore() {
+  const v = detailConfirmRestore.value
+  if (!v || detailFileId.value <= 0) return
+  detailRestoring.value = v.hash
+  detailError.value = ''
+  detailNotice.value = ''
+  try {
+    await restoreFile(detailFileId.value, v.hash)
+    detailConfirmRestore.value = null
+    detailNotice.value = '已恢复 ✓ 当前文件已还原为该版本（若此前有改动，已先自动保存）'
+  } catch (e: any) {
+    detailError.value = e.message || '恢复失败'
+  } finally {
+    detailRestoring.value = null
   }
 }
 
@@ -374,8 +405,8 @@ function statusClass(e: BrowseEntry): string {
 
     <div v-if="ws.info && !ws.initialized" class="init-banner card">
       <div class="init-banner__content">
-        <strong>工作区尚未初始化</strong>
-        <span class="init-banner-desc">请先在「设置」中配置工作区与模型端点。</span>
+        <strong>还没有选择要管理的文件夹</strong>
+        <span class="init-banner-desc">选好文件夹、连接 AI 后即可使用全部功能。</span>
       </div>
       <button class="btn btn-primary btn-sm" @click="router.push('/settings')">去设置</button>
     </div>
@@ -388,7 +419,7 @@ function statusClass(e: BrowseEntry): string {
           <input
             v-model="searchQuery"
             class="input search-input"
-            placeholder="按文件名 / 路径搜索全部文件…（实时扫描磁盘，不依赖索引）"
+            placeholder="按文件名搜索：输入文件名或路径的一部分"
             @keyup.enter="doSearch"
           />
         </div>
@@ -553,18 +584,37 @@ function statusClass(e: BrowseEntry): string {
                   <span class="version-hash" :title="v.hash">{{ v.hash.slice(0, 7) }}</span>
                 </div>
               </div>
-              <button
-                class="btn btn-ghost btn-sm"
-                @click="downloadVersion(v)"
-                :disabled="detailDownloading === v.hash"
-              >
-                <Icon name="download" :size="13" />
-                {{ detailDownloading === v.hash ? '下载中…' : '下载' }}
-              </button>
+              <div class="version-actions">
+                <button
+                  class="btn btn-ghost btn-sm"
+                  @click="downloadVersion(v)"
+                  :disabled="detailDownloading === v.hash"
+                >
+                  <Icon name="download" :size="13" />
+                  {{ detailDownloading === v.hash ? '下载中…' : '下载' }}
+                </button>
+                <button
+                  class="btn btn-primary btn-sm"
+                  @click="askRestore(v)"
+                  :disabled="detailRestoring === v.hash"
+                >
+                  {{ detailRestoring === v.hash ? '恢复中…' : '恢复此版本' }}
+                </button>
+              </div>
+              <div v-if="detailConfirmRestore && detailConfirmRestore.hash === v.hash" class="restore-confirm">
+                <span class="restore-confirm__text">将把文件恢复为这个版本；若当前有未保存改动，会先自动保存。</span>
+                <div class="restore-confirm__actions">
+                  <button class="btn btn-primary btn-sm" :disabled="detailRestoring !== null" @click="doRestore">
+                    {{ detailRestoring === v.hash ? '恢复中…' : '确认恢复' }}
+                  </button>
+                  <button class="btn btn-ghost btn-sm" :disabled="detailRestoring !== null" @click="detailConfirmRestore = null">取消</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
+        <div v-if="detailNotice" class="alert alert--success">{{ detailNotice }}</div>
         <div v-if="detailError" class="alert alert--error">{{ detailError }}</div>
 
         <div class="modal-actions">
@@ -933,6 +983,35 @@ function statusClass(e: BrowseEntry): string {
   border: 1px solid var(--c-border);
   border-radius: var(--r-md);
   background: var(--c-bg-secondary);
+}
+
+.version-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* 行内恢复确认条 */
+.restore-confirm {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--c-bg-panel);
+  border: 1px solid var(--c-warning);
+}
+.restore-confirm__text {
+  font-size: 12px;
+  color: var(--c-text-secondary);
+  line-height: 1.5;
+}
+.restore-confirm__actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .version-num {

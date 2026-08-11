@@ -74,7 +74,65 @@ func (m *Module) EnsureRepo(path string) error {
 	}
 
 	m.repo = repo
+
+	// 首次初始化：空仓库（无任何提交）时立即把工作区全部文件提交为「初始版本」。
+	// 让 Timeline 从第一天就有基线版本，"找回"有起点（修复：此前直到首次文件变更才有提交）。
+	m.commitInitialLocked()
+
 	return nil
+}
+
+// commitInitialLocked 空仓库快照提交（调用方需持有 m.mu）。
+// 已有提交则跳过；工作区为空（无可提交文件）也跳过，留给首次文件变更生成第一个版本。
+// 失败仅记日志不阻断启动——首次自动提交会兜底。
+func (m *Module) commitInitialLocked() {
+	if m.repo == nil {
+		return
+	}
+	if _, err := m.repo.Head(); err == nil {
+		return // 已有提交
+	}
+
+	wt, err := m.repo.Worktree()
+	if err != nil {
+		logx.Warn("git", "初始版本获取工作区失败", "err", err.Error())
+		return
+	}
+	status, err := wt.Status()
+	if err != nil {
+		logx.Warn("git", "初始版本读取状态失败", "err", err.Error())
+		return
+	}
+	hasAny := false
+	for f, s := range status {
+		// 空仓库中所有文件均为 '?'（未跟踪）；仅有的 .gitignore 不算实质内容，跳过
+		if s.Worktree == '?' && f != ".gitignore" {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
+		return // 空工作区，暂无内容可提交
+	}
+
+	if _, err := wt.Add("."); err != nil {
+		// 回退到逐文件 add（与 CommitAuto 一致的稳妥路径）
+		logx.Debug("git", "初始版本 Add('.') 失败，改逐文件 add", "err", err.Error())
+		for f, s := range status {
+			if s.Worktree == '?' {
+				if _, aerr := wt.Add(f); aerr != nil {
+					logx.Warn("git", "初始版本 add 失败", "file", f, "err", aerr.Error())
+				}
+			}
+		}
+	}
+	now := time.Now()
+	name, email := m.cfg.GetGitAuthor()
+	if _, err := wt.Commit("初始版本：工作区全部文件快照", &gogit.CommitOptions{
+		Author: &object.Signature{Name: name, Email: email, When: now},
+	}); err != nil {
+		logx.Warn("git", "初始版本提交失败", "err", err.Error())
+	}
 }
 
 // Status 返回工作区状态
@@ -175,7 +233,21 @@ func (m *Module) CommitAuto(files []string) (string, bool, error) {
 		}
 	}
 
-	msg := fmt.Sprintf("自动提交：修改 %d、新增 %d、删除 %d", modified, added, deleted)
+	// 口语化提交信息（面向小白）：只列有变化的部分，避免「删除 0 个」噪音
+	var changeParts []string
+	if modified > 0 {
+		changeParts = append(changeParts, fmt.Sprintf("修改 %d 个文件", modified))
+	}
+	if added > 0 {
+		changeParts = append(changeParts, fmt.Sprintf("新增 %d 个", added))
+	}
+	if deleted > 0 {
+		changeParts = append(changeParts, fmt.Sprintf("删除 %d 个", deleted))
+	}
+	msg := "自动保存：" + strings.Join(changeParts, "、")
+	if len(changeParts) == 0 {
+		msg = "自动保存"
+	}
 
 	// 添加文件清单到正文
 	var fileList []string

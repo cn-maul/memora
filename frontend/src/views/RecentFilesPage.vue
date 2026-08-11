@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useSettingsStore } from '@/stores/settings'
-import { getRecentFiles, getFile, browseOpen, getFileHistory, downloadHistoryVersion, resolveFileId } from '@/api/client'
+import { getRecentFiles, getFile, browseOpen, getFileHistory, downloadHistoryVersion, resolveFileId, restoreFile } from '@/api/client'
 import type { FileItem } from '@/types'
 import Icon from '@/components/Icon.vue'
 
@@ -137,12 +137,16 @@ async function openFile(relPath: string) {
   }
 }
 
-// 文件详情弹窗（版本历史 + 下载）
+// 文件详情弹窗（版本历史 + 下载 + 一键恢复）
 const detailEntry = ref<FileItem | null>(null)
 const detailVersions = ref<Array<{ hash: string; time: number; message: string; author: string }>>([])
 const detailLoadingHistory = ref(false)
 const detailDownloading = ref<string | null>(null)
+const detailRestoring = ref<string | null>(null)
+const detailConfirmRestore = ref<{ hash: string; time: number; message: string } | null>(null)
+const detailFileId = ref(0)
 const detailError = ref('')
+const detailNotice = ref('')
 
 function baseName(p: string) {
   const idx = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
@@ -153,9 +157,12 @@ async function openDetailModal(f: FileItem) {
   detailEntry.value = f
   detailVersions.value = []
   detailError.value = ''
+  detailNotice.value = ''
+  detailConfirmRestore.value = null
   detailLoadingHistory.value = true
   try {
     const fileId = await resolveFileId(f.relPath)
+    detailFileId.value = fileId
     const history = await getFileHistory(fileId)
     detailVersions.value = history.commits
       .map((c: any) => ({ hash: c.hash, time: c.time, message: c.message, author: c.author }))
@@ -164,6 +171,30 @@ async function openDetailModal(f: FileItem) {
     // 文件未索引则无版本历史，静默
   } finally {
     detailLoadingHistory.value = false
+  }
+}
+
+// 一键恢复：小白点「恢复」→ 行内确认 → 后端自动先保存当前状态再恢复
+function askRestore(v: { hash: string; time: number; message: string }) {
+  detailError.value = ''
+  detailNotice.value = ''
+  detailConfirmRestore.value = v
+}
+
+async function doRestore() {
+  const v = detailConfirmRestore.value
+  if (!v || detailFileId.value <= 0) return
+  detailRestoring.value = v.hash
+  detailError.value = ''
+  detailNotice.value = ''
+  try {
+    await restoreFile(detailFileId.value, v.hash)
+    detailConfirmRestore.value = null
+    detailNotice.value = '已恢复 ✓ 当前文件已还原为该版本（若此前有改动，已先自动保存）'
+  } catch (e: any) {
+    detailError.value = e.message || '恢复失败'
+  } finally {
+    detailRestoring.value = null
   }
 }
 
@@ -250,8 +281,8 @@ function statusClass(s: string) {
 
     <div v-if="ws.info && !ws.initialized" class="init-banner card">
       <div class="init-banner__content">
-        <strong>工作区尚未初始化</strong>
-        <span class="init-banner-desc">请先在「设置」中配置工作区与模型端点。</span>
+        <strong>还没有选择要管理的文件夹</strong>
+        <span class="init-banner-desc">选好文件夹、连接 AI 后即可使用全部功能。</span>
       </div>
       <button class="btn btn-primary btn-sm" @click="router.push('/settings')">去设置</button>
     </div>
@@ -289,9 +320,14 @@ function statusClass(s: string) {
         </div>
         <div class="file-rows">
           <div v-for="f in displayItems" :key="f.id" class="file-row" :class="{ 'file-row--highlight': highlightRel }">
-            <span class="file-row-name" :title="f.relPath">
-              <Icon name="file" :size="14" class="file-row-icon" />
-              {{ f.relPath }}
+            <span class="file-row-cell file-row-name-cell">
+              <span class="file-row-name" :title="f.relPath">
+                <Icon name="file" :size="14" class="file-row-icon" />
+                <span class="file-row-name__text">{{ f.relPath }}</span>
+              </span>
+              <span v-if="f.tags?.length" class="file-row-tags">
+                <span v-for="t in f.tags" :key="t.name" class="tag-chip tag-chip--mini">{{ t.name }}</span>
+              </span>
             </span>
             <span class="file-row-cell file-doc">{{ f.docType }}</span>
             <span class="file-row-cell file-row-size">{{ formatSize(f.size) }}</span>
@@ -311,7 +347,11 @@ function statusClass(s: string) {
       </div>
     </template>
     <div v-else-if="!ws.info" class="loading">加载工作区信息…</div>
-    <div v-else class="empty-state">请先初始化工作区</div>
+    <div v-else class="empty-state">
+      <span class="empty-state__title">还没有选择要管理的文件夹</span>
+      <span class="empty-state__desc">选好文件夹后，这里会显示最近修改的文件</span>
+      <button class="btn btn-primary btn-sm" style="margin-top: 12px" @click="router.push('/settings')">去设置</button>
+    </div>
 
     <!-- 文件详情弹窗 -->
     <div v-if="detailEntry" class="modal-overlay" @click.self="detailEntry = null">
@@ -352,14 +392,29 @@ function statusClass(s: string) {
                   <span class="version-hash" :title="v.hash">{{ v.hash.slice(0, 7) }}</span>
                 </div>
               </div>
-              <button class="btn btn-ghost btn-sm" @click="downloadVersion(v)" :disabled="detailDownloading === v.hash">
-                <Icon name="download" :size="13" />
-                {{ detailDownloading === v.hash ? '下载中…' : '下载' }}
-              </button>
+              <div class="version-actions">
+                <button class="btn btn-ghost btn-sm" @click="downloadVersion(v)" :disabled="detailDownloading === v.hash">
+                  <Icon name="download" :size="13" />
+                  {{ detailDownloading === v.hash ? '下载中…' : '下载' }}
+                </button>
+                <button class="btn btn-primary btn-sm" @click="askRestore(v)" :disabled="detailRestoring === v.hash">
+                  {{ detailRestoring === v.hash ? '恢复中…' : '恢复此版本' }}
+                </button>
+              </div>
+              <div v-if="detailConfirmRestore && detailConfirmRestore.hash === v.hash" class="restore-confirm">
+                <span class="restore-confirm__text">将把文件恢复为这个版本；若当前有未保存改动，会先自动保存。</span>
+                <div class="restore-confirm__actions">
+                  <button class="btn btn-primary btn-sm" :disabled="detailRestoring !== null" @click="doRestore">
+                    {{ detailRestoring === v.hash ? '恢复中…' : '确认恢复' }}
+                  </button>
+                  <button class="btn btn-ghost btn-sm" :disabled="detailRestoring !== null" @click="detailConfirmRestore = null">取消</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
+        <div v-if="detailNotice" class="alert alert--success">{{ detailNotice }}</div>
         <div v-if="detailError" class="alert alert--error">{{ detailError }}</div>
 
         <div class="modal-actions">
@@ -441,6 +496,16 @@ function statusClass(s: string) {
 .file-row:last-child { border-bottom: none; }
 .file-row:hover { background: var(--c-bg-hover); }
 .file-row-name { display: flex; align-items: center; gap: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--c-text-primary); font-weight: 500; }
+.file-row-name-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  justify-content: center;
+  min-width: 0;
+}
+.file-row-name__text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-row-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+.tag-chip--mini { font-size: 10.5px; padding: 1px 6px; }
 .file-row-icon { color: var(--c-icon-secondary); flex-shrink: 0; }
 .file-row-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-doc { color: var(--c-text-secondary); text-transform: uppercase; font-weight: 600; font-size: 12px; }
@@ -468,6 +533,24 @@ function statusClass(s: string) {
 
 .version-list { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow-y: auto; }
 .version-item { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--c-border); border-radius: var(--r-md); background: var(--c-bg-secondary); }
+
+.version-actions { display: flex; gap: 6px; }
+
+/* 行内恢复确认条 */
+.restore-confirm {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--c-bg-panel);
+  border: 1px solid var(--c-warning);
+}
+.restore-confirm__text { font-size: 12px; color: var(--c-text-secondary); line-height: 1.5; }
+.restore-confirm__actions { display: flex; gap: 6px; flex-shrink: 0; }
 .version-num { font-size: 11px; font-weight: 700; color: var(--c-brand); background: var(--c-brand-soft); padding: 2px 6px; border-radius: var(--r-xs); }
 .version-info { min-width: 0; }
 .version-message { font-size: 12px; color: var(--c-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

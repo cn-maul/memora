@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, computed } from 'vue'
+import { onMounted, onUnmounted, ref, computed, watch, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useTagsStore } from '@/stores/tags'
@@ -46,8 +46,8 @@ let queueTimer: ReturnType<typeof setInterval> | null = null
 const navItems: { path: string; label: string; icon: IconName }[] = [
   { path: '/files', label: '最近文件', icon: 'clock' },
   { path: '/workspace', label: '全部文件', icon: 'folder' },
-  { path: '/index', label: '文档索引', icon: 'search' },
-  { path: '/timeline', label: '提交记录', icon: 'git-branch' },
+  { path: '/index', label: '内容整理', icon: 'search' },
+  { path: '/timeline', label: '版本历史', icon: 'git-branch' },
   { path: '/qa', label: '问答', icon: 'chat' },
   { path: '/stats', label: '统计', icon: 'chart' },
   { path: '/settings', label: '设置', icon: 'settings' },
@@ -59,6 +59,8 @@ const gitBranchName = computed(() => {
 })
 const autoCommitting = ref(false)
 const autoCommitResult = ref('')
+// 首次使用「版本历史」引导 toast（localStorage 去重，只出现一次）
+const vcGuideVisible = ref(false)
 
 function headHashShort(): string {
   const h = ws.info?.head?.hash
@@ -71,12 +73,12 @@ async function handleAutoCommit() {
   try {
     const res = await autoCommit()
     if (res.hash) {
-      autoCommitResult.value = res.ai ? `AI 提交 ${res.hash.slice(0, 8)}` : `已提交 ${res.hash.slice(0, 8)}`
+      autoCommitResult.value = '已保存 ✓'
     } else {
-      autoCommitResult.value = '无变更'
+      autoCommitResult.value = '没有需要保存的改动'
     }
   } catch (e: any) {
-    autoCommitResult.value = e.message || '提交失败'
+    autoCommitResult.value = e.message || '保存失败'
   } finally {
     autoCommitting.value = false
   }
@@ -151,7 +153,7 @@ async function handleSuggestMessage() {
   try {
     const suggestion = await suggestCommitMessage()
     commitMessage.value = suggestion
-    commitSuccess.value = '已生成 AI 建议，可自行修改后提交'
+    commitSuccess.value = '已生成 AI 建议，可直接使用或修改'
   } catch (e: any) {
     commitError.value = e.message || 'AI 生成备注失败'
   } finally {
@@ -161,21 +163,18 @@ async function handleSuggestMessage() {
 
 async function handleManualCommit() {
   const msg = commitMessage.value.trim()
-  if (!msg) {
-    commitError.value = '请填写提交备注，或点「AI 生成」自动总结'
-    return
-  }
+  // 空备注也允许提交：小白写不出备注也能保存（后端自动生成统计备注）
   commitSubmitting.value = true
   commitError.value = ''
   commitSuccess.value = ''
   try {
     const hash = await manualCommit(msg)
-    commitSuccess.value = hash ? `提交成功 ${hash.slice(0, 8)}` : '没有变更需要提交'
+    commitSuccess.value = hash ? '已保存 ✓' : '没有需要保存的改动'
     commitDialogOpen.value = false
     await ws.fetchInfo()
-    autoCommitResult.value = hash ? `已提交 ${hash.slice(0, 8)}` : ''
+    autoCommitResult.value = hash ? '已保存 ✓' : ''
   } catch (e: any) {
-    commitError.value = e.message || '提交失败'
+    commitError.value = e.message || '保存失败'
   } finally {
     commitSubmitting.value = false
   }
@@ -226,6 +225,7 @@ function startDrag(target: 'sidebar' | 'chat', e: MouseEvent) {
 // ── 对话输入 ────────
 const chatInput = ref('')
 const chatInputRef = ref<HTMLTextAreaElement | null>(null)
+const chatListRef = ref<HTMLElement | null>(null) // 消息列表容器，用于自动滚动
 const chatError = ref('')
 function autosize() {
   const ta = chatInputRef.value
@@ -233,6 +233,34 @@ function autosize() {
   ta.style.height = 'auto'
   ta.style.height = Math.min(ta.scrollHeight, 180) + 'px'
 }
+function scrollChatToBottom() {
+  nextTick(() => {
+    if (chatListRef.value) {
+      chatListRef.value.scrollTop = chatListRef.value.scrollHeight
+    }
+  })
+}
+// 新消息出现（发送消息 / 恢复历史会话）时始终滚到底部最新对话
+watch(
+  () => qa.messages.length,
+  () => {
+    scrollChatToBottom()
+  },
+)
+// 流式输出期间持续跟随滚动：等待回复时内容不断变长，始终停在最新内容处
+watch(
+  () => {
+    const last = qa.messages[qa.messages.length - 1]
+    return last ? last.content.length : 0
+  },
+  () => {
+    if (qa.sending) scrollChatToBottom()
+  },
+)
+// 侧栏对话显示（进入 /files 页）时确保停在最新消息，兼容恢复完成晚于面板渲染的场景
+watch(hideChatPanel, (hidden) => {
+  if (!hidden) scrollChatToBottom()
+})
 async function send() {
   const text = chatInput.value.trim()
   if (!text || qa.sending) return
@@ -247,6 +275,8 @@ async function send() {
     if (cur && cur.mode === 'file') sessionId = undefined
   }
   await qa.send({ question: text, mode: 'global', sessionId })
+  // 发送后滚到底部（流式过程中由上面 watch 持续跟随）
+  scrollChatToBottom()
   // 注：错误提示由 qa store 写入助手消息气泡，此处不再需要空消息兜底分支
 }
 function cancelSend() {
@@ -345,8 +375,11 @@ let incrementalRefreshTimer: ReturnType<typeof setTimeout> | null = null
 onMounted(async () => {
   applyTheme(theme.value)
   await ws.fetchInfo()
-  // 自动恢复上一次 AI 对话到侧栏聊天（需求：再次打开软件显示上次会话，而不是空的新对话）
-  qa.restoreLastSession().catch(() => {})
+// 自动恢复上一次 AI 对话到侧栏聊天（需求：再次打开软件显示上次会话，而不是空的新对话）
+	qa.restoreLastSession().then(() => {
+		// 恢复完成后滚动到最新对话（restore 是异步的，必须等消息真正载入后再滚）
+		scrollChatToBottom()
+	}).catch(() => {})
   // 挂载文件导航函数到 window，供 renderAnswer 生成的链接使用
   ;(window as any).__navigateToFile = (relPath: string) => {
     ;(window as any).__highlightFile = relPath
@@ -402,6 +435,24 @@ onMounted(async () => {
   tags.fetchTags()
   refreshQueue()
   queueTimer = setInterval(refreshQueue, 5000)
+
+  // 首次进入且已有版本记录：一次性提示「自动记录版本」的心智模型
+  if (ws.initialized && ws.info?.head?.hasCommits) {
+    let guideShown = false
+    try {
+      guideShown = localStorage.getItem('memora.vcGuideShown') === '1'
+    } catch {
+      // 隐私模式等场景忽略
+    }
+    if (!guideShown) {
+      vcGuideVisible.value = true
+      try {
+        localStorage.setItem('memora.vcGuideShown', '1')
+      } catch {
+        // 忽略写入失败
+      }
+    }
+  }
 })
 
 onUnmounted(() => {
@@ -444,36 +495,34 @@ onUnmounted(() => {
       </nav>
 
       <div class="git-section" v-show="!sidebarCollapsed">
-        <div class="git-label">版本控制</div>
+        <div class="git-label">版本历史</div>
 
-        <div class="git-branch-row">
-          <Icon name="git-branch" :size="14" :color="'var(--c-icon-secondary)'" />
-          <span class="git-branch-name">{{ gitBranchName }}</span>
-        </div>
-
-        <div class="git-head-row" v-if="ws.initialized && ws.info?.head">
-          <span class="git-head">
-            <span class="git-head__label">HEAD</span>
-            <span class="git-head__hash">{{ headHashShort() || '—' }}</span>
-            <span class="git-head__sep">·</span>
-            <span class="git-head__count">{{ ws.info.head?.countFiles ?? 0 }} 文件</span>
-            <span class="git-head__sep">·</span>
-            <span class="git-head__count">{{ ws.info.head?.changedFiles ?? 0 }} 改动</span>
+        <!-- 通俗状态：小白只看「待保存 / 已保存」 -->
+        <div class="git-state-row" v-if="ws.initialized">
+          <span class="git-state-dot" :class="{ 'git-state-dot--dirty': hasUncommitted() }"></span>
+          <span class="git-state-text">
+            {{
+              hasUncommitted()
+                ? `${gitDirtySum()} 个文件有改动，待保存`
+                : ws.info?.head?.hasCommits
+                  ? '已保存 · 改动都已记录成版本'
+                  : '尚未保存过版本'
+            }}
           </span>
         </div>
 
         <div class="git-status-row" v-if="ws.initialized">
-          <span class="git-status-item" title="相对上次提交被修改的文件数">
+          <span class="git-status-item" title="相对上次保存被修改的文件数">
             <span class="git-status-dot" :class="{ 'dot--modified': (ws.info?.dirtyCounts?.modified || 0) > 0 }"></span>
             <span class="git-status-num">{{ ws.info?.dirtyCounts?.modified || 0 }}</span>
             <span class="git-status-text">修改</span>
           </span>
-          <span class="git-status-item" title="尚未被 Git 跟踪的新文件数">
+          <span class="git-status-item" title="工作区里新出现的文件数">
             <span class="git-status-dot" :class="{ 'dot--untracked': (ws.info?.dirtyCounts?.untracked || 0) > 0 }"></span>
             <span class="git-status-num">{{ ws.info?.dirtyCounts?.untracked || 0 }}</span>
-            <span class="git-status-text">未跟踪</span>
+            <span class="git-status-text">新文件</span>
           </span>
-          <span class="git-status-item" title="相对上次提交被删除的文件数">
+          <span class="git-status-item" title="相对上次保存被删除的文件数">
             <span class="git-status-dot" :class="{ 'dot--deleted': (ws.info?.dirtyCounts?.deleted || 0) > 0 }"></span>
             <span class="git-status-num">{{ ws.info?.dirtyCounts?.deleted || 0 }}</span>
             <span class="git-status-text">删除</span>
@@ -485,23 +534,44 @@ onUnmounted(() => {
             class="git-commit-btn git-commit-btn--auto"
             :disabled="autoCommitting || !hasUncommitted()"
             @click="handleAutoCommit"
-            title="自动提交"
+            title="把当前所有改动保存成一个新版本"
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
-            {{ autoCommitting ? '…' : 'auto' }}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+            {{ autoCommitting ? '…' : '保存' }}
           </button>
           <button
             class="git-commit-btn git-commit-btn--manual"
             :disabled="!hasUncommitted()"
             @click="openCommitDialog"
-            title="手动提交（可写备注 + AI 生成）"
+            title="保存当前改动，并给这个版本写一句说明（可选）"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-            <span class="git-commit-btn__label">{{ autoCommitting ? '…' : '写备注' }}</span>
+            <span class="git-commit-btn__label">{{ autoCommitting ? '…' : '保存并备注' }}</span>
           </button>
         </div>
 
-        <div v-if="autoCommitResult" class="git-result" :class="autoCommitResult.startsWith('已提交') ? 'git-result--success' : ''">
+        <!-- 高级：分支 / HEAD 等专业信息（默认折叠，给想看的用户） -->
+        <details class="git-advanced" v-if="ws.initialized && ws.info?.head">
+          <summary class="git-advanced__summary">高级</summary>
+          <div class="git-advanced__body">
+            <div class="git-branch-row">
+              <Icon name="git-branch" :size="14" :color="'var(--c-icon-secondary)'" />
+              <span class="git-branch-name">{{ gitBranchName }}</span>
+            </div>
+            <div class="git-head-row">
+              <span class="git-head">
+                <span class="git-head__label">HEAD</span>
+                <span class="git-head__hash">{{ headHashShort() || '—' }}</span>
+                <span class="git-head__sep">·</span>
+                <span class="git-head__count">{{ ws.info.head?.countFiles ?? 0 }} 文件</span>
+                <span class="git-head__sep">·</span>
+                <span class="git-head__count">{{ ws.info.head?.changedFiles ?? 0 }} 改动</span>
+              </span>
+            </div>
+          </div>
+        </details>
+
+        <div v-if="autoCommitResult" class="git-result" :class="autoCommitResult.startsWith('已保存') ? 'git-result--success' : ''">
           {{ autoCommitResult }}
         </div>
       </div>
@@ -558,10 +628,14 @@ onUnmounted(() => {
         <span class="greeting-text">向文档提问，获取基于内容的回答</span>
       </div>
 
-      <div v-else class="chat-messages">
+      <div v-else ref="chatListRef" class="chat-messages">
         <div v-for="msg in qa.messages" :key="msg.id" class="chat-msg" :class="`chat-msg--${msg.role}`">
           <div class="chat-msg__role">{{ msg.role === 'user' ? '你' : 'Memora' }}</div>
           <div class="chat-msg__content">
+            <details v-if="msg.thinking" class="chat-thinking" open>
+              <summary>思考过程</summary>
+              <div class="chat-thinking__body">{{ msg.thinking }}</div>
+            </details>
             <template v-if="msg.role === 'assistant' && !msg.content && qa.sending">
               <span class="chat-msg__thinking">正在思考</span>
               <span class="chat-msg__dots"><span></span><span></span><span></span></span>
@@ -625,13 +699,13 @@ onUnmounted(() => {
       </div>
     </aside>
 
-    <!-- 手动提交对话框 -->
+    <!-- 手动提交对话框（小白友好：备注可选，留空也能保存） -->
     <div v-if="commitDialogOpen" class="commit-mask" @click.self="closeCommitDialog">
       <div class="commit-dialog card">
         <div class="commit-dialog__head">
           <div class="commit-dialog__title">
             <Icon name="git-branch" :size="16" />
-            <span>手动提交</span>
+            <span>保存当前改动</span>
           </div>
           <button class="commit-dialog__close" title="关闭" @click="closeCommitDialog">
             <Icon name="x" :size="16" />
@@ -641,7 +715,7 @@ onUnmounted(() => {
         <div v-if="commitLoading" class="loading">加载变更状态…</div>
         <template v-else>
           <div v-if="commitFiles.length === 0 && !commitError" class="commit-dialog__empty">
-            当前没有变更需要提交
+            当前没有需要保存的改动
           </div>
 
           <div v-if="commitFiles.length" class="commit-dialog__files">
@@ -657,11 +731,11 @@ onUnmounted(() => {
           <div v-if="commitError" class="alert alert--error commit-dialog__error">{{ commitError }}</div>
           <div v-if="commitSuccess" class="alert alert--success commit-dialog__success">{{ commitSuccess }}</div>
 
-          <label class="commit-dialog__label">提交备注</label>
+          <label class="commit-dialog__label">给这个版本写句说明（可不填）</label>
           <textarea
             v-model="commitMessage"
             class="input textarea commit-dialog__message"
-            placeholder="请填写本次提交的说明…"
+            placeholder="例如：更新了预算表的 3 月数据…（不填也能保存）"
             rows="3"
           ></textarea>
 
@@ -672,21 +746,33 @@ onUnmounted(() => {
               @click="handleSuggestMessage"
             >
               <Icon name="memory" :size="13" />
-              {{ commitSuggesting ? '生成中…' : 'AI 生成' }}
+              {{ commitSuggesting ? '生成中…' : '帮我写说明' }}
             </button>
             <div class="commit-dialog__actions-right">
               <button class="btn btn-ghost btn-sm" @click="closeCommitDialog">取消</button>
               <button
                 class="btn btn-primary btn-sm"
-                :disabled="commitSubmitting || !commitMessage.trim()"
+                :disabled="commitSubmitting || commitFiles.length === 0"
                 @click="handleManualCommit"
               >
-                {{ commitSubmitting ? '提交中…' : '提交' }}
+                {{ commitSubmitting ? '保存中…' : '保存' }}
               </button>
             </div>
           </div>
         </template>
       </div>
+    </div>
+
+    <!-- 首次使用引导 toast：自动记录版本 -->
+    <div v-if="vcGuideVisible" class="vc-guide-toast">
+      <span class="vc-guide-toast__icon">🕰️</span>
+      <div class="vc-guide-toast__body">
+        <span class="vc-guide-toast__title">你的文件会自动记录版本</span>
+        <span class="vc-guide-toast__text">
+          修改或删除文件后，稍等片刻系统会自动保存一个版本。想找回旧内容，随时在左侧「版本历史」或文件详情里点「恢复此版本」。
+        </span>
+      </div>
+      <button class="vc-guide-toast__close" title="知道了" @click="vcGuideVisible = false">×</button>
     </div>
   </div>
 </template>
@@ -856,6 +942,49 @@ onUnmounted(() => {
   color: var(--c-text-tertiary);
   padding: 4px 10px 6px;
   letter-spacing: 0.5px;
+}
+/* 通俗状态行：待保存 / 已保存 */
+.git-state-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--c-bg-panel);
+  border: 1px solid var(--c-border);
+  margin-bottom: 4px;
+}
+.git-state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c-success);
+  flex-shrink: 0;
+}
+.git-state-dot--dirty {
+  background: var(--c-warning);
+}
+.git-state-text {
+  font-size: 12px;
+  color: var(--c-text-secondary);
+  line-height: 1.4;
+}
+/* 高级折叠区：分支 / HEAD 等专业信息 */
+.git-advanced {
+  margin: 2px 0 0;
+}
+.git-advanced__summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  color: var(--c-text-tertiary);
+  padding: 4px 10px;
+}
+.git-advanced__summary:hover {
+  color: var(--c-text-secondary);
+}
+.git-advanced__body {
+  padding-bottom: 4px;
 }
 .git-branch-row {
   display: flex;
@@ -1308,6 +1437,31 @@ onUnmounted(() => {
   padding: 0 4px;
 }
 
+/* 思考过程折叠区（推理模型思维链，流式期间实时展示） */
+.chat-thinking {
+  margin-bottom: 6px;
+  background: var(--c-bg-page);
+  border: 1px dashed var(--c-border);
+  border-radius: var(--r-sm);
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--c-text-tertiary);
+  line-height: 1.55;
+}
+
+.chat-thinking summary {
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  color: var(--c-text-secondary);
+}
+
+.chat-thinking__body {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .chat-error {
   margin: 0 14px 8px;
   flex-shrink: 0;
@@ -1539,5 +1693,61 @@ onUnmounted(() => {
   width: 13px;
   height: 13px;
   opacity: 0.7;
+}
+
+/* ── 首次使用引导 toast ── */
+.vc-guide-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 1000;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: 380px;
+  padding: 12px 14px;
+  border-radius: var(--r-lg);
+  background: var(--c-bg-elevated);
+  border: 1px solid var(--c-brand-border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  animation: guide-in 0.25s ease-out;
+}
+@keyframes guide-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+.vc-guide-toast__icon {
+  font-size: 20px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.vc-guide-toast__body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.vc-guide-toast__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--c-text-primary);
+}
+.vc-guide-toast__text {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--c-text-secondary);
+}
+.vc-guide-toast__close {
+  border: none;
+  background: none;
+  color: var(--c-text-tertiary);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.vc-guide-toast__close:hover {
+  color: var(--c-text-primary);
 }
 </style>

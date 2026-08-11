@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
+import { useRouter } from 'vue-router'
 import { getStats, exportStats } from '@/api/client'
 import type { StatsMetrics } from '@/types'
 import Icon from '@/components/Icon.vue'
 
+const router = useRouter()
 const stats = ref<StatsMetrics | null>(null)
 const enabled = ref(true)
 const range = ref('week')
@@ -87,11 +89,17 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
 
     <div v-if="loadError" class="alert alert--error">{{ loadError }}</div>
 
-    <div v-if="!enabled" class="empty-state">统计已关闭，请在隐私设置中开启</div>
+    <div v-if="!enabled" class="empty-state">
+      统计已关闭，可在「设置」里开启
+      <button class="btn btn-primary btn-sm" style="margin-top: 10px" @click="router.push('/settings')">去设置</button>
+    </div>
 
     <div v-else-if="loading" class="loading">加载中…</div>
 
-    <div v-else-if="!stats" class="empty-state">暂无统计数据</div>
+    <div v-else-if="!stats" class="empty-state">
+      还没有统计数据
+      <span class="empty-desc">修改文件并自动保存版本后，这里会出现你的活跃趋势</span>
+    </div>
 
     <div v-else class="stats-content">
       <div class="range-bar segmented">
@@ -116,10 +124,10 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
         <div class="stat-card card">
           <div class="stat-label">
             <Icon name="memory" :size="14" />
-            迭代速率
+            活跃度
           </div>
           <div class="stat-value">{{ (stats.iterationRate * 100).toFixed(1) }}%</div>
-          <div class="stat-hint">活跃提交节奏</div>
+          <div class="stat-hint">你整理和更新文件的频率</div>
         </div>
         <div class="stat-card card">
           <div class="stat-label">
@@ -135,9 +143,9 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
         </div>
       </div>
 
-      <!-- 提交趋势（简易柱状） -->
+      <!-- 版本趋势（简易柱状） -->
       <div class="card">
-        <div class="card-title">提交趋势</div>
+        <div class="card-title">版本趋势</div>
         <div class="bar-chart">
           <div v-for="(d, i) in commitsByDay" :key="i" class="bar-item">
             <div class="bar-value">{{ d.count > 0 ? d.count : '' }}</div>
@@ -152,7 +160,11 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
         <div class="card" v-if="hotFiles.length">
           <div class="card-title">热点文件</div>
           <div v-for="f in hotFiles" :key="f.relPath" class="hot-file">
-            <span class="hot-file__path">
+            <span
+              class="hot-file__path"
+              :title="'去全部文件页查看：' + f.relPath"
+              @click="router.push({ path: '/workspace', query: { highlight: f.relPath } })"
+            >
               <Icon name="file" :size="13" />
               {{ f.relPath }}
             </span>
@@ -335,6 +347,12 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+  color: var(--c-text-primary);
+}
+.hot-file__path:hover {
+  color: var(--c-brand);
+  text-decoration: underline;
 }
 
 .hot-file-count {
@@ -362,5 +380,12 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
   color: var(--c-text-secondary);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+
+.empty-desc {
+  display: block;
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--c-text-tertiary);
 }
 </style>

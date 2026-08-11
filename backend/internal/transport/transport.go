@@ -26,7 +26,6 @@ import (
 	"memora/internal/events"
 	"memora/internal/logx"
 	"memora/internal/taskqueue"
-	"memora/internal/timeline"
 )
 
 // EventBus 事件接口
@@ -175,6 +174,7 @@ type LLMAPI interface {
 	TestChatWith(baseURL, apiKey, model string, temperature float64) error
 	TestEmbedWith(baseURL, apiKey, model string) error
 	TestRerankWith(baseURL, apiKey, model string) error
+	ListModels(kind, baseURL, apiKey string) ([]string, error)
 }
 
 // BrowserAPI 文件浏览模块接口
@@ -1096,13 +1096,8 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := m.handler.Timeline.Restore(file.RelPath, req.CommitHash); err != nil {
-			if de, ok := err.(*timeline.WorkspaceDirtyError); ok {
-				writeError(w, "workspace_dirty", de.Error(), http.StatusConflict, map[string]interface{}{
-					"modified": de.Files,
-				})
-			} else {
-				writeError(w, "internal", err.Error(), http.StatusInternalServerError)
-			}
+			// 恢复已无 409 门槛：工作区有改动时后端自动先保存当前状态再恢复
+			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
 			return
 		}
 		writeOK(w, map[string]interface{}{"ok": true, "modified": []string{file.RelPath}})
@@ -1454,9 +1449,24 @@ func (m *Module) handleFilesRecent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 批量附带标签（与 handleFiles 一致，避免逐文件 N+1）
+	type RecentItem struct {
+		contract.FileInfo
+		Tags []contract.FileTag `json:"tags"`
+	}
+	ids := make([]int64, len(files))
+	for i, f := range files {
+		ids[i] = f.ID
+	}
+	tagMap, _ := m.handler.Storage.FileTagsByFiles(ids)
+	items := make([]RecentItem, 0, len(files))
+	for _, f := range files {
+		items = append(items, RecentItem{FileInfo: *f, Tags: tagMap[f.ID]})
+	}
+
 	writeOK(w, map[string]interface{}{
 		"window": window,
-		"items":  files,
+		"items":  items,
 	})
 }
 
@@ -1903,6 +1913,29 @@ func (m *Module) handleCommitByHash(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GET /api/commits/{hash}/content?path=... —— 该版本中某文件的文本内容（版本预览）
+	if strings.HasSuffix(path, "/content") && r.Method == http.MethodGet {
+		hash := getPathParam(path, "/api/commits/")
+		hash = strings.TrimSuffix(hash, "/content")
+		if !isHexSHA1(hash) {
+			writeError(w, "bad_request", "无效提交哈希", http.StatusBadRequest)
+			return
+		}
+		relPath := getQueryParam(r, "path")
+		if relPath == "" {
+			writeError(w, "bad_request", "缺少 path 参数", http.StatusBadRequest)
+			return
+		}
+		content, err := m.handler.Git.ShowFileAt(relPath, hash)
+		if err != nil {
+			writeError(w, "not_found", "该版本中不存在此文件", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, content)
+		return
+	}
+
 	// POST /api/commits/{hash}/summary
 	if strings.HasSuffix(path, "/summary") && r.Method == http.MethodPost {
 		hash := getPathParam(path, "/api/commits/")
@@ -1961,10 +1994,6 @@ func (m *Module) handleCommitManual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg := strings.TrimSpace(req.Message)
-	if msg == "" {
-		writeError(w, "bad_request", "提交备注不能为空", http.StatusBadRequest)
-		return
-	}
 
 	// 无变更时返回 skipped，不报错（前端据此提示"无变更"）
 	status, err := m.handler.Git.Status()
@@ -1973,15 +2002,38 @@ func (m *Module) handleCommitManual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hasChanges := false
+	added, modified, deleted := 0, 0, 0
 	for _, code := range status {
 		if code != "" && code != " " {
 			hasChanges = true
-			break
+		}
+		switch code {
+		case "A", "?":
+			added++
+		case "M":
+			modified++
+		case "D":
+			deleted++
 		}
 	}
 	if !hasChanges {
 		writeOK(w, map[string]interface{}{"skipped": true, "hash": ""})
 		return
+	}
+
+	// 空备注不再拦截（小白写不出备注也能保存）：自动生成统计备注
+	if msg == "" {
+		var parts []string
+		if modified > 0 {
+			parts = append(parts, fmt.Sprintf("修改 %d 个文件", modified))
+		}
+		if added > 0 {
+			parts = append(parts, fmt.Sprintf("新增 %d 个", added))
+		}
+		if deleted > 0 {
+			parts = append(parts, fmt.Sprintf("删除 %d 个", deleted))
+		}
+		msg = "手动保存：" + strings.Join(parts, "、")
 	}
 
 	hash, err := m.handler.Git.CommitManual(msg)
@@ -2076,9 +2128,12 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 				}
 			default:
 				// 其余配置项属于需重启生效项（或已由特定模块热更新）
-				// recent.windowHours 由最近文件页实时读取；rerank.* 由 llm 模块每次调用实时读取
+				// llm/embed 配置由 llm 模块每次调用实时读取（GetLLMConfig/GetEmbedConfig），
+				// 改完即生效，不算"需重启"（修复：此前误标导致提示误导小白）。
 				switch key {
-				case "stats.enabled", "recent.windowHours", "rerank.baseUrl", "rerank.model":
+				case "stats.enabled", "recent.windowHours", "rerank.baseUrl", "rerank.model",
+					"rerank.apiKey", "llm.baseUrl", "llm.model", "llm.temperature",
+					"llm.apiKey", "embed.baseUrl", "embed.model", "embed.dimensions", "embed.apiKey":
 				default:
 					restartKeys[key] = true
 				}
@@ -2131,7 +2186,8 @@ func (m *Module) handleTest(w http.ResponseWriter, r *http.Request) {
 	// POST /api/test/llm
 	if strings.HasSuffix(path, "/llm") {
 		var req struct {
-			Type        string  `json:"type"` // chat|embed
+			Type        string  `json:"type"` // chat|embed|models
+			Kind        string  `json:"kind"` // models 时区分 chat/embed/rerank，用于回退正确密钥
 			BaseURL     string  `json:"baseUrl"`
 			Model       string  `json:"model"`
 			ApiKey      string  `json:"apiKey"`
@@ -2143,6 +2199,14 @@ func (m *Module) handleTest(w http.ResponseWriter, r *http.Request) {
 		}
 		var err error
 		switch req.Type {
+		case "models":
+			models, lerr := m.handler.LLM.ListModels(req.Kind, req.BaseURL, req.ApiKey)
+			if lerr != nil {
+				writeOK(w, map[string]interface{}{"ok": false, "message": lerr.Error()})
+				return
+			}
+			writeOK(w, map[string]interface{}{"ok": true, "models": models})
+			return
 		case "embed":
 			err = m.handler.LLM.TestEmbedWith(req.BaseURL, req.ApiKey, req.Model)
 		case "rerank":

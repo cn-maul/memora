@@ -216,7 +216,7 @@ type IStorage interface {
 	FilesGet(id int64) (*FileInfo, error)
 	FilesList(status, tag string, page, pageSize int, sortOrder string) ([]*FileInfo, int, error)
 	FilesMarkStatus(id int64, status, lastError string) error
-	FilesRetryStatus(id int64) error // 将 failed 重置为 pending，供用户手动重试
+	FilesRetryStatus(id int64) error                           // 将 failed 重置为 pending，供用户手动重试
 	FilesRecent(sinceMs int64, limit int) ([]*FileInfo, error) // 最近修改的文件（按 mtime 倒序）
 
 	// 分块
@@ -280,6 +280,12 @@ type ChatOptions struct {
 	MaxTokens   int
 	JSONMode    bool
 }
+
+// ThinkChunkPrefix 流式"思考过程"块前缀。
+// 推理模型（SenseNova reasoning、DeepSeek-R1 等）的思维链经 delta.reasoning
+// 增量返回，与最终答案 delta.content 混在同一流里。带此前缀的块表示思考过程，
+// 前端单独渲染（折叠区），后端不计入最终回答（不落库）。
+const ThinkChunkPrefix = "\x00MTHINK\x00"
 
 // ILLM 模型网关
 type ILLM interface {

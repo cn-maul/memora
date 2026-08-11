@@ -25,11 +25,12 @@ const hasSearched = ref(false)
 // 状态/标签筛选（与后端 FilesList 状态机一致：pending/extracting/embedding/indexed/failed/ignored）
 const statusOptions = [
   { value: '', label: '全部状态' },
-  { value: 'pending', label: '待索引' },
-  { value: 'extracting', label: '提取中' },
-  { value: 'embedding', label: '嵌入中' },
-  { value: 'indexed', label: '已索引' },
+  { value: 'pending', label: '等待整理' },
+  { value: 'extracting', label: '处理中' },
+  { value: 'embedding', label: '处理中' },
+  { value: 'indexed', label: '已整理' },
   { value: 'failed', label: '失败' },
+  { value: 'ignored', label: '已忽略' },
 ]
 
 const fileError = ref('')
@@ -127,7 +128,7 @@ async function handleReindex() {
   try {
     await reindexAll()
   } catch (e: any) {
-    fileError.value = e.message || '重建索引失败'
+    fileError.value = e.message || '重新整理失败'
     files.setReindexProgress(null)
   } finally {
     reindexing.value = false
@@ -229,10 +230,10 @@ function formatTime(ms?: number) {
 
 function statusLabel(s: string) {
   const map: Record<string, string> = {
-    pending: '待索引',
-    extracting: '提取中',
-    embedding: '嵌入中',
-    indexed: '已索引',
+    pending: '等待整理',
+    extracting: '处理中',
+    embedding: '处理中',
+    indexed: '已整理',
     failed: '失败',
     ignored: '已忽略',
   }
@@ -249,14 +250,21 @@ function statusClass(s: string) {
   }
   return map[s] || 'status-chip--muted'
 }
+
+// 相关度分数 → 通俗等级（对小白不展示百分比，避免误以为是"准确率"）
+function scoreLevel(score: number): string {
+  if (score >= 0.7) return '相关度高'
+  if (score >= 0.4) return '相关度中'
+  return '相关度低'
+}
 </script>
 
 <template>
   <div class="index-page">
     <div class="page-header">
       <div>
-        <h2>文档索引</h2>
-        <p class="page-sub">语义搜索、标签管理与索引状态总览</p>
+        <h2>内容整理</h2>
+        <p class="page-sub">按内容搜索文档，查看整理进度与标签</p>
       </div>
       <div class="header-actions">
         <button class="btn btn-ghost btn-sm" @click="files.fetch()">
@@ -264,15 +272,15 @@ function statusClass(s: string) {
         </button>
         <button class="btn btn-primary btn-sm" @click="handleReindex" :disabled="reindexing || !ws.initialized">
           <Icon name="refresh" :size="14" />
-          {{ reindexing ? '重建中…' : '重建索引' }}
+          {{ reindexing ? '整理中…' : '重新整理' }}
         </button>
       </div>
     </div>
 
     <div v-if="ws.info && !ws.initialized" class="init-banner card">
       <div class="init-banner__content">
-        <strong>工作区尚未初始化</strong>
-        <span class="init-banner-desc">请先在「设置」中配置工作区与模型端点。</span>
+        <strong>还没有选择要管理的文件夹</strong>
+        <span class="init-banner-desc">选好文件夹并连接 AI 后，就能按内容搜索、自动整理和问答。</span>
       </div>
       <button class="btn btn-primary btn-sm" @click="router.push('/settings')">去设置</button>
     </div>
@@ -281,14 +289,21 @@ function statusClass(s: string) {
       <div v-if="fileError" class="alert alert--error">{{ fileError }}</div>
       <div v-if="openError" class="alert alert--error">{{ openError }}</div>
 
-      <!-- 语义搜索 -->
+      <!-- AI 未配置引导 -->
+      <div v-if="!ws.info?.embedConfigured" class="ai-hint card">
+        <Icon name="search" :size="14" />
+        <span>「按内容搜索」需要先连接 AI 服务，点这里去设置（暂时跳过也能浏览文件）</span>
+        <button class="btn btn-ghost btn-sm" @click="router.push('/settings')">去设置</button>
+      </div>
+
+      <!-- 按内容搜索（语义搜索） -->
       <div class="search-bar">
         <div class="search-input-wrap">
           <Icon name="search" :size="15" class="search-input-icon" />
           <input
             v-model="searchQuery"
             class="input search-input"
-            placeholder="内容搜索：基于向量语义检索文档（支持标签过滤）"
+            placeholder="按内容搜索：输入你想找的内容，如「今年预算」"
             @keyup.enter="doSearch"
           />
         </div>
@@ -311,6 +326,10 @@ function statusClass(s: string) {
           :class="{ 'tag-wall__item--picked': t.name === files.tagFilter }"
           @click="toggleTagFilter(t.name)"
         >{{ t.name }}</span>
+        <button v-if="files.tagFilter" class="btn btn-ghost btn-sm tag-wall__clear" @click="toggleTagFilter(files.tagFilter)">
+          <Icon name="x" :size="13" />
+          清除筛选
+        </button>
       </div>
 
       <!-- 标签建议（待处理） -->
@@ -348,14 +367,17 @@ function statusClass(s: string) {
       <!-- 语义搜索结果 -->
       <div v-if="hasSearched" class="search-results">
         <div v-if="searching" class="loading">搜索中…</div>
-        <div v-else-if="searchResults.length === 0" class="empty-state">未找到匹配「{{ searchQuery }}」的内容</div>
+        <div v-else-if="searchResults.length === 0" class="empty-state">
+          <span class="empty-state__title">没有找到「{{ searchQuery }}」相关的内容</span>
+          <span class="empty-state__desc">试试换个说法或更简短的关键词</span>
+        </div>
         <template v-else>
           <div v-for="r in searchResults" :key="r.fileId" class="search-item card">
             <div class="search-item-main">
 <div class="search-item-top">
                 <span class="search-item-path" :title="r.relPath">{{ r.relPath }}</span>
                 <span v-if="r.score !== undefined" class="search-item-score">
-                  {{ (r.score * 100).toFixed(0) }}%
+                  {{ scoreLevel(r.score) }}
                 </span>
               </div>
               <div v-if="r.hitText" class="search-item-hit">{{ r.hitText }}</div>
@@ -386,15 +408,15 @@ function statusClass(s: string) {
         <div v-if="files.reindexProgress" class="reindex-progress card">
           <template v-if="files.reindexProgress.phase === 'done'">
             <Icon name="check" :size="14" class="reindex-progress__icon" />
-            <span>重建完成，共处理 {{ files.reindexProgress.total }} 个文件</span>
+            <span>整理完成，共处理 {{ files.reindexProgress.total }} 个文件</span>
           </template>
           <template v-else-if="files.reindexProgress.phase === 'reset'">
             <Icon name="refresh" :size="14" class="reindex-progress__icon spin" />
-            <span>正在重置索引状态…</span>
+            <span>正在准备…</span>
           </template>
           <template v-else>
             <Icon name="refresh" :size="14" class="reindex-progress__icon spin" />
-            <span class="reindex-progress__count">正在索引 {{ files.reindexProgress.done }}/{{ files.reindexProgress.total }}</span>
+            <span class="reindex-progress__count">正在整理 {{ files.reindexProgress.done }}/{{ files.reindexProgress.total }}</span>
             <span class="reindex-progress__file" :title="files.reindexProgress.current">{{ files.reindexProgress.current }}</span>
             <div class="reindex-progress__bar">
               <div
@@ -422,7 +444,10 @@ function statusClass(s: string) {
 
         <div v-if="files.loading" class="loading">加载中…</div>
         <div v-else-if="files.error" class="alert alert--error">{{ files.error }}</div>
-        <div v-else-if="files.items.length === 0" class="empty-state">暂无索引文件</div>
+        <div v-else-if="files.items.length === 0" class="empty-state">
+          <span class="empty-state__title">还没有需要整理的文件</span>
+          <span class="empty-state__desc">把文档放进工作文件夹后，点右上角「重新整理」就会出现在这里</span>
+        </div>
         <div v-else class="file-table">
           <div class="file-table-head">
             <span class="file-col-name sortable" @click="files.cycleSort('name')">
@@ -440,7 +465,7 @@ function statusClass(s: string) {
             <span class="file-col-tags">标签</span>
             <span>大小</span>
             <span class="sortable" @click="files.cycleSort('time')">
-              索引时间
+              整理时间
               <span class="sort-arrow" v-if="files.sortField === 'time'">{{ files.sortDir === 'asc' ? '▲' : '▼' }}</span>
             </span>
             <span>操作</span>
@@ -477,7 +502,7 @@ function statusClass(s: string) {
               <button
                 v-if="f.indexStatus === 'failed'"
                 class="btn btn-ghost btn-mini btn-mini--warn"
-                title="重置状态并重新入队索引"
+                title="重新整理这个文件"
                 @click="retryFileItem(f)"
               >
                 重试
@@ -501,7 +526,7 @@ function statusClass(s: string) {
       </div>
     </template>
 
-    <div v-else class="empty-state">请先初始化工作区以查看文档索引</div>
+    <div v-else class="empty-state">还没有选择要管理的文件夹，请到「设置」里开始使用</div>
 
     <!-- 标签编辑弹窗 -->
     <div v-if="tagEditor" class="modal-overlay" @click.self="closeTagEditor">
@@ -575,6 +600,22 @@ function statusClass(s: string) {
   font-size: 13px;
 }
 
+/* AI 未配置引导条 */
+.ai-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  font-size: 12.5px;
+  color: var(--c-text-secondary);
+  border-color: var(--c-warning);
+  background: var(--c-warning-soft);
+}
+.ai-hint span {
+  flex: 1;
+}
+
 .search-bar {
   display: flex;
   gap: 8px;
@@ -631,6 +672,13 @@ function statusClass(s: string) {
 .tag-wall__item.tag-wall__item--picked {
   background: var(--c-brand);
   color: var(--c-on-brand);
+}
+
+.tag-wall__clear {
+  color: var(--c-text-tertiary);
+}
+.tag-wall__clear:hover {
+  color: var(--c-danger);
 }
 
 /* 标签建议面板（修复 H-01：后端已实现，前端此前未接线） */

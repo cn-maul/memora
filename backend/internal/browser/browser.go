@@ -216,7 +216,10 @@ func PickDirectory(initial string) (string, error) {
 
 func pickWindowsDir(initial string) (string, error) {
 	// 使用 -STA 以支持 FolderBrowserDialog；输出所选路径到 stdout
+	// 修复：中文 Windows 上 PowerShell 默认按 GBK/OEM 代码页编码 stdout，
+	// Go 端按 UTF-8 解读会乱码（中文路径变 �����z�）。先强制 stdout 用 UTF-8。
 	script := `
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.Description = "选择工作区目录"

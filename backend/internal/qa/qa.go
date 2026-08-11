@@ -52,7 +52,13 @@ type Module struct {
 }
 
 // systemPrompt 问答系统提示词（Ask 与 AskStream 共用，精简以减少输入 token）
-const systemPrompt = "你是 Memora 文档问答助手。依据下方 [文件=路径, 段落=序号] 标注的文档片段回答，引用时注明文件路径。用 Markdown 简洁作答（# 标题、- 列表、**加粗**），不要开场白与结束语。若片段中没有答案，直接说明\"根据现有文档，未找到相关信息\"，不要猜测。"
+const systemPrompt = "你是 Memora 文档问答助手。依据下方 [文件=路径, 段落=序号] 标注的文档片段回答。引用文件时务必用 [文件=路径, 段落=序号] 标记原样标出（如 [文件=预算表.xlsx, 段落=3]），不要用反引号或只写文件名。用 Markdown 简洁作答（# 标题、- 列表、**加粗**），不要开场白与结束语。若片段中没有答案，直接说明\"根据现有文档，未找到相关信息\"，不要猜测。"
+
+// qaMaxTokens 问答最大输出 token。
+// 推理模型（SenseNova reasoning 等）会先消耗大量 token 输出思维链（delta.reasoning）
+// 再输出最终答案；上限过低会导致思维链还没结束就触发 finish_reason=length，
+// 最终 delta.content 为空、只能走非流式重试（慢且非流式）。给足余量避免该场景。
+const qaMaxTokens = 4096
 
 // quotedKeywordRe 提取引号/书名号内文件名关键词（包级复用，避免每次编译，review nit）
 var quotedKeywordRe = regexp.MustCompile(`[“"『「《]([^”"』」》]{1,30})[”"』」》]`)
@@ -113,7 +119,7 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 
 	userPrompt := fmt.Sprintf("%s\n\n问题：%s", contextStr, req.Question)
 
-	answer, err := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 2400})
+	answer, err := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
 	if err != nil {
 		// 失败回滚：若是本次新建的会话则整会话删除，避免留下孤立空会话（修复 M-03）
 		if newSession {
@@ -126,6 +132,9 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 	if strings.TrimSpace(answer) == "" {
 		answer = "（模型未返回内容。请确认模型服务正常、文件已成功索引，或换个问法重试。）"
 	}
+
+	// 把回答里的文件路径（含反引号/裸路径）规整为 [文件=path] 标记，保证前端可点击（修复：检索到文件却没超链接）
+	answer = linkifySourceRefs(answer, sources)
 
 	// 模型成功后，一次性写入用户与助手消息（避免孤立消息）
 	m.storage.QAMessagesAppend(sessionID, "user", req.Question, "", time.Now().UnixMilli())
@@ -207,7 +216,7 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 
 		userPrompt := fmt.Sprintf("%s\n\n问题：%s", contextStr, req.Question)
 
-		chunks, err := m.llm.ChatStream(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 2400}, cancel)
+		chunks, err := m.llm.ChatStream(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens}, cancel)
 		if err != nil {
 			if newSession {
 				_ = m.storage.QASessionsDelete(sessionID)
@@ -225,6 +234,20 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 				}
 				done <- &contract.QAResponse{Error: sb.String()}
 				return
+			}
+			if strings.HasPrefix(chunk, contract.ThinkChunkPrefix) {
+				// 思考过程块（推理模型思维链）：转发给前端实时渲染，但不计入最终回答
+				// （answer 仅含 delta.content，避免思维链被持久化进会话消息）。
+				select {
+				case ch <- chunk:
+				case <-cancel:
+					if newSession {
+						_ = m.storage.QASessionsDelete(sessionID)
+					}
+					done <- &contract.QAResponse{Error: "已取消"}
+					return
+				}
+				continue
 			}
 			sb.WriteString(chunk)
 			select {
@@ -259,7 +282,7 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 			}
 
 			logx.Warn("qa", "流式回答为空，改用非流式重试", "question", req.Question)
-			retried, rerr := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: 2400})
+			retried, rerr := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
 			// 重试完成后再次检查取消：用户中止时丢弃重试结果，不写入会话（review 发现）
 			select {
 			case <-cancel:
@@ -283,6 +306,9 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 				answer = "（模型未返回内容。请确认模型服务正常、文件已成功索引，或换个问法重试。）"
 			}
 		}
+
+		// 把回答里的文件路径（含反引号/裸路径）规整为 [文件=path] 标记，保证前端可点击（修复：检索到文件却没超链接）
+		answer = linkifySourceRefs(answer, sources)
 
 		// 保存消息（用户 + 助手）
 		m.storage.QAMessagesAppend(sessionID, "user", req.Question, "", time.Now().UnixMilli())
@@ -545,6 +571,57 @@ func marshalSources(sources []contract.QASource) string {
 		return "[]"
 	}
 	return string(data)
+}
+
+// linkifySourceRefs 把回答中的文件路径规整为 [文件=path] 引用标记。
+// 推理模型输出不稳定：有时用反引号包裹路径（`10分类汇总.xlsx`）、有时裸写路径，
+// 而不是提示词要求的 [文件=路径, 段落=N] 标记，导致前端无法转成可点击链接
+// （修复：检索到文件却没超链接）。对每个检索来源路径，把其在回答中的出现
+// （含反引号包裹形式）替换为 [文件=path]；已存在的 [文件=...] 标记原样保留。
+func linkifySourceRefs(answer string, sources []contract.QASource) string {
+	if len(sources) == 0 {
+		return answer
+	}
+
+	// 1. 保护已有 [文件=...] 标记，避免后续替换误伤
+	refRe := regexp.MustCompile(`\[文件=[^\]]+\]`)
+	var refs []string
+	marked := refRe.ReplaceAllStringFunc(answer, func(m string) string {
+		refs = append(refs, m)
+		return fmt.Sprintf("\x00REF%d\x00", len(refs)-1)
+	})
+
+	// 2. 收集来源路径，按长度降序处理（避免短路径覆盖长路径的子串）
+	paths := make([]string, 0, len(sources))
+	seen := map[string]bool{}
+	for _, s := range sources {
+		p := strings.TrimSpace(s.RelPath)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	sort.Slice(paths, func(i, j int) bool { return len(paths[i]) > len(paths[j]) })
+
+	// 3. 路径 → 临时占位符（含反引号包裹形式），再统一还原为标记，避免替换自嵌套
+	placeholders := make(map[string]string, len(paths))
+	for i, p := range paths {
+		ph := fmt.Sprintf("\x00SRC%d\x00", i)
+		placeholders[p] = ph
+		btRe := regexp.MustCompile("`" + regexp.QuoteMeta(p) + "`")
+		marked = btRe.ReplaceAllString(marked, ph)
+		marked = strings.ReplaceAll(marked, p, ph)
+	}
+	for p, ph := range placeholders {
+		marked = strings.ReplaceAll(marked, ph, "[文件="+p+"]")
+	}
+
+	// 4. 还原原有 [文件=...] 标记
+	for i, m := range refs {
+		marked = strings.ReplaceAll(marked, fmt.Sprintf("\x00REF%d\x00", i), m)
+	}
+	return marked
 }
 
 // extractFilenameKeyword 从问题中提取用于文件名模糊搜索的关键词。

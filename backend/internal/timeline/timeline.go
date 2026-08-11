@@ -20,7 +20,8 @@ type IGit interface {
 	ShowFileAt(relPath, hash string) (string, error)
 	RestoreFile(relPath, hash string) error
 	Status() (map[string]string, error)
-	DiffContents() (string, error) // 提交前把变动文本喂给 AI
+	DiffContents() (string, error)                   // 提交前把变动文本喂给 AI
+	CommitAuto(files []string) (string, bool, error) // 恢复前自动快照用
 }
 
 // IStorage timeline 所需的 storage 接口
@@ -376,27 +377,33 @@ func (m *Module) GenerateSummary(commitHash string) (string, error) {
 	return summary, nil
 }
 
-// Restore 恢复文件到指定版本
+// Restore 恢复文件到指定版本（小白视角：一键找回）。
+// 工作区有未保存改动时先自动提交当前状态（「恢复前自动备份」），再执行恢复——
+// 让恢复永远无痛，不再因 409 workspace_dirty 被拦下（修复：此前强制要求工作区干净）。
+// 目标文件已删除时 RestoreFile 写盘即重建，同样可恢复。
 func (m *Module) Restore(relPath, hash string) error {
 	if relPath == "" || hash == "" {
 		return fmt.Errorf("参数不完整")
 	}
 
-	// 校验整个工作区干净
 	status, err := m.git.Status()
 	if err != nil {
 		return fmt.Errorf("检查工作区状态失败: %w", err)
 	}
 	var dirtyFiles []string
 	for f, code := range status {
-		// git.Status 的 code 为单字符：M/A/D/R/C 表示已跟踪文件的改动（恢复前需确认）；
-		// '?' 为未跟踪新文件，不影响恢复目标文件，不算脏
+		// code 为单字符：M/A/D/R/C 表示已跟踪文件的改动；'?' 为未跟踪新文件，不影响恢复
 		if code != " " && code != "" && code != "?" {
 			dirtyFiles = append(dirtyFiles, f)
 		}
 	}
 	if len(dirtyFiles) > 0 {
-		return &WorkspaceDirtyError{Files: dirtyFiles}
+		// 先把当前状态存为「恢复前自动备份」版本，再恢复，避免覆盖掉未保存的工作
+		if _, skipped, cerr := m.git.CommitAuto(nil); cerr != nil {
+			return fmt.Errorf("恢复前自动保存失败: %w", cerr)
+		} else if !skipped {
+			m.events.Notify("commit_done", map[string]interface{}{"auto": true})
+		}
 	}
 
 	if err := m.git.RestoreFile(relPath, hash); err != nil {
@@ -404,13 +411,4 @@ func (m *Module) Restore(relPath, hash string) error {
 	}
 
 	return nil
-}
-
-// WorkspaceDirtyError 工作区脏错误，携带脏文件列表
-type WorkspaceDirtyError struct {
-	Files []string
-}
-
-func (e *WorkspaceDirtyError) Error() string {
-	return fmt.Sprintf("工作区有 %d 个未提交变更", len(e.Files))
 }

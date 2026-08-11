@@ -83,8 +83,8 @@ function statusSign(s: string) {
   <div class="commit-page">
     <div class="page-header">
       <div>
-        <h2>提交记录</h2>
-        <p class="page-sub">版本迭代与改动明细</p>
+        <h2>版本历史</h2>
+        <p class="page-sub">你保存的每一个版本，以及每次改动了什么</p>
       </div>
       <div class="header-actions">
         <button class="btn btn-ghost btn-sm" @click="loadData" :disabled="loading">
@@ -98,7 +98,7 @@ function statusSign(s: string) {
     <div v-if="commits.length" class="commit-summary">
       <div class="summary-item">
         <span class="summary-num">{{ totalCommits }}</span>
-        <span class="summary-label">提交</span>
+        <span class="summary-label">版本</span>
       </div>
       <div class="summary-item">
         <span class="summary-num">{{ totalFiles }}</span>
@@ -111,8 +111,8 @@ function statusSign(s: string) {
     <div v-if="loading" class="loading">加载中…</div>
     <div v-else-if="commits.length === 0" class="empty-state empty-state--icon">
       <span class="empty-state__icon"><Icon name="git-branch" :size="20" /></span>
-      <span class="empty-state__title">暂无提交记录</span>
-      <span class="empty-state__desc">文件变更经自动提交后，会在这里形成版本时间线</span>
+      <span class="empty-state__title">还没有版本</span>
+      <span class="empty-state__desc">修改任意文件后，系统会自动保存第一个版本；也可在左侧「版本历史」手动保存</span>
     </div>
 
     <div v-else class="timeline">

@@ -25,11 +25,35 @@ const http = axios.create({
   timeout: 30000,
 })
 
+// 后端错误 → 通俗提示（小白友好）。顺序敏感：先匹配"未配置"，再匹配鉴权/限流等。
+export function translateApiError(msg: string): string {
+  if (!msg) return '操作失败，请重试'
+  const s = String(msg)
+  const low = s.toLowerCase()
+
+  if (/network error|timeout|etimedout|econnreset|econnrefused|无法连接/.test(low)) {
+    return '无法连接服务，请检查网络或稍后重试'
+  }
+  if (s.includes('聊天端点未配置')) return 'AI 助手还未连接，请到「设置 → AI 助手」里连接'
+  if (s.includes('嵌入端点未配置')) return '「按内容搜索」还未连接，请到「设置 → 内容整理模型」里连接'
+  if (s.includes('工作区未初始化') || s.includes('仓库未初始化')) {
+    return '还没有选择要管理的文件夹，请到「设置」里选择'
+  }
+  if (/401|unauthorized|invalid api|api ?key/.test(low)) return 'API Key 不正确或已失效，请检查后重试'
+  if (/403|forbidden/.test(low)) return '没有权限访问该服务，请检查账号权限或 API Key'
+  if (/429|rate ?limit|too many requests/.test(low)) return '请求太频繁被限流了，稍等片刻再试'
+  if (/model.{0,20}not found|invalid model/.test(low)) return '模型名称不正确，请检查模型设置'
+  return s
+}
+
 http.interceptors.response.use(
   (res) => res,
   (err) => {
     const msg = err.response?.data?.message || err.message || '网络错误'
-    return Promise.reject(new Error(msg))
+    const e = new Error(translateApiError(msg))
+    // 保留原始错误供排查（界面只显示通俗文案）
+    ;(e as any).rawMsg = msg
+    return Promise.reject(e)
   },
 )
 
@@ -86,6 +110,20 @@ export async function downloadHistoryVersion(relPath: string, hash: string): Pro
 export async function resolveFileId(relPath: string): Promise<number> {
   const { data } = await http.get<ApiResponse<{ fileId: number }>>('/files/resolve', { params: { relPath } })
   return data.data!.fileId
+}
+
+// 恢复文件到指定历史版本（后端会先自动保存当前状态，小白可一键找回）
+export async function restoreFile(id: number, commitHash: string): Promise<void> {
+  await http.post(`/files/${id}/restore`, { commitHash })
+}
+
+// 查看某版本中文件的文本内容（版本预览）
+export async function getCommitFileContent(commitHash: string, path: string): Promise<string> {
+  const res = await http.get(`/commits/${commitHash}/content`, {
+    params: { path },
+    responseType: 'text',
+  })
+  return res.data as string
 }
 
 export async function updateFileTags(
@@ -374,6 +412,18 @@ export interface LLMTestParams {
 export async function testLLM(params: LLMTestParams): Promise<ProbeResult> {
   const { data } = await http.post<ApiResponse<ProbeResult>>('/test/llm', params)
   return data.data!
+}
+
+// 获取端点支持的模型列表（「获取模型」按钮）；kind 区分 chat/embed/rerank，后端回退对应已保存密钥
+export async function fetchModels(params: { kind: 'chat' | 'embed' | 'rerank'; baseUrl: string; apiKey?: string }): Promise<string[]> {
+  const { data } = await http.post<ApiResponse<{ ok: boolean; models?: string[]; message?: string }>>('/test/llm', {
+    type: 'models',
+    kind: params.kind,
+    baseUrl: params.baseUrl,
+    apiKey: params.apiKey,
+  })
+  if (!data.data?.ok) throw new Error(data.data?.message || '获取模型失败')
+  return data.data.models || []
 }
 
 export interface PythonDetectResult {

@@ -118,6 +118,8 @@ export interface QAMessage {
   sessionId: number
   role: string
   content: string
+  // 思考过程（推理模型思维链，仅流式期间存在，后端不落库、刷新后消失）
+  thinking?: string
   sources?: string
   createdAt: number
 }
