@@ -41,5 +41,5 @@ src/
 
 ## 与后端契约
 
-所有接口字段、错误码以 `backend/internal/contract` 与项目根 `design.md` §5 为准，
+所有接口字段、错误码以 `backend/internal/contract` 与项目 `docs/API_REFERENCE.md` 为准，
 修改后端接口时请同步更新 `src/types/index.ts`。

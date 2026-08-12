@@ -3,7 +3,7 @@
 > 审计基线：`main` / `c9fe01d`  
 > 审计日期：2026-08-12  
 > 审计范围：Go 后端、Vue 前端、REST/SSE 契约、SQLite/向量索引、Git、配置与密钥、任务与生命周期、构建测试、日志和发布工程  
-> 文档性质：当前源码整改主计划。`AUDIT_REPORT.md` 是历史快照，不再作为现状依据。
+> 文档性质：当前源码整改主计划。历史审计快照已随整改完成归档删除，不再作为现状依据。
 
 ## 实施进度（截至 2026-08-12）
 
@@ -165,7 +165,7 @@ infrastructure
 - 发布生成 SHA-256、SBOM 和变更日志；加入升级前备份和回滚演练。
 - 增加 `/health`、`/ready` 和诊断摘要：版本、DB、runtime generation、队列深度、活动任务、缓存体积、最近错误。
 - API Key 通过统一 `CredentialStore` 管理，Windows 实现使用 DPAPI；文本缓存增加配额、TTL、清理入口和隐私说明。
-- 修正文档：根 README、开发验证、备份恢复、发布回滚、错误码、日志字段、当前架构；把 `design.md` 明确标注为目标/ADR，不再混作源码事实。
+- 修正文档：根 README、开发验证、备份恢复、发布回滚、错误码、日志字段、当前架构；历史设计书已标注为 ADR 后随整改完成归档删除，架构以源码与 `docs/PROJECT_GUIDE.md` 为准。
 
 ## 5. 重复与删除清单
 
@@ -179,7 +179,7 @@ infrastructure
 | `NewSesion/ClearSesion` | 拼写错误、未使用接口 | 删除；不要再加兼容别名 |
 | `getCommitList(withFiles?)` 的未使用参数 | 无调用者传 `true` | 固化按需 diff 契约后删除参数 |
 | SSE “旧版明文”解析 | 仓库历史无法证明有旧客户端 | 用当前 JSON SSE 协议测试固定后删除 |
-| `autoCommit.enabled` | 配置存在、UI 已无入口、运行时忽略 | 按 `design.md` D5 保留并恢复完整能力：UI、入队、执行和测试闭环 |
+| `autoCommit.enabled` | 配置存在、UI 已无入口、运行时忽略 | 按设计决策 D5 保留并恢复完整能力：UI、入队、执行和测试闭环 |
 | 侧栏 QA | 与独立页双轨且渲染策略不同 | 默认收敛到独立页；若保留必须复用共享实现 |
 | 每 5 秒 queue 轮询 | 结果未渲染且与 SSE 重复 | 删除或仅作为 SSE 断线 fallback |
 

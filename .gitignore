@@ -15,7 +15,9 @@ backend/coverage.out
 backend/out/
 
 # Backend embed output (copied from frontend/dist by build.bat)
-backend/internal/web/dist/
+# 保留 .gitkeep 占位（go:embed all:dist 要求目录存在），忽略实际构建产物
+backend/internal/web/dist/*
+!backend/internal/web/dist/.gitkeep
 
 # App runtime data (.memora/config.json holds API keys / meta.db)
 **/.memora/

@@ -213,12 +213,7 @@ release.bat vX.Y.Z
 | 文档 | 角色 |
 |---|---|
 | [`API_REFERENCE.md`](API_REFERENCE.md) | **第三方开发接口参考**：全部 REST/SSE 端点、参数、响应 DTO、错误码 |
-| [`design.md`](../design.md) | 目标设计与决策记录（ADR，D1-D40）——设计意图参考，**不是源码事实** |
 | [`SYSTEM_REMEDIATION_PLAN.md`](SYSTEM_REMEDIATION_PLAN.md) | 整改主计划（当前总纲，含问题台账 P0-P3 与 Phase 0-6 状态） |
-| [`MEMORA_FUNCTION_SPEC.md`](MEMORA_FUNCTION_SPEC.md) | 基于源码的功能说明（数据模型、路由、模块职责） |
-| [`FRONTEND_SIMPLIFY_PLAN.md`](FRONTEND_SIMPLIFY_PLAN.md) | 前端「小白化」简化改版计划 |
-| [`SECRET_SCAN_REPORT.md`](SECRET_SCAN_REPORT.md) | 密钥与敏感文件泄露扫描记录 |
 | [`RELEASE_RUNBOOK.md`](RELEASE_RUNBOOK.md) | 发布手册（tag 驱动发布、升级、回滚、冒烟清单） |
 | [`ERROR_CODES.md`](ERROR_CODES.md) | 错误码表（code / HTTP 状态 / 含义 / 用户建议） |
-| [`AUDIT_REPORT.md`](../AUDIT_REPORT.md) | 历史审计快照（已失效，仅留档） |
 | [`benchmarks/README.md`](../benchmarks/README.md) | 性能基准说明与阈值记录 |
