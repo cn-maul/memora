@@ -261,6 +261,7 @@ function newSession() {
         :sending="qa.sending"
         placeholder="输入问题，Enter 发送，Shift+Enter 换行"
         @send="handleSendMessage"
+        @cancel="qa.cancel"
       />
     </section>
   </div>

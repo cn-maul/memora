@@ -23,6 +23,7 @@ const props = withDefaults(
 // ────────────────────────────────────────────────────────────────
 const emit = defineEmits<{
   (e: 'send', text: string): void
+  (e: 'cancel'): void
 }>()
 
 const router = useRouter()
@@ -166,11 +167,20 @@ onUnmounted(() => {
 // 输入区
 // ────────────────────────────────────────────────────────────────
 const inputText = ref('')
+const inputRef = ref<HTMLTextAreaElement | null>(null)
+// 输入框随内容自适应高度（最多 180px），发送后重置为初始高度
+function autosize() {
+  const ta = inputRef.value
+  if (!ta) return
+  ta.style.height = 'auto'
+  ta.style.height = Math.min(ta.scrollHeight, 180) + 'px'
+}
 function handleSend() {
   const text = inputText.value.trim()
   if (!text || props.sending) return
   emit('send', text)
   inputText.value = ''
+  nextTick(autosize)
 }
 </script>
 
@@ -211,19 +221,42 @@ function handleSend() {
       </div>
     </div>
 
-    <!-- 输入区 -->
-    <div class="qa-input-bar">
-      <textarea
-        v-model="inputText"
-        class="input qa-input"
-        :placeholder="sending ? '思考中…' : placeholder"
-        :disabled="sending"
-        rows="1"
-        @keydown.enter.exact.prevent="handleSend"
-      />
-      <button class="btn btn-primary" :disabled="sending || !inputText.trim()" @click="handleSend">
-        {{ sending ? '思考中…' : '发送' }}
-      </button>
+    <!-- 输入区（旧样式：圆角输入框 + 工具栏发送/取消按钮） -->
+    <div class="input-area">
+      <div class="input-box">
+        <textarea
+          ref="inputRef"
+          v-model="inputText"
+          class="input-textarea"
+          :placeholder="sending ? '等待回答…' : placeholder"
+          :disabled="sending"
+          rows="1"
+          @input="autosize"
+          @keydown.enter.exact.prevent="handleSend"
+        ></textarea>
+        <div class="input-toolbar">
+          <div class="input-toolbar-right">
+            <button
+              v-if="sending"
+              class="send-btn send-btn--cancel"
+              title="中止"
+              @click="emit('cancel')"
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            </button>
+            <button
+              v-else
+              class="send-btn"
+              :class="{ 'has-content': inputText.trim().length > 0 }"
+              title="发送"
+              :disabled="!inputText.trim()"
+              @click="handleSend"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -526,20 +559,90 @@ function handleSend() {
   }
 }
 
-/* ─────── 输入区 ─────── */
-.qa-input-bar {
-  display: flex;
-  gap: 8px;
-  align-items: flex-end;
+/* ─────── 输入区（旧样式：圆角输入框 + 工具栏） ─────── */
+.input-area {
+  width: 100%;
+  max-width: 100%;
+  padding: 0 12px 12px;
   flex-shrink: 0;
-  padding-top: 4px;
 }
-
-.qa-input {
-  flex: 1;
-  min-height: 42px;
-  max-height: 160px;
+.input-box {
+  background: var(--c-bg-panel);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.input-box:focus-within {
+  border-color: var(--c-brand-border);
+  box-shadow: 0 0 0 2px var(--c-brand-soft);
+}
+.input-textarea {
+  width: 100%;
+  min-height: 52px;
+  max-height: 180px;
   resize: none;
-  line-height: 1.5;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--c-text-primary);
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 14px 16px 4px;
+  font-family: inherit;
+}
+.input-textarea::placeholder {
+  color: var(--c-text-tertiary);
+}
+.input-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 10px;
+}
+.input-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.send-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: none;
+  background: var(--c-brand);
+  color: var(--c-on-brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.1s, transform 0.08s;
+  opacity: 0.55;
+}
+.send-btn:hover {
+  background: var(--c-brand-hover);
+}
+.send-btn:active {
+  transform: scale(0.92);
+}
+.send-btn.has-content {
+  opacity: 1;
+}
+.send-btn:disabled {
+  cursor: not-allowed;
+}
+.send-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.send-btn--cancel {
+  background: var(--c-danger);
+  opacity: 1;
+}
+.send-btn--cancel:hover {
+  background: var(--c-danger);
 }
 </style>

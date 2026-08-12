@@ -263,8 +263,6 @@ function next() {
             </select>
             <span v-if="rerank.state.modelsError" class="obw-err">{{ rerank.state.modelsError }}</span>
           </details>
-
-          <p v-if="hasAnyAI" class="obw-ok">✓ 已填写 AI 信息，可直接下一步</p>
         </div>
 
         <!-- 步骤 3：开始使用 -->
@@ -450,11 +448,6 @@ function next() {
   margin-top: 8px;
   font-size: 12.5px;
   color: var(--c-danger);
-}
-.obw-ok {
-  margin-top: 10px;
-  font-size: 12.5px;
-  color: var(--c-success);
 }
 .obw-ai-block {
   border: 1px solid var(--c-border);

@@ -144,25 +144,32 @@ function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
 }
 const sidebarRef = ref<HTMLElement | null>(null)
+const chatRef = ref<HTMLElement | null>(null)
 const sidebarWidth = ref(260)
-const dragging = ref(false)
+const chatWidth = ref(320)
+const dragging = ref<'sidebar' | 'chat' | null>(null)
 
-function startDrag(e: MouseEvent) {
-  const el = sidebarRef.value as HTMLElement | null
+function startDrag(target: 'sidebar' | 'chat', e: MouseEvent) {
+  const el = (target === 'sidebar' ? sidebarRef.value : chatRef.value) as HTMLElement | null
   if (!el) return
   const sideEl = el
-  dragging.value = true
+  dragging.value = target
   document.body.style.cursor = 'col-resize'
   e.preventDefault()
 
   function onMove(ev: MouseEvent) {
-    const w =
-      ev.clientX - sideEl.getBoundingClientRect().left + sidebarWidth.value - sideEl.offsetWidth
-    if (w >= 180 && w <= 420) sidebarWidth.value = w
+    if (target === 'sidebar') {
+      const w =
+        ev.clientX - sideEl.getBoundingClientRect().left + sidebarWidth.value - sideEl.offsetWidth
+      if (w >= 180 && w <= 420) sidebarWidth.value = w
+    } else {
+      const w = window.innerWidth - ev.clientX
+      if (w >= 280 && w <= 560) chatWidth.value = w
+    }
   }
 
   function onUp() {
-    dragging.value = false
+    dragging.value = null
     document.body.style.cursor = ''
     document.removeEventListener('mousemove', onMove)
     document.removeEventListener('mouseup', onUp)
@@ -331,8 +338,8 @@ onUnmounted(() => {
     <div
       v-show="!hideSidePanels"
       class="drag-handle"
-      :class="{ dragging }"
-      @mousedown="startDrag"
+      :class="{ dragging: dragging === 'sidebar' }"
+      @mousedown="startDrag('sidebar', $event)"
     ></div>
 
     <!-- 路由出口 -->
@@ -340,16 +347,27 @@ onUnmounted(() => {
       <router-view />
     </main>
 
+    <!-- 主区与右侧对话之间的拖拽分割条 -->
+    <div
+      v-show="!hideSidePanels && !hideChatPanel"
+      class="drag-handle chat-handle"
+      :class="{ dragging: dragging === 'chat' }"
+      @mousedown="startDrag('chat', $event)"
+    ></div>
+
     <!-- 右侧：对话区（仅主页 /files 显示） -->
     <aside
       v-show="!hideSidePanels && !hideChatPanel"
+      ref="chatRef"
       class="chat-panel"
+      :style="{ width: chatWidth + 'px' }"
     >
       <template v-if="!hideChatPanel">
         <ChatSurface
           :messages="qa.messages as any[]"
           :sending="qa.sending"
           @send="handleChatSend"
+          @cancel="qa.cancel"
         />
       </template>
     </aside>
@@ -1006,7 +1024,6 @@ onUnmounted(() => {
   background: var(--c-bg-page);
   position: relative;
   overflow: hidden;
-  width: 320px;
 }
 
 /* ── 首次使用引导 toast ── */
