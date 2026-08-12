@@ -212,6 +212,7 @@ release.bat vX.Y.Z
 
 | 文档 | 角色 |
 |---|---|
+| [`API_REFERENCE.md`](API_REFERENCE.md) | **第三方开发接口参考**：全部 REST/SSE 端点、参数、响应 DTO、错误码 |
 | [`design.md`](../design.md) | 目标设计与决策记录（ADR，D1-D40）——设计意图参考，**不是源码事实** |
 | [`SYSTEM_REMEDIATION_PLAN.md`](SYSTEM_REMEDIATION_PLAN.md) | 整改主计划（当前总纲，含问题台账 P0-P3 与 Phase 0-6 状态） |
 | [`MEMORA_FUNCTION_SPEC.md`](MEMORA_FUNCTION_SPEC.md) | 基于源码的功能说明（数据模型、路由、模块职责） |

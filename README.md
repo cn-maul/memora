@@ -9,6 +9,7 @@ Memora 是一个面向 Windows 的本地单进程文档知识库：在用户选�
 **📖 项目详情请见 [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md)**，包含：
 
 - [功能清单](docs/PROJECT_GUIDE.md#21-功能清单) —— 索引 / 搜索 / 问答 / 版本控制 / 统计 / 设置
+- [第三方开发接口](docs/API_REFERENCE.md) —— 全部 REST / SSE 端点、参数、响应 DTO、错误码
 - [快速开始](docs/PROJECT_GUIDE.md#2-快速开始) —— 构建、运行、开发模式
 - [架构概览](docs/PROJECT_GUIDE.md#3-架构概览) 与 [目录结构](docs/PROJECT_GUIDE.md#4-目录结构)
 - [开发与验证](docs/PROJECT_GUIDE.md#5-开发与验证) —— verify.bat 门禁、前端/后端检查命令
