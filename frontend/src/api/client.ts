@@ -1,308 +1,160 @@
-import axios from 'axios'
-import {
-  AppError,
-  ERROR_CODES,
-  isAppError,
-  unwrapData,
-  type ErrorCode,
-} from '@/utils/errors'
-import type {
-  ApiResponse,
-  WorkspaceInfo,
-  InitRequest,
-  PaginatedData,
-  FileItem,
-  TagInfo,
-  TagSuggestion,
-  SearchResult,
-  QASession,
-  QAMessage,
-  StatsMetrics,
-  ProbeResult,
-  BrowseDirResponse,
-  BrowseSearchResponse,
-  BrowsePickDirResponse,
-  CommitItem,
-  VersionFile,
-  CommitFile,
-} from '@/types'
+// client.ts — Wails v3 模式 API 客户端
+// 所有后端通信通过 Wails 绑定完成，无 HTTP 服务器。
 
-const http = axios.create({
-  baseURL: '/api',
-  timeout: 30000,
-})
+import { Events } from '@wailsio/runtime'
 
-// 后端错误 → 通俗提示（小白友好）。顺序敏感：先匹配"未配置"，再匹配鉴权/限流等。
+import * as WorkspaceService from '../../bindings/memora/internal/assembler/workspaceservice.js'
+import * as FilesService from '../../bindings/memora/internal/assembler/filesservice.js'
+import * as SearchService from '../../bindings/memora/internal/assembler/searchservice.js'
+import * as IndexService from '../../bindings/memora/internal/assembler/indexservice.js'
+import * as BrowseService from '../../bindings/memora/internal/assembler/browseservice.js'
+import * as TagsService from '../../bindings/memora/internal/assembler/tagsservice.js'
+import * as QAService from '../../bindings/memora/internal/assembler/qaservice.js'
+import * as StatsService from '../../bindings/memora/internal/assembler/statsservice.js'
+import * as CommitsService from '../../bindings/memora/internal/assembler/commitsservice.js'
+import * as SettingsService from '../../bindings/memora/internal/assembler/settingsservice.js'
+import * as TestService from '../../bindings/memora/internal/assembler/testservice.js'
+import * as QueueService from '../../bindings/memora/internal/assembler/queueservice.js'
+
+import { AppError, ERROR_CODES } from '@/utils/errors'
+
 export function translateApiError(msg: string): string {
-  if (!msg) return '操作失败，请重试'
-  const s = String(msg)
-  const low = s.toLowerCase()
-
-  if (/network error|timeout|etimedout|econnreset|econnrefused|failed to fetch|无法连接/.test(low)) {
-    return '无法连接服务，请检查网络或稍后重试'
-  }
-  if (s.includes('聊天端点未配置')) return 'AI 助手还未连接，请到「设置 → AI 助手」里连接'
-  if (s.includes('嵌入端点未配置')) return '「按内容搜索」还未连接，请到「设置 → 内容整理模型」里连接'
-  if (s.includes('工作区未初始化') || s.includes('仓库未初始化')) {
-    return '还没有选择要管理的文件夹，请到「设置」里选择'
-  }
-  if (/401|unauthorized|invalid api|api ?key/.test(low)) return 'API Key 不正确或已失效，请检查后重试'
-  if (/403|forbidden/.test(low)) return '没有权限访问该服务，请检查账号权限或 API Key'
-  if (/429|rate ?limit|too many requests/.test(low)) return '请求太频繁被限流了，稍等片刻再试'
-  if (/model.{0,20}not found|invalid model/.test(low)) return '模型名称不正确，请检查模型设置'
-  return s
+  if (msg.includes('canceled') || msg.includes('cancel')) return '操作已取消'
+  if (msg.includes('timeout')) return '请求超时'
+  return msg || '未知错误'
 }
 
-// ──────────────────────── 统一错误（P1-13） ────────────────────────
-// 所有失败都以 AppError 形式抛出（带稳定 code + 用户可读 message + requestId）。
-// 原始 body/Blob 内容绝不作为 message 直接回吐（避免 SQL/Go 文本泄漏）。
-
-// 把未知响应体规整为 record（兼容 responseType:'text' 时 axios 返回的 JSON 字符串）。
-function toRecord(raw: unknown): Record<string, unknown> | null {
-  if (typeof raw === 'string') {
-    const t = raw.trim()
-    if (t.startsWith('{') || t.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(t)
-        return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-          ? (parsed as Record<string, unknown>)
-          : null
-      } catch {
-        return null
-      }
-    }
-    return null
-  }
-  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
-    return raw as Record<string, unknown>
-  }
-  return null
+function fromBindingError(err: unknown, fallback: string = '请求失败'): AppError {
+  if (err instanceof AppError) return err
+  const msg = typeof err === 'string' ? err : err instanceof Error ? err.message : fallback
+  return new AppError(msg, ERROR_CODES.internal)
 }
-
-// 后端原始 code → 前端稳定 ErrorCode；未知 code 一律 internal（不向用户暴露）。
-function normalizeCode(code: string): ErrorCode {
-  const values = Object.values(ERROR_CODES) as string[]
-  return values.includes(code) ? (code as ErrorCode) : ERROR_CODES.internal
-}
-
-// 从响应头 + 响应体两处读取 requestId（体优先，头兜底）。
-function readRequestId(res?: { headers?: unknown; data?: unknown }): string | undefined {
-  const headers = res?.headers as Record<string, unknown> | undefined
-  if (headers) {
-    const v = headers['x-request-id'] ?? headers['X-Request-ID']
-    if (typeof v === 'string' && v) return v
-  }
-  const body = toRecord(res?.data)
-  if (body && typeof body.requestId === 'string' && body.requestId) return body.requestId
-  return undefined
-}
-
-// 信封形错误体（HTTP 非 2xx）→ AppError。非信封（网络/超时）走 fallbackMsg。
-function appErrorFromBody(raw: unknown, opts: { status?: number; headerReqId?: string; fallbackMsg: string }): AppError {
-  const body = toRecord(raw)
-  let requestId = opts.headerReqId
-  if (body && typeof body.requestId === 'string' && body.requestId) requestId = body.requestId
-  if (body && typeof body.code === 'string') {
-    const msg = typeof body.message === 'string' && body.message ? body.message : opts.fallbackMsg
-    return new AppError(msg, normalizeCode(body.code), {
-      status: opts.status,
-      requestId,
-      detail: body.data,
-    })
-  }
-  return new AppError(opts.fallbackMsg, ERROR_CODES.internal, { status: opts.status, requestId })
-}
-
-function toAppError(err: unknown): AppError {
-  const ae = err as { response?: { status?: number; headers?: unknown; data?: unknown }; message?: string; code?: string }
-  const status = ae.response?.status
-  const requestId = readRequestId(ae.response)
-
-  // 客户端主动取消（AbortController）
-  if (ae?.code === 'ERR_CANCELED') {
-    return new AppError('请求已取消', ERROR_CODES.canceled, { status, requestId })
-  }
-
-  // Blob 响应（下载端点）：不读取 blob 文本，抛出通用文案
-  if (ae.response?.data instanceof Blob) {
-    return new AppError('下载失败', ERROR_CODES.internal, { status, requestId })
-  }
-
-  // 有响应体：走信封解析（含 responseType:'text' 时的 JSON 字符串）
-  if (ae.response) {
-    return appErrorFromBody(ae.response.data, { status, headerReqId: requestId, fallbackMsg: translateApiError(ae?.message || '网络错误') })
-  }
-
-  // 无响应体（网络/超时）：保留小白友好翻译
-  return new AppError(translateApiError(ae?.message || '网络错误'), ERROR_CODES.internal, { requestId })
-}
-
-http.interceptors.response.use(
-  (res) => res,
-  (err) => {
-    if (isAppError(err)) return Promise.reject(err)
-    return Promise.reject(toAppError(err))
-  },
-)
 
 // ──────── 工作区 ────────
 
-export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
-  const { data } = await http.get<ApiResponse<WorkspaceInfo>>('/workspace/info')
-  return unwrapData<WorkspaceInfo>(data)
+export async function getWorkspaceInfo(): Promise<any> {
+  try { return await WorkspaceService.Info() } catch (e) { throw fromBindingError(e) }
 }
-
-export async function initWorkspace(req: InitRequest): Promise<void> {
-  await http.post('/workspace/init', req)
+export async function initWorkspace(req: { workspacePath: string }): Promise<void> {
+  try { await WorkspaceService.Init({ workspace: req.workspacePath }) } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 文件 ────────
 
 export async function listFiles(
-  params: {
-    status?: string
-    tag?: string
-    page?: number
-    pageSize?: number
-    sort?: string
-  },
-  opts?: { signal?: AbortSignal },
-): Promise<PaginatedData<FileItem>> {
-  const { data } = await http.get<ApiResponse<PaginatedData<FileItem>>>('/files', { params, signal: opts?.signal })
-  return unwrapData<PaginatedData<FileItem>>(data)
+  params: { status?: string; tag?: string; page?: number; pageSize?: number; sort?: string },
+  _opts?: { signal?: AbortSignal },
+): Promise<any> {
+  try {
+    const res = await FilesService.List({ status: params.status || '', tag: params.tag || '', page: params.page || 0, pageSize: params.pageSize || 50, sort: params.sort || '' })
+    return { data: { code: 'ok', data: res } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function getRecentFiles(params?: {
-  window?: number
-  limit?: number
-}): Promise<{ items: FileItem[]; window: number }> {
-  const { data } = await http.get<ApiResponse<{ items: FileItem[]; window: number }>>('/files/recent', { params })
-  return unwrapData<{ items: FileItem[]; window: number }>(data)
+export async function getRecentFiles(params?: { window?: number; limit?: number }): Promise<any> {
+  try {
+    const res = await FilesService.Recent({ status: '', tag: '', page: 0, pageSize: params?.limit || 20, sort: '' })
+    return { data: { code: 'ok', data: res } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function getFile(id: number): Promise<FileItem> {
-  const { data } = await http.get<ApiResponse<FileItem>>(`/files/${id}`)
-  return unwrapData<FileItem>(data)
+export async function getFile(id: number): Promise<any> {
+  try { return await FilesService.Get(id) } catch (e) { throw fromBindingError(e) }
 }
-
-export async function getFileHistory(id: number): Promise<{ commits: any[] }> {
-  const { data } = await http.get<ApiResponse<{ commits: any[] }>>(`/files/${id}/history`)
-  return unwrapData<{ commits: any[] }>(data)
+export async function getFileHistory(id: number): Promise<any> {
+  try {
+    const res = await FilesService.History(id)
+    return { data: { code: 'ok', data: { commits: res?.commits || [] } } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
 export async function downloadHistoryVersion(relPath: string, hash: string): Promise<Blob> {
-  const res = await http.get('/files/download-history', {
-    params: { relPath, hash },
-    responseType: 'blob',
-  })
-  return res.data as Blob
+  try {
+    const content = await FilesService.DownloadHistory(relPath, hash)
+    return new Blob([content as string], { type: 'text/plain' })
+  } catch (e) { throw fromBindingError(e) }
 }
-
 export async function resolveFileId(relPath: string): Promise<number> {
-  const { data } = await http.get<ApiResponse<{ fileId: number }>>('/files/resolve', { params: { relPath } })
-  return unwrapData<{ fileId: number }>(data).fileId
+  try { return await FilesService.Resolve(relPath) } catch (e) { throw fromBindingError(e) }
 }
-
-// 恢复文件到指定历史版本（后端会先自动保存当前状态，小白可一键找回）
 export async function restoreFile(id: number, commitHash: string): Promise<void> {
-  await http.post(`/files/${id}/restore`, { commitHash })
+  try { await FilesService.Restore({ id, commitHash }) } catch (e) { throw fromBindingError(e) }
 }
-
-// 查看某版本中文件的文本内容（版本预览）
 export async function getCommitFileContent(commitHash: string, path: string): Promise<string> {
-  const res = await http.get(`/commits/${commitHash}/content`, {
-    params: { path },
-    responseType: 'text',
-  })
-  return res.data as string
+  try { return await FilesService.CommitFileContent(commitHash, path) } catch (e) { throw fromBindingError(e) }
 }
-
-export async function updateFileTags(
-  id: number,
-  add: string[],
-  remove: string[],
-): Promise<void> {
-  await http.post(`/files/${id}/tags`, { add, remove })
+export async function updateFileTags(id: number, add: string[], remove: string[]): Promise<void> {
+  try { await FilesService.UpdateTags({ id, add, remove }) } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 搜索 ────────
 
-export async function searchFiles(params: {
-  q: string
-  tag?: string
-  page?: number
-}): Promise<{ items: SearchResult[]; total: number; page: number }> {
-  const { data } = await http.get<ApiResponse<{ items: SearchResult[]; total: number; page: number }>>('/search', { params })
-  return unwrapData<{ items: SearchResult[]; total: number; page: number }>(data)
+export async function searchFiles(params: { q: string; tag?: string; page?: number }): Promise<any> {
+  try {
+    const res = await SearchService.Search({ q: params.q, tag: params.tag || '', page: params.page || 0, tagFilter: [] })
+    return { data: { code: 'ok', data: res } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
 export async function reindexAll(): Promise<void> {
-  await http.post('/index/reindex')
+  try { await IndexService.Reindex() } catch (e) { throw fromBindingError(e) }
 }
-
 export async function retryFile(id: number): Promise<void> {
-  await http.post(`/files/${id}/retry`)
+  try { await FilesService.Retry(id) } catch (e) { throw fromBindingError(e) }
 }
 
-// ──────── 文件浏览（资源管理器） ────────
+// ──────── 文件浏览 ────────
 
-export async function browseDir(path?: string): Promise<BrowseDirResponse> {
-  const { data } = await http.get<ApiResponse<BrowseDirResponse>>('/browse', { params: path ? { path } : {} })
-  return unwrapData<BrowseDirResponse>(data)
+export async function browseDir(path?: string): Promise<any> {
+  try {
+    const res = await BrowseService.Dir({ path: path || '' })
+    return { data: { code: 'ok', data: res } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function browseSearch(q: string, limit?: number): Promise<BrowseSearchResponse> {
-  const { data } = await http.get<ApiResponse<BrowseSearchResponse>>('/browse/search', { params: { q, limit } })
-  return unwrapData<BrowseSearchResponse>(data)
+export async function browseSearch(q: string, limit?: number): Promise<any> {
+  try {
+    const res = await BrowseService.SearchByName({ q, limit: limit || 100 })
+    return { data: { code: 'ok', data: res } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
 export async function browseOpen(relPath: string): Promise<void> {
-  await http.post('/browse/open', { relPath })
+  try { await BrowseService.OpenFile(relPath) } catch (e) { throw fromBindingError(e) }
 }
-
-export async function browsePickDir(initial?: string): Promise<BrowsePickDirResponse> {
-  // 原生目录选择对话框：请求会一直挂到用户在对话框里选完/取消才返回（含用户思考时间）。
-  // 后端已常驻 PowerShell 预加载，首次点击也秒开；此处只需给足用户选择时间即可。
-  const { data } = await http.post<ApiResponse<BrowsePickDirResponse>>('/browse/pickdir', { initial }, { timeout: 180000 })
-  return unwrapData<BrowsePickDirResponse>(data)
+export async function browsePickDir(initial?: string): Promise<any> {
+  try { return await BrowseService.PickDir(initial || '') } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 标签 ────────
 
-export async function listTags(): Promise<TagInfo[]> {
-  const { data } = await http.get<ApiResponse<{ tags: TagInfo[] }>>('/tags')
-  return unwrapData<{ tags: TagInfo[] }>(data).tags
+export async function listTags(): Promise<any> {
+  try {
+    const res = await TagsService.List()
+    return { data: { code: 'ok', data: { tags: res?.tags || [] } } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function listTagSuggestions(): Promise<TagSuggestion[]> {
-  const { data } = await http.get<ApiResponse<{ suggestions: TagSuggestion[] }>>('/tag-suggestions')
-  return unwrapData<{ suggestions: TagSuggestion[] }>(data).suggestions
+export async function listTagSuggestions(): Promise<any> {
+  try {
+    const res = await TagsService.Suggestions()
+    return { data: { code: 'ok', data: { suggestions: res?.suggestions || [] } } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
 export async function acceptSuggestion(id: number): Promise<void> {
-  await http.post(`/tag-suggestions/${id}/accept`)
+  try { await TagsService.AcceptSuggestion(id) } catch (e) { throw fromBindingError(e) }
 }
-
 export async function rejectSuggestion(id: number): Promise<void> {
-  await http.post(`/tag-suggestions/${id}/reject`)
+  try { await TagsService.RejectSuggestion(id) } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 问答 ────────
 
-export async function listQASessions(): Promise<QASession[]> {
-  const { data } = await http.get<ApiResponse<{ sessions: QASession[] }>>('/qa/sessions')
-  return unwrapData<{ sessions: QASession[] }>(data).sessions
+export async function listQASessions(): Promise<any> {
+  try {
+    const res = await QAService.Sessions()
+    return { data: { code: 'ok', data: { sessions: res?.sessions || [] } } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function getQAMessages(sessionId: number): Promise<QAMessage[]> {
-  const { data } = await http.get<ApiResponse<{ messages: QAMessage[] }>>(`/qa/sessions/${sessionId}/messages`)
-  return unwrapData<{ messages: QAMessage[] }>(data).messages
+export async function getQAMessages(sessionId: number): Promise<any> {
+  try {
+    const res = await QAService.Messages(sessionId)
+    return { data: { code: 'ok', data: { messages: res?.messages || [] } } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-// SSE 协议错误提示：后端（2025 版起）统一以 JSON 编码发送流式 data 载荷，
-// 解析失败即协议异常（连接中断/流格式错乱），不再按"旧版明文"静默使用。
-const SSE_PROTOCOL_ERROR = '连接中断，请重试'
-
 export async function askQuestionStream(
   params: { question: string; mode: string; fileId?: number; sessionId?: number },
   onChunk: (chunk: string) => void,
@@ -310,328 +162,173 @@ export async function askQuestionStream(
   onError: (err: string) => void,
   signal: AbortSignal,
 ): Promise<void> {
+  const id = Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+  const evChunk = 'qa:chunk:' + id, evDone = 'qa:done:' + id, evError = 'qa:error:' + id
+  let cancelled = false
+  const cleanup = () => { cancelled = true; Events.Off(evChunk); Events.Off(evDone); Events.Off(evError) }
+  signal.addEventListener('abort', () => { if (!cancelled) { cleanup(); onError('已取消') } })
   try {
-    const res = await fetch('/api/qa/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-      signal,
+    Events.On(evChunk, (payload: any) => {
+      if (cancelled) return
+      const chunk = typeof payload === 'string' ? payload : payload?.data || payload
+      onChunk(chunk as string)
     })
-    if (!res.ok) {
-      // 非 2xx：正文为统一信封（含稳定 code / message / requestId），解析为 AppError 再取值
-      let raw: unknown = null
-      try {
-        raw = await res.json()
-      } catch {
-        // 非 JSON 正文（旧后端/网关），忽略，走通用文案
-      }
-      const appErr = appErrorFromBody(raw, {
-        status: res.status,
-        headerReqId: res.headers.get('x-request-id') || undefined,
-        fallbackMsg: translateApiError(`请求失败（${res.status}）`),
-      })
-      onError(appErr.requestId ? `${appErr.message}（错误编号 ${appErr.requestId}）` : appErr.message)
-      return
-    }
-    const reader = res.body?.getReader()
-    if (!reader) {
-      onError('响应体不可读')
-      return
-    }
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let eventType = '' // 当前事件类型
-    let settled = false // 是否已收到 done/error 终态（P1-06：防止异常 EOF 时 Promise 永久悬挂）
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-
-      // 按双换行分割事件
-      const parts = buffer.split('\n\n')
-      buffer = parts.pop() || ''
-
-      for (const part of parts) {
-        const lines = part.split('\n')
-        let dataLines: string[] = []
-
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (trimmed.startsWith('event: ')) {
-            eventType = trimmed.slice(7).trim()
-          } else if (trimmed.startsWith('data: ')) {
-            dataLines.push(trimmed.slice(6))
-          }
-        }
-
-        const payload = dataLines.join('\n')
-
-        if (eventType === 'done') {
-          settled = true
-          try {
-            const parsed = JSON.parse(payload)
-            onDone({ sessionId: parsed.sessionId || 0, sources: parsed.sources || [] })
-          } catch {
-            // 后端统一 JSON 编码；解析失败视为协议错误，中断流，避免静默当作空结果
-            onError(SSE_PROTOCOL_ERROR)
-            return
-          }
-          eventType = ''
-        } else if (eventType === 'error') {
-          settled = true
-          // error 数据为 JSON 字符串编码（后端 2025 版起统一）；解析失败视为协议错误
-          let errMsg = payload
-          try {
-            const parsed = JSON.parse(payload)
-            if (typeof parsed === 'string') errMsg = parsed
-          } catch {
-            errMsg = SSE_PROTOCOL_ERROR
-          }
-          onError(errMsg)
-          eventType = ''
-        } else if (payload) {
-          // 流式增量：后端以 JSON 字符串编码（含换行的 chunk 安全传输），解码还原
-          let text = payload
-          try {
-            const parsed = JSON.parse(payload)
-            if (typeof parsed === 'string') text = parsed
-          } catch {
-            // 后端统一 JSON 编码；解析失败说明协议错乱，中断流，避免明文误当正文
-            onError(SSE_PROTOCOL_ERROR)
-            return
-          }
-          onChunk(text)
-        }
-      }
-    }
-
-    // 流正常结束（EOF）但未收到 done/error 终态：视为连接中断而非静默成功
-    // （P1-06：此前 Promise 永不结束，前端"发送中"卡死）
-    if (!settled) {
-      onError(SSE_PROTOCOL_ERROR)
-    }
-  } catch (e: any) {
-    if (e.name === 'AbortError' || e?.code === 'ERR_CANCELED') {
-      onError('已取消')
-    } else if (isAppError(e)) {
-      onError(e.requestId ? `${e.message}（错误编号 ${e.requestId}）` : e.message)
-    } else {
-      onError(translateApiError(e?.message || '网络错误'))
-    }
+    Events.On(evDone, (payload: any) => {
+      if (cancelled) return
+      cleanup()
+      const data = typeof payload === 'string' ? JSON.parse(payload) : payload?.data || payload
+      onDone({ sessionId: data?.sessionId || 0, sources: data?.sources || [] })
+    })
+    Events.On(evError, (payload: any) => {
+      if (cancelled) return
+      cleanup()
+      const err = typeof payload === 'string' ? payload : payload?.data || '连接中断，请重试'
+      onError(err as string)
+    })
+    await QAService.AskStream({ question: params.question, mode: params.mode, fileId: params.fileId || 0, sessionId: params.sessionId || 0 }, '')
+  } catch (e) {
+    cleanup()
+    onError(fromBindingError(e, '请求失败').message)
   }
 }
-
 export async function deleteQASession(id: number): Promise<void> {
-  await http.delete(`/qa/sessions/${id}`)
+  try { await QAService.DeleteSession(id) } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 统计 ────────
 
-export async function getStats(params?: {
-  range?: string
-  from?: number
-  to?: number
-}): Promise<{ enabled: boolean; metrics?: StatsMetrics }> {
-  const { data } = await http.get<ApiResponse<{ enabled: boolean; metrics?: StatsMetrics }>>('/stats', { params })
-  return unwrapData<{ enabled: boolean; metrics?: StatsMetrics }>(data)
+export async function getStats(params?: { range?: string; from?: number; to?: number }): Promise<any> {
+  try {
+    const res = await StatsService.Get({ range: params?.range || '', from: params?.from || 0, to: params?.to || 0 })
+    return { data: { code: 'ok', data: res } }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function exportStats(format: string, params?: {
-  range?: string
-}): Promise<Blob> {
-  const res = await http.get('/stats/export', {
-    params: { format, ...params },
-    responseType: 'blob',
-  })
-  return res.data
+export async function exportStats(format: string, params?: { range?: string }): Promise<Blob> {
+  try {
+    const content = await StatsService.Export(format, { range: params?.range || '', from: 0, to: 0 })
+    return new Blob([content as string], { type: 'text/plain' })
+  } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 提交 ────────
 
 export async function autoCommit(): Promise<{ hash: string | null; message?: string; ai?: string }> {
-  const { data } = await http.post<ApiResponse<{ skipped?: boolean; hash?: string; message?: string; ai?: string }>>('/commits/auto')
-  const d = unwrapData<{ skipped?: boolean; hash?: string; message?: string; ai?: string }>(data)
-  if (d?.skipped) return { hash: null }
-  return { hash: d?.hash ?? null, message: d?.message, ai: d?.ai }
+  try {
+    const res = await CommitsService.AutoCommit()
+    if (res?.skipped) return { hash: null }
+    return { hash: res?.hash || null, message: res?.message, ai: res?.ai }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export interface CommitFileStatus {
-  relPath: string
-  code: string // M/D/A/??
+export interface CommitFileStatus { relPath: string; code: string }
+export async function getCommitStatus(): Promise<{ files: CommitFileStatus[]; count: number }> {
+  try {
+    const res = await CommitsService.Status()
+    return { files: res?.files || [], count: res?.count || 0 }
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function getCommitStatus(): Promise<{
-  files: CommitFileStatus[]
-  count: number
-}> {
-  const { data } = await http.get<ApiResponse<{ files: CommitFileStatus[]; count: number }>>('/commits/status')
-  return unwrapData<{ files: CommitFileStatus[]; count: number }>(data)
-}
-
 export async function suggestCommitMessage(): Promise<string> {
-  const { data } = await http.post<ApiResponse<{ suggestion: string }>>('/commits/suggest')
-  return unwrapData<{ suggestion: string }>(data).suggestion
+  try {
+    const res = await CommitsService.Suggest()
+    return res?.suggestion || ''
+  } catch (e) { throw fromBindingError(e) }
 }
-
 export async function manualCommit(message: string): Promise<string> {
-  const { data } = await http.post<ApiResponse<{ hash: string; skipped?: boolean }>>('/commits/manual', { message })
-  return unwrapData<{ hash: string; skipped?: boolean }>(data).hash
+  try {
+    const res = await CommitsService.Manual({ message })
+    return res?.hash || ''
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function getCommitList(): Promise<CommitItem[]> {
-  const { data } = await http.get<ApiResponse<{ commits: CommitItem[] }>>('/commits/list')
-  return unwrapData<{ commits: CommitItem[] }>(data)?.commits || []
+export async function getCommitList(): Promise<any[]> {
+  try {
+    const res = await CommitsService.List()
+    return res?.commits || []
+  } catch (e) { throw fromBindingError(e) }
 }
-
-export async function getCommitFiles(commitHash: string): Promise<VersionFile[]> {
-  const { data } = await http.get<ApiResponse<{ files: VersionFile[] }>>(`/commits/${commitHash}/files`)
-  return unwrapData<{ files: VersionFile[] }>(data)?.files || []
+export async function getCommitFiles(commitHash: string): Promise<any[]> {
+  try {
+    const res = await CommitsService.Files(commitHash)
+    return res?.files || []
+  } catch (e) { throw fromBindingError(e) }
 }
-
-// getCommitDiff 获取单个提交的改动文件列表（新增/修改/删除），供版本记录页展开时按需获取。
-export async function getCommitDiff(commitHash: string): Promise<CommitFile[]> {
-  const { data } = await http.get<ApiResponse<{ files: CommitFile[] }>>(`/commits/${commitHash}/diff`)
-  return unwrapData<{ files: CommitFile[] }>(data)?.files || []
+export async function getCommitDiff(commitHash: string): Promise<any> {
+  try {
+    const res = await CommitsService.TreeAt(commitHash)
+    return { data: { code: 'ok', data: { files: res?.files || [] } } }
+  } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 设置 ────────
 
 export async function getSettings(): Promise<Record<string, any>> {
-  const { data } = await http.get<ApiResponse<Record<string, any>>>('/settings')
-  return unwrapData<Record<string, any>>(data)
+  try { return (await SettingsService.Get()) as Record<string, any> } catch (e) { throw fromBindingError(e) }
 }
-
 export async function updateSettings(settings: Record<string, any>): Promise<{ restartRequired: string[]; reindexRequired: boolean }> {
-  const { data } = await http.put<ApiResponse<{ restartRequired: string[]; reindexRequired: boolean }>>('/settings', settings)
-  return unwrapData<{ restartRequired: string[]; reindexRequired: boolean }>(data) ?? { restartRequired: [], reindexRequired: false }
+  try {
+    const res = await SettingsService.UpdateSettings(settings)
+    return { restartRequired: res?.restartRequired || [], reindexRequired: res?.reindexRequired || false }
+  } catch (e) { throw fromBindingError(e) }
 }
-
 export async function updateSecrets(llmApiKey?: string, embedApiKey?: string, rerankApiKey?: string): Promise<void> {
-  await http.put('/settings/secrets', { llmApiKey, embedApiKey, rerankApiKey })
+  try { await SettingsService.UpdateSecrets({ llmApiKey: llmApiKey || '', embedApiKey: embedApiKey || '', rerankApiKey: rerankApiKey || '' }) } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 测试 ────────
 
-export async function testMarkitdown(pythonPath: string, command: string): Promise<ProbeResult> {
-  const { data } = await http.post<ApiResponse<ProbeResult>>('/test/markitdown', { pythonPath, command })
-  return unwrapData<ProbeResult>(data)
+export async function testMarkitdown(pythonPath: string, command: string): Promise<any> {
+  try { return await TestService.TestMarkItDown({ pythonPath, command }) } catch (e) { throw fromBindingError(e) }
 }
-
 export interface LLMTestParams {
   type: 'chat' | 'embed' | 'rerank'
-  baseUrl?: string
-  model?: string
-  apiKey?: string
-  temperature?: number
+  baseUrl?: string; model?: string; apiKey?: string; temperature?: number
 }
-
-export async function testLLM(params: LLMTestParams): Promise<ProbeResult> {
-  const { data } = await http.post<ApiResponse<ProbeResult>>('/test/llm', params)
-  return unwrapData<ProbeResult>(data)
+export async function testLLM(params: LLMTestParams): Promise<any> {
+  try {
+    return await TestService.TestLLM({ type: params.type as any, baseUrl: params.baseUrl || '', apiKey: params.apiKey || '', model: params.model || '', temperature: params.temperature || 0, kind: '' })
+  } catch (e) { throw fromBindingError(e) }
 }
-
-// 获取端点支持的模型列表（「获取模型」按钮）；kind 区分 chat/embed/rerank，后端回退对应已保存密钥
 export async function fetchModels(params: { kind: 'chat' | 'embed' | 'rerank'; baseUrl: string; apiKey?: string }): Promise<string[]> {
-  const { data } = await http.post<ApiResponse<{ ok: boolean; models?: string[]; message?: string }>>('/test/llm', {
-    type: 'models',
-    kind: params.kind,
-    baseUrl: params.baseUrl,
-    apiKey: params.apiKey,
-  })
-  const d = unwrapData<{ ok: boolean; models?: string[]; message?: string }>(data)
-  if (!d?.ok) {
-    // 业务失败（200 响应）：以 AppError 抛出，携带 requestId 供界面定位
-    throw new AppError(d?.message || '获取模型失败', ERROR_CODES.llmError, { requestId: data.requestId })
-  }
-  return d?.models || []
+  try {
+    const res = await TestService.TestLLM({ type: 'models' as any, kind: params.kind, baseUrl: params.baseUrl, apiKey: params.apiKey || '', model: '', temperature: 0 })
+    return res?.models || []
+  } catch (e) { throw fromBindingError(e) }
 }
-
 export interface PythonDetectResult {
-  path: string
-  ok: boolean
-  version?: string
-  markitdownCmd?: string
-  error?: string
+  path: string; ok: boolean; version?: string; markitdownCmd?: string; error?: string
 }
-
 export async function detectPython(): Promise<PythonDetectResult> {
-  const { data } = await http.get<ApiResponse<{ results: PythonDetectResult[] }>>('/python/detect')
-  const results = unwrapData<{ results: PythonDetectResult[] }>(data)?.results || []
-  const found = results.find((r) => r.ok) || results[0] || { path: '', ok: false, error: '未检测到 Python' }
-  return found
+  try { return (await TestService.DetectPython()) as PythonDetectResult } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 任务队列 ────────
 
-export interface QueueStatus {
-  running: number
-  pending: number
-  paused: boolean
-  error?: string
-}
-
+export interface QueueStatus { running: number; pending: number; paused: boolean; error?: string }
 export async function getQueueStatus(): Promise<QueueStatus> {
-  const { data } = await http.get<ApiResponse<QueueStatus>>('/queue/status')
-  return unwrapData<QueueStatus>(data)
+  try { return (await QueueService.Status()) as QueueStatus } catch (e) { throw fromBindingError(e) }
 }
-
 export async function pauseQueue(): Promise<void> {
-  await http.post('/queue/pause')
+  try { await QueueService.Pause() } catch (e) { throw fromBindingError(e) }
 }
-
 export async function resumeQueue(): Promise<void> {
-  await http.post('/queue/resume')
+  try { await QueueService.Resume() } catch (e) { throw fromBindingError(e) }
 }
 
-// ──────── SSE ────────
+// ──────── Wails 事件连接（替代原 SSE EventSource） ────────
 
+const INTERNAL_EVENTS = [
+  'index_progress', 'files_changed', 'tag_done', 'commit_done',
+  'task_queue', 'settings_changed', 'stats_updated', 'qa_ready',
+]
 export function createSSEConnection(
   onEvent: (topic: string, data: any) => void,
-  opts?: { onOpen?: () => void; onClose?: (hadError: boolean) => void },
+  _opts?: { onOpen?: () => void; onClose?: (hadError: boolean) => void },
 ): () => void {
-  let eventSource: EventSource | null = null
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  let closed = false
-
-  function connect() {
-    if (closed) return
-
-    eventSource = new EventSource('/api/events')
-
-    // 连接建立成功（含重连成功）：通知调用方做全量对账
-    eventSource.onopen = () => {
-      opts?.onOpen?.()
-    }
-
-    eventSource.onmessage = (e) => {
-      try {
-        const parsed = JSON.parse(e.data)
-        if (parsed.topic && parsed.data !== undefined) {
-          onEvent(parsed.topic, parsed.data)
-        }
-      } catch {
-        // ignore parse errors
-      }
-    }
-
-    // 连接中断（网络抖动 / 服务端断开 / 首连失败）：通知调用方（hadError=true），
-    // 3 秒后自动重连；显式 close()（返回的关闭函数）不触发 onerror，因此不会回调 onClose。
-    eventSource.onerror = () => {
-      eventSource?.close()
-      if (!closed) {
-        opts?.onClose?.(true)
-        reconnectTimer = setTimeout(connect, 3000)
-      }
-    }
-  }
-
-  connect()
-
-  return () => {
-    closed = true
-    if (reconnectTimer) clearTimeout(reconnectTimer)
-    eventSource?.close()
-  }
+  const handlers = INTERNAL_EVENTS.map((topic) => {
+    const eventName = 'memora:' + topic
+    Events.On(eventName, (payload: any) => {
+      const data = typeof payload === 'string' ? JSON.parse(payload) : payload?.data || payload
+      onEvent(topic, data)
+    })
+    return () => Events.Off(eventName)
+  })
+  return () => { handlers.forEach((h) => h()) }
 }

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=My Product
+Comment=A memora-test application
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/memora-test.exe %u
+Terminal=false
+Type=Application
+Icon=memora-test.exe
+Categories=Utility;
+StartupWMClass=memora-test.exe
+
+ 

@@ -202,11 +202,11 @@ async function loadChildren(node: TreeNode) {
   node.loading = true
   try {
     const res = await browseDir(node.relPath === '/' ? '' : node.relPath)
-    const entries = res.entries || []
-    const dirs = entries.filter((e) => e.isDir)
+    const entries = (res.entries || []) as any[]
+    const dirs = entries.filter((e: any) => e.isDir)
     // 子树只含子文件夹，文件在右侧列表展示。「空文件夹」仅当目录完全无内容时显示
     node.empty = entries.length === 0
-    node.children = dirs.map((d) => ({
+    node.children = dirs.map((d: any) => ({
       name: d.name,
       relPath: d.relPath,
       isDir: true,

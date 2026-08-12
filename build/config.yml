@@ -1,0 +1,42 @@
+version: '3'
+
+info:
+  companyName: "Memora"
+  productName: "Memora"
+  productIdentifier: "com.memora.app"
+  description: "智能文档库 - 本地知识库与 RAG 问答"
+  copyright: "(c) 2025, Memora"
+  comments: "Memora 智能文档库"
+  version: "0.0.1"
+
+dev_mode:
+  root_path: .
+  log_level: warn
+  debounce: 1000
+  ignore:
+    dir:
+      - .git
+      - node_modules
+      - frontend
+      - bin
+      - build
+      - pkg
+    file:
+      - .DS_Store
+      - .gitignore
+      - .gitkeep
+      - "*_test.go"
+    watched_extension:
+      - "*.go"
+    git_ignore: true
+  executes:
+    - cmd: wails3 build DEV=true
+      type: blocking
+    - cmd: wails3 task common:dev:frontend
+      type: background
+    - cmd: wails3 task run
+      type: primary
+
+fileAssociations: []
+
+other: []
