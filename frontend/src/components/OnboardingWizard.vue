@@ -3,8 +3,9 @@
 // 目标：小白在 3 步内成功用起来，无需理解 base_url/模型名等概念。
 import { ref, computed } from 'vue'
 import { useWorkspaceStore } from '@/stores/workspace'
-import { browsePickDir, fetchModels, translateApiError } from '@/api/client'
-import { PROVIDER_PRESETS, CUSTOM_PROVIDER_ID } from '@/data/providers'
+import { browsePickDir, translateApiError } from '@/api/client'
+import { createProviderController, modelOptions, type ModelKind } from '@/data/providerModel'
+import { PROVIDER_PRESETS, CUSTOM_PROVIDER_ID } from '@/data/providerModel'
 import Icon from '@/components/Icon.vue'
 
 const props = defineProps<{ visible: boolean }>()
@@ -42,89 +43,30 @@ function closeWizard() {
 }
 
 // ── 步骤 2：连接 AI（可选）──
-// 每个模型块：服务商下拉 + API Key（地址/模型自动填）
-const llmProviderId = ref(CUSTOM_PROVIDER_ID)
-const llmApiKey = ref('')
-const llmModel = ref('')
-const llmBaseUrl = ref('')
+// 每个模型块：服务商下拉 + API Key（地址自动填、维度按预设）；语义统一走共享状态机。
+// 向导策略：选预设只填地址/维度不清模型，由「获取模型」拉真实列表后选择。
+const chat = createProviderController('chat', { clearRemoteOnPreset: true })
+const embed = createProviderController('embed', { clearRemoteOnPreset: true })
+const rerank = createProviderController('rerank', { clearRemoteOnPreset: true })
+const controllers: Record<ModelKind, typeof chat> = { chat, embed, rerank }
+const fetchingModels = ref<ModelKind | ''>('')
 
-const embedProviderId = ref(CUSTOM_PROVIDER_ID)
-const embedApiKey = ref('')
-const embedModel = ref('')
-const embedBaseUrl = ref('')
-const embedDimensions = ref(1024)
-
-const rerankProviderId = ref(CUSTOM_PROVIDER_ID)
-const rerankApiKey = ref('')
-const rerankModel = ref('')
-const rerankBaseUrl = ref('')
-
-function applyProvider(kind: 'chat' | 'embed' | 'rerank', id: string) {
-  const p = PROVIDER_PRESETS.find((x) => x.id === id)
-  if (!p) return
-  // 只填接口地址与默认维度；模型由「获取模型」拉取真实列表后选择（避免预设与账户可用模型不符）
-  if (kind === 'chat') {
-    if (p.chatBaseUrl) llmBaseUrl.value = p.chatBaseUrl
-    llmModel.value = ''
-    llmFetchedModels.value = []
-    llmModelsError.value = ''
-  } else if (kind === 'embed') {
-    if (p.embedBaseUrl) embedBaseUrl.value = p.embedBaseUrl
-    if (p.embedDim) embedDimensions.value = p.embedDim
-    embedModel.value = ''
-    embedFetchedModels.value = []
-    embedModelsError.value = ''
-  } else {
-    if (p.rerankBaseUrl) rerankBaseUrl.value = p.rerankBaseUrl
-    rerankModel.value = ''
-    rerankFetchedModels.value = []
-    rerankModelsError.value = ''
-  }
-}
-
-// 获取模型：填好密钥后拉取该服务的真实模型列表
-const llmFetchedModels = ref<string[]>([])
-const embedFetchedModels = ref<string[]>([])
-const rerankFetchedModels = ref<string[]>([])
-const fetchingModels = ref<'chat' | 'embed' | 'rerank' | ''>('')
-const llmModelsError = ref('')
-const embedModelsError = ref('')
-const rerankModelsError = ref('')
-
-async function fetchWizardModels(kind: 'chat' | 'embed' | 'rerank') {
-  const baseUrl = kind === 'chat' ? llmBaseUrl.value : kind === 'embed' ? embedBaseUrl.value : rerankBaseUrl.value
-  const apiKey = kind === 'chat' ? llmApiKey.value : kind === 'embed' ? embedApiKey.value : rerankApiKey.value
-  const errRef = kind === 'chat' ? llmModelsError : kind === 'embed' ? embedModelsError : rerankModelsError
-  const hitRef = kind === 'chat' ? llmFetchedModels : kind === 'embed' ? embedFetchedModels : rerankFetchedModels
-  errRef.value = ''
-  if (!baseUrl.trim()) {
-    errRef.value = '请先选择服务商'
-    return
-  }
-  if (!apiKey.trim()) {
-    errRef.value = '请先填入 API Key 再获取模型'
-    return
-  }
+async function fetchWizardModels(kind: ModelKind) {
   fetchingModels.value = kind
   try {
-    hitRef.value = await fetchModels({ kind, baseUrl: baseUrl.trim(), apiKey: apiKey.trim() || undefined })
-    if (hitRef.value.length === 0) errRef.value = '该服务没有返回可用模型，请检查服务地址和密钥'
-  } catch (e: any) {
-    errRef.value = translateApiError(e?.message) || '获取模型失败'
+    await controllers[kind].fetchModels({
+      requireBaseUrl: '请先选择服务商',
+      requireApiKey: '请先填入 API Key 再获取模型',
+      emptyMessage: '该服务没有返回可用模型，请检查服务地址和密钥',
+    })
   } finally {
     fetchingModels.value = ''
   }
 }
 
-function modelOptions(models: string[], current: string): string[] {
-  const opts = [...models]
-  if (current && !opts.includes(current)) opts.unshift(current)
-  return opts
-}
-
 // AI 是否配置了任意一项（用于步骤 2 的提示）
 const hasAnyAI = computed(
-  () => !!llmBaseUrl.value || !!embedBaseUrl.value || !!rerankBaseUrl.value,
+  () => !!chat.state.baseUrl || !!embed.state.baseUrl || !!rerank.state.baseUrl,
 )
 
 // ── 步骤 3：开始使用 ──
@@ -138,15 +80,9 @@ async function start() {
   try {
     await ws.init({
       workspacePath: workspacePath.value.trim(),
-      llm: llmBaseUrl.value
-        ? { baseUrl: llmBaseUrl.value, apiKey: llmApiKey.value || undefined, model: llmModel.value || undefined }
-        : undefined,
-      embed: embedBaseUrl.value
-        ? { baseUrl: embedBaseUrl.value, apiKey: embedApiKey.value || undefined, model: embedModel.value || undefined, dimensions: embedDimensions.value || undefined }
-        : undefined,
-      rerank: rerankBaseUrl.value
-        ? { baseUrl: rerankBaseUrl.value, apiKey: rerankApiKey.value || undefined, model: rerankModel.value || undefined }
-        : undefined,
+      llm: chat.state.baseUrl ? chat.buildSection() : undefined,
+      embed: embed.state.baseUrl ? embed.buildSection() : undefined,
+      rerank: rerank.state.baseUrl ? rerank.buildSection() : undefined,
     })
     started.value = true
   } catch (e: any) {
@@ -222,15 +158,15 @@ function next() {
             </div>
             <div class="obw-ai-block__row">
               <select
-                :value="llmProviderId"
+                :value="chat.state.providerId"
                 class="select obw-provider"
-                @change="(e) => { llmProviderId = (e.target as HTMLSelectElement).value; applyProvider('chat', llmProviderId) }"
+                @change="(e) => chat.applyPreset((e.target as HTMLSelectElement).value)"
               >
                 <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                 <option :value="CUSTOM_PROVIDER_ID">自定义</option>
               </select>
               <input
-                v-model="llmApiKey"
+                v-model="chat.state.apiKey"
                 class="input obw-key"
                 type="password"
                 placeholder="API Key（粘贴）"
@@ -244,13 +180,13 @@ function next() {
               </button>
             </div>
             <select
-              v-if="llmFetchedModels.length"
-              v-model="llmModel"
+              v-if="chat.state.fetchedModels.length"
+              v-model="chat.state.model"
               class="select obw-model"
             >
-              <option v-for="m in modelOptions(llmFetchedModels, llmModel)" :key="m" :value="m">{{ m }}</option>
+              <option v-for="m in modelOptions(chat.state.fetchedModels, chat.state.model)" :key="m" :value="m">{{ m }}</option>
             </select>
-            <span v-if="llmModelsError" class="obw-err">{{ llmModelsError }}</span>
+            <span v-if="chat.state.modelsError" class="obw-err">{{ chat.state.modelsError }}</span>
           </div>
 
           <!-- 内容整理 -->
@@ -261,15 +197,15 @@ function next() {
             </div>
             <div class="obw-ai-block__row">
               <select
-                :value="embedProviderId"
+                :value="embed.state.providerId"
                 class="select obw-provider"
-                @change="(e) => { embedProviderId = (e.target as HTMLSelectElement).value; applyProvider('embed', embedProviderId) }"
+                @change="(e) => embed.applyPreset((e.target as HTMLSelectElement).value)"
               >
                 <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                 <option :value="CUSTOM_PROVIDER_ID">自定义</option>
               </select>
               <input
-                v-model="embedApiKey"
+                v-model="embed.state.apiKey"
                 class="input obw-key"
                 type="password"
                 placeholder="API Key（粘贴）"
@@ -283,13 +219,13 @@ function next() {
               </button>
             </div>
             <select
-              v-if="embedFetchedModels.length"
-              v-model="embedModel"
+              v-if="embed.state.fetchedModels.length"
+              v-model="embed.state.model"
               class="select obw-model"
             >
-              <option v-for="m in modelOptions(embedFetchedModels, embedModel)" :key="m" :value="m">{{ m }}</option>
+              <option v-for="m in modelOptions(embed.state.fetchedModels, embed.state.model)" :key="m" :value="m">{{ m }}</option>
             </select>
-            <span v-if="embedModelsError" class="obw-err">{{ embedModelsError }}</span>
+            <span v-if="embed.state.modelsError" class="obw-err">{{ embed.state.modelsError }}</span>
           </div>
 
           <!-- 排序优化（可选） -->
@@ -297,15 +233,15 @@ function next() {
             <summary>重排模型（可选，一般可跳过）</summary>
             <div class="obw-ai-block__row" style="margin-top: 8px">
               <select
-                :value="rerankProviderId"
+                :value="rerank.state.providerId"
                 class="select obw-provider"
-                @change="(e) => { rerankProviderId = (e.target as HTMLSelectElement).value; applyProvider('rerank', rerankProviderId) }"
+                @change="(e) => rerank.applyPreset((e.target as HTMLSelectElement).value)"
               >
                 <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                 <option :value="CUSTOM_PROVIDER_ID">自定义</option>
               </select>
               <input
-                v-model="rerankApiKey"
+                v-model="rerank.state.apiKey"
                 class="input obw-key"
                 type="password"
                 placeholder="API Key（粘贴）"
@@ -319,13 +255,13 @@ function next() {
               </button>
             </div>
             <select
-              v-if="rerankFetchedModels.length"
-              v-model="rerankModel"
+              v-if="rerank.state.fetchedModels.length"
+              v-model="rerank.state.model"
               class="select obw-model"
             >
-              <option v-for="m in modelOptions(rerankFetchedModels, rerankModel)" :key="m" :value="m">{{ m }}</option>
+              <option v-for="m in modelOptions(rerank.state.fetchedModels, rerank.state.model)" :key="m" :value="m">{{ m }}</option>
             </select>
-            <span v-if="rerankModelsError" class="obw-err">{{ rerankModelsError }}</span>
+            <span v-if="rerank.state.modelsError" class="obw-err">{{ rerank.state.modelsError }}</span>
           </details>
 
           <p v-if="hasAnyAI" class="obw-ok">✓ 已填写 AI 信息，可直接下一步</p>
@@ -339,11 +275,11 @@ function next() {
               <li><Icon name="folder" :size="14" /> 管理文件夹：<b>{{ workspacePath }}</b></li>
               <li>
                 <Icon name="chat" :size="14" />
-                AI 助手：{{ llmBaseUrl ? '已连接' : '未连接（可稍后在设置里补）' }}
+                AI 助手：{{ chat.state.baseUrl ? '已连接' : '未连接（可稍后在设置里补）' }}
               </li>
               <li>
                 <Icon name="search" :size="14" />
-                内容搜索：{{ embedBaseUrl ? '已连接' : '未连接（可稍后在设置里补）' }}
+                内容搜索：{{ embed.state.baseUrl ? '已连接' : '未连接（可稍后在设置里补）' }}
               </li>
             </ul>
             <p class="obw-desc">

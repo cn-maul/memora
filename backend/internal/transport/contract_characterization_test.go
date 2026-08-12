@@ -134,18 +134,12 @@ func (charSearch) Query(q string, tagFilter []string, page int) ([]*contract.Sea
 
 type charTimeline struct{}
 
-func (charTimeline) Get(q *contract.TimelineQuery) ([]*contract.TimelineNode, error) {
-	return []*contract.TimelineNode{}, nil
-}
 func (charTimeline) GenerateSummary(commitHash string) (string, error) { return "", nil }
 func (charTimeline) SuggestCommitMessage() (string, error)             { return "", nil }
 func (charTimeline) Restore(relPath, hash string) error                { return nil }
 
 type charTimelineErr struct{}
 
-func (charTimelineErr) Get(q *contract.TimelineQuery) ([]*contract.TimelineNode, error) {
-	return nil, nil
-}
 func (charTimelineErr) GenerateSummary(commitHash string) (string, error) { return "", nil }
 func (charTimelineErr) SuggestCommitMessage() (string, error) {
 	return "", errors.New("LLM 未配置")
@@ -158,9 +152,8 @@ func (charQA) Ask(req *contract.QARequest) (*contract.QAResponse, error) { retur
 func (charQA) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-chan string, <-chan *contract.QAResponse) {
 	return nil, nil
 }
-func (charQA) Sessions() ([]*contract.QASession, error)           { return nil, nil }
-func (charQA) NewSesion(mode string, fileID int64) (int64, error) { return 0, nil }
-func (charQA) DeleteSession(id int64) error                       { return nil }
+func (charQA) Sessions() ([]*contract.QASession, error) { return nil, nil }
+func (charQA) DeleteSession(id int64) error             { return nil }
 
 type charStats struct {
 	enabled bool
@@ -563,18 +556,11 @@ func TestQueueStatusNotReady(t *testing.T) {
 	assertStatus(t, rr, http.StatusServiceUnavailable)
 }
 
-// GET /api/timeline：工作区未初始化时返回 400 not_configured。
-func TestTimelineNotConfigured(t *testing.T) {
+// /api/timeline 已下线：路由不再注册,请求应命中 404。
+func TestTimelineRouteRemoved(t *testing.T) {
 	m := newCharFakeHandler(t, nil)
 	rr := doReq(m, http.MethodGet, "/api/timeline", "")
-	assertStatus(t, rr, http.StatusBadRequest)
-	var resp struct {
-		Code string `json:"code"`
-	}
-	decodeResp(t, rr, &resp)
-	if resp.Code != "not_configured" {
-		t.Fatalf("code = %q, want not_configured", resp.Code)
-	}
+	assertStatus(t, rr, http.StatusNotFound)
 }
 
 // POST-only 端点对 GET 应返回 400 bad_request。

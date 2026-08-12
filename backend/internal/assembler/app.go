@@ -260,8 +260,8 @@ func (a *App) buildRuntime(gen, dataDir, workspace string) (*Runtime, error) {
 	// 标签模块
 	tg := tag.New(st, a.LLM, a.Events)
 
-	// 搜索模块
-	sr := search.New(idx, a.LLM, st)
+	// 搜索模块（检索编排置于 search：向量检索 + 标签过滤 + 结果组装）
+	sr := search.New(a.LLM, st)
 
 	// 时间线模块
 	tl := timeline.New(a.Git, st, a.LLM, a.Events, workspace)

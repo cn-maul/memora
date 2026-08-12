@@ -693,44 +693,6 @@ func (m *Module) DeleteFile(relPath string) error {
 	return nil
 }
 
-// Query 向量查询
-// 注意：tagFilter 参数仅用于接口兼容，实际的标签过滤由 search 模块负责。
-func (m *Module) Query(vec []float32, topK int, tagFilter []string) ([]contract.SearchResult, error) {
-	entries, err := m.storage.VectorsSearch(vec, topK)
-	if err != nil {
-		return nil, err
-	}
-
-	var results []contract.SearchResult
-	fileSeen := make(map[int64]bool)
-	for _, entry := range entries {
-		chunk, err := m.storage.ChunksGet(entry.ChunkID)
-		if err != nil || chunk == nil {
-			continue
-		}
-		if fileSeen[chunk.FileID] {
-			continue
-		}
-		file, err := m.storage.FilesGet(chunk.FileID)
-		if err != nil || file == nil {
-			continue
-		}
-		results = append(results, contract.SearchResult{
-			FileID:  file.ID,
-			RelPath: file.RelPath,
-			HitText: truncateText(chunk.Text, 200),
-			Score:   entry.Score,
-			Mtime:   file.Mtime,
-		})
-		fileSeen[chunk.FileID] = true
-		if len(results) >= topK {
-			break
-		}
-	}
-
-	return results, nil
-}
-
 // ──────────────────── 辅助函数 ────────────────────
 
 // scanWorkspaceFiles 扫描工作目录下的所有支持文件
@@ -760,14 +722,3 @@ func (m *Module) scanWorkspaceFiles() ([]string, error) {
 
 // isHeavyDirName / detectDocType 已统一迁移到 documentpolicy 包：
 // IsIgnoredDir / DetectDocType。避免各模块重复维护一份规则（P2-14）。
-
-// truncateText 截断文本（按 rune）
-func truncateText(text string, maxRunes int) string {
-	runes := []rune(text)
-	if len(runes) <= maxRunes {
-		return text
-	}
-	// 截取并加上省略号
-	half := maxRunes / 2
-	return string(runes[:half]) + "..." + string(runes[len(runes)-half:])
-}

@@ -120,25 +120,6 @@ type SearchResult struct {
 	MatchedChunks int       `json:"matchedChunks"`
 }
 
-// TimelineNode 时间线节点
-type TimelineNode struct {
-	Bucket   string         `json:"bucket"`
-	Label    string         `json:"label"`
-	Count    int            `json:"count"`
-	Added    int            `json:"added"`
-	Modified int            `json:"modified"`
-	Deleted  int            `json:"deleted"`
-	Summary  string         `json:"summary,omitempty"`
-	Files    []TimelineFile `json:"files"`
-}
-
-// TimelineFile 时间线文件
-type TimelineFile struct {
-	RelPath    string `json:"relPath"`
-	Mtime      int64  `json:"mtime"`
-	CommitHash string `json:"commitHash,omitempty"`
-}
-
 // StatsMetrics 统计指标
 type StatsMetrics struct {
 	CommitsByDay    []DayCount  `json:"commitsByDay"`
@@ -338,7 +319,7 @@ type IWatch interface {
 	Changes() <-chan *FileChange
 }
 
-// ──────────────────────────── 4.7 IExtract ────────────────────────────
+// ──────────────────────────── 4.7 Extract DTOs ────────────────────────────
 
 type ProbeResult struct {
 	Ok      bool   `json:"ok"`
@@ -350,62 +331,7 @@ type ExtractResult struct {
 	CacheKey string `json:"cacheKey"`
 }
 
-// IExtract 文本提取
-type IExtract interface {
-	Probe(pythonPath, command string) (*ProbeResult, error)
-	ExtractFile(filePath string) (text string, cacheKey string, err error)
-	Cleanup() error
-}
-
-// ───────────────────────────── 4.8 IIndex ─────────────────────────────
-
-// IIndex 索引管理
-type IIndex interface {
-	FullReindex() error
-	Incremental(changed, removed []string) error
-	ProcessFile(file *FileInfo) error
-	DeleteFile(relPath string) error
-	Query(vec []float32, topK int, tagFilter []string) ([]SearchResult, error)
-}
-
-// ──────────────────────────── 4.9 ITag ────────────────────────────
-
-// ITag 标签管理
-type ITag interface {
-	ProcessFile(file *FileInfo) error
-	ManualOverride(fileID int64, add, remove []string) error
-	ListLibrary() ([]*TagInfo, error)
-	ListSuggestions() ([]*TagSuggestion, error)
-	AcceptSuggestion(id int64) error
-	RejectSuggestion(id int64) error
-}
-
-// ───────────────────────────── 4.10 ISearch ─────────────────────────────
-
-// ISearch 搜索
-type ISearch interface {
-	Query(q string, tagFilter []string, page int) ([]*SearchResult, int, error) // results, total, err
-}
-
-// ───────────────────────────── 4.11 ITimeline ─────────────────────────────
-
-type TimelineQuery struct {
-	Granularity string // day|week|month
-	TagFilter   []string
-	From        int64 // 毫秒
-	To          int64
-}
-
-// ITimeline 时间线
-type ITimeline interface {
-	Get(q *TimelineQuery) ([]*TimelineNode, error)
-	NodeDetail(node *TimelineNode) error
-	GenerateSummary(commitHash string) (string, error)
-	SuggestCommitMessage() (string, error) // 根据当前未提交变动生成提交备注建议
-	Restore(relPath, hash string) error
-}
-
-// ───────────────────────────── 4.12 IQA ─────────────────────────────
+// ───────────────────────────── 4.12 QA DTOs ─────────────────────────────
 
 type QARequest struct {
 	SessionID int64  `json:"sessionId,omitempty"`
@@ -426,16 +352,7 @@ type QASource struct {
 	Seq     int    `json:"seq"`
 }
 
-// IQA 问答
-type IQA interface {
-	Ask(req *QARequest) (*QAResponse, error)
-	Sessions() ([]*QASession, error)
-	NewSesion(mode string, fileID int64) (int64, error)
-	ClearSesion(id int64) error
-	DeleteSession(id int64) error
-}
-
-// ──────────────────────────── 4.13 IStats ────────────────────────────
+// ──────────────────────────── 4.13 Stats DTOs ────────────────────────────
 
 type StatsRange struct {
 	Range string `json:"range"` // week|month|quarter|custom
@@ -443,16 +360,7 @@ type StatsRange struct {
 	To    int64  `json:"to,omitempty"`
 }
 
-// IStats 统计
-type IStats interface {
-	Enabled() bool
-	SetEnabled(v bool) error
-	Summary(r *StatsRange) (*StatsMetrics, error)
-	Export(format string, r *StatsRange) (string, error) // 内容 + Content-Type
-	Purge() error
-}
-
-// ──────────────────────────── 4.14 ITaskQueue ────────────────────────────
+// ──────────────────────────── 4.14 TaskQueue DTOs ────────────────────────────
 
 type Task struct {
 	Type    string      `json:"type"` // extract|tag|summarize|reindex|delete_index
@@ -462,33 +370,4 @@ type Task struct {
 type QueueStatus struct {
 	Running int `json:"running"`
 	Pending int `json:"pending"`
-}
-
-// ITaskQueue 任务队列
-type ITaskQueue interface {
-	Submit(task *Task) error
-	Pause() error
-	Resume() error
-	Status() (*QueueStatus, error)
-	CancelAll() error
-}
-
-// ──────────────────────────── 4.15 ITransport ────────────────────────────
-
-// ITransport 传输适配
-type ITransport interface {
-	Handle(routes map[string]interface{}) error
-	SSE() error
-	Addr() string // 返回监听地址
-	Stop() error
-}
-
-// ──────────────────────────── 4.16 IApp ────────────────────────────
-
-// IApp 应用装配与生命周期
-type IApp interface {
-	Run() error
-	Shutdown()
-	Quit()
-	ShowWindow()
 }

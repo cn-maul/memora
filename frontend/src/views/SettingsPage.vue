@@ -3,112 +3,42 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSettingsStore } from '@/stores/settings'
 import { useWorkspaceStore } from '@/stores/workspace'
-import { testMarkitdown, testLLM, fetchModels, browsePickDir, detectPython, translateApiError, type PythonDetectResult } from '@/api/client'
+import { testMarkitdown, browsePickDir, detectPython, translateApiError, type PythonDetectResult } from '@/api/client'
 import Icon, { type IconName } from '@/components/Icon.vue'
 import OnboardingWizard from '@/components/OnboardingWizard.vue'
-import { PROVIDER_PRESETS, CUSTOM_PROVIDER_ID, providerForUrl } from '@/data/providers'
+import { createProviderController, type ModelKind } from '@/data/providerModel'
+import { PROVIDER_PRESETS, CUSTOM_PROVIDER_ID } from '@/data/providerModel'
 
 const settings = useSettingsStore()
 const ws = useWorkspaceStore()
 const router = useRouter()
 
 // ───── 表单状态 ─────
-const llmBaseUrl = ref('')
-const llmModel = ref('')
-const llmTemperature = ref(0.7)
-const llmApiKey = ref('')
-const llmProviderId = ref(CUSTOM_PROVIDER_ID)
+// 三个模型区块统一由共享状态机托管（服务商切换 / 获取模型 / 测试 / 载荷组装见 providerModel）。
+// 设置页策略：选预设时预填首个预设模型 + 维度（fillModelOnPreset），不清已拉取的远程模型。
+const chat = createProviderController('chat', { fillModelOnPreset: true })
+const embed = createProviderController('embed', { fillModelOnPreset: true })
+const rerank = createProviderController('rerank', { fillModelOnPreset: true, defaultModel: 'Pro/BAAI/bge-reranker-v2-m3' })
+const controllers: Record<ModelKind, typeof chat> = { chat, embed, rerank }
+const fetchingModels = ref<ModelKind | ''>('') // '' | 'chat' | 'embed' | 'rerank'
 
-const embedBaseUrl = ref('')
-const embedModel = ref('')
-const embedDimensions = ref(1024)
-const embedApiKey = ref('')
-const embedProviderId = ref(CUSTOM_PROVIDER_ID)
+// 模型下拉选项：预设模型 + 已拉取的远程模型 + 当前已填值兜底（自定义模型）
+const llmModelOptions = computed(() => chat.modelOptions())
+const embedModelOptions = computed(() => embed.modelOptions())
+const rerankModelOptions = computed(() => rerank.modelOptions())
+// 有预设/远程模型就用下拉，否则手动输入
+const llmUseSelect = computed(() => chat.useSelect())
+const embedUseSelect = computed(() => embed.useSelect())
+const rerankUseSelect = computed(() => rerank.useSelect())
 
-const rerankBaseUrl = ref('')
-const rerankModel = ref('Pro/BAAI/bge-reranker-v2-m3')
-const rerankApiKey = ref('')
-const rerankProviderId = ref(CUSTOM_PROVIDER_ID)
-
-// 「获取模型」：从端点拉取模型列表，填充模型下拉（错误按区块独立，互不影响）
-const llmFetchedModels = ref<string[]>([])
-const embedFetchedModels = ref<string[]>([])
-const rerankFetchedModels = ref<string[]>([])
-const fetchingModels = ref('') // '' | 'chat' | 'embed' | 'rerank'
-const llmModelsError = ref('')
-const embedModelsError = ref('')
-const rerankModelsError = ref('')
-
-// 服务商预设辅助（选中预设自动填地址/模型/维度）
-const llmPreset = computed(() => PROVIDER_PRESETS.find((p) => p.id === llmProviderId.value) || null)
-const embedPreset = computed(() => PROVIDER_PRESETS.find((p) => p.id === embedProviderId.value) || null)
-const rerankPreset = computed(() => PROVIDER_PRESETS.find((p) => p.id === rerankProviderId.value) || null)
-
-function applyProvider(kind: 'chat' | 'embed' | 'rerank', id: string) {
-  const preset = PROVIDER_PRESETS.find((p) => p.id === id)
-  if (!preset) return
-  if (kind === 'chat') {
-    if (preset.chatBaseUrl) llmBaseUrl.value = preset.chatBaseUrl
-    if (preset.chatModels.length) llmModel.value = preset.chatModels[0]
-  } else if (kind === 'embed') {
-    if (preset.embedBaseUrl) embedBaseUrl.value = preset.embedBaseUrl
-    if (preset.embedModels.length) embedModel.value = preset.embedModels[0]
-    if (preset.embedDim) embedDimensions.value = preset.embedDim
-  } else {
-    if (preset.rerankBaseUrl) rerankBaseUrl.value = preset.rerankBaseUrl
-    if (preset.rerankModels.length) rerankModel.value = preset.rerankModels[0]
-  }
-}
-
-// 服务商下拉变化：自动填地址/模型/维度
-function onProviderChange(kind: 'chat' | 'embed' | 'rerank', id: string) {
-  if (id === CUSTOM_PROVIDER_ID) return
-  applyProvider(kind, id)
-}
-
-// 模型下拉选项：预设模型 + 当前已填但不在列表里的值（自定义模型兜底）
-function modelOptions(models: string[], current: string): string[] {
-  const opts = [...models]
-  if (current && !opts.includes(current)) opts.unshift(current)
-  return opts
-}
-
-// 模型选择：优先「获取模型」拉到的列表，其次服务商预设；两者都没有则手动输入
-const llmModelOptions = computed(() =>
-  modelOptions([...llmFetchedModels.value, ...(llmPreset.value?.chatModels || [])], llmModel.value),
-)
-const embedModelOptions = computed(() =>
-  modelOptions([...embedFetchedModels.value, ...(embedPreset.value?.embedModels || [])], embedModel.value),
-)
-const rerankModelOptions = computed(() =>
-  modelOptions([...rerankFetchedModels.value, ...(rerankPreset.value?.rerankModels || [])], rerankModel.value),
-)
-const llmUseSelect = computed(() => llmFetchedModels.value.length > 0 || (llmPreset.value?.chatModels.length || 0) > 0)
-const embedUseSelect = computed(() => embedFetchedModels.value.length > 0 || (embedPreset.value?.embedModels.length || 0) > 0)
-const rerankUseSelect = computed(() => rerankFetchedModels.value.length > 0 || (rerankPreset.value?.rerankModels.length || 0) > 0)
-
-// 获取模型：调用端点 /models 拉取可用模型列表
-async function handleFetchModels(kind: 'chat' | 'embed' | 'rerank') {
+async function handleFetchModels(kind: ModelKind) {
   fetchingModels.value = kind
-  llmModelsError.value = ''
-  embedModelsError.value = ''
-  rerankModelsError.value = ''
+  // 错误按区块独立展示，互不影响：先统一清空三块，再只写入目标块
+  chat.state.modelsError = ''
+  embed.state.modelsError = ''
+  rerank.state.modelsError = ''
   try {
-    const params =
-      kind === 'chat'
-        ? { kind, baseUrl: llmBaseUrl.value, apiKey: llmApiKey.value || undefined }
-        : kind === 'embed'
-          ? { kind, baseUrl: embedBaseUrl.value, apiKey: embedApiKey.value || undefined }
-          : { kind, baseUrl: rerankBaseUrl.value, apiKey: rerankApiKey.value || undefined }
-    const models = await fetchModels(params)
-    if (kind === 'chat') llmFetchedModels.value = models
-    else if (kind === 'embed') embedFetchedModels.value = models
-    else rerankFetchedModels.value = models
-  } catch (e: any) {
-    const msg = translateApiError(e.message)
-    if (kind === 'chat') llmModelsError.value = msg
-    else if (kind === 'embed') embedModelsError.value = msg
-    else rerankModelsError.value = msg
+    await controllers[kind].fetchModels({})
   } finally {
     fetchingModels.value = ''
   }
@@ -252,15 +182,15 @@ async function retryLoadSettings() {
 
 function loadFromSettings() {
   const s = settings.settings
-  llmBaseUrl.value = s.llm?.baseUrl || s.llmBaseUrl || ''
-  llmModel.value = s.llm?.model || s.llmModel || ''
+  chat.state.baseUrl = s.llm?.baseUrl || s.llmBaseUrl || ''
+  chat.state.model = s.llm?.model || s.llmModel || ''
   // 用 ?? 而非 ||：temperature=0 是合法值（确定性输出），|| 会回退到默认值（修复 L-2）
-  llmTemperature.value = s.llm?.temperature ?? s.llmTemperature ?? 0.7
-  embedBaseUrl.value = s.embed?.baseUrl || s.embedBaseUrl || ''
-  embedModel.value = s.embed?.model || s.embedModel || ''
-  embedDimensions.value = s.embed?.dimensions ?? s.embedDimensions ?? 1024
-  rerankBaseUrl.value = s.rerank?.baseUrl || ''
-  rerankModel.value = s.rerank?.model || 'Pro/BAAI/bge-reranker-v2-m3'
+  chat.state.temperature = s.llm?.temperature ?? s.llmTemperature ?? 0.7
+  embed.state.baseUrl = s.embed?.baseUrl || s.embedBaseUrl || ''
+  embed.state.model = s.embed?.model || s.embedModel || ''
+  embed.state.dimensions = s.embed?.dimensions ?? s.embedDimensions ?? 1024
+  rerank.state.baseUrl = s.rerank?.baseUrl || ''
+  rerank.state.model = s.rerank?.model || 'Pro/BAAI/bge-reranker-v2-m3'
   pythonPath.value = s.markitdown?.pythonPath || s.markitdownPythonPath || ''
   command.value = s.markitdown?.command || s.markitdownCommand || ''
   markitdownCmd.value = s.markitdown?.markitdownCmd || ''
@@ -270,19 +200,19 @@ function loadFromSettings() {
   autoCommitDebounceSec.value = s.autoCommit?.debounceSec ?? 90
   workspacePath.value = s.workspace?.path || s.workspacePath || ws.info?.workspacePath || ''
   // 按当前地址反推命中的服务商预设（未命中显示"自定义"）
-  llmProviderId.value = providerForUrl(llmBaseUrl.value, 'chat')
-  embedProviderId.value = providerForUrl(embedBaseUrl.value, 'embed')
-  rerankProviderId.value = providerForUrl(rerankBaseUrl.value, 'rerank')
+  chat.detectFromUrl()
+  embed.detectFromUrl()
+  rerank.detectFromUrl()
 }
 
 async function handleSaveSecrets() {
   saving.value = true
   saveError.value = ''
   try {
-    await settings.saveSecrets(llmApiKey.value || undefined, embedApiKey.value || undefined, rerankApiKey.value || undefined)
-    llmApiKey.value = ''
-    embedApiKey.value = ''
-    rerankApiKey.value = ''
+    await settings.saveSecrets(chat.state.apiKey || undefined, embed.state.apiKey || undefined, rerank.state.apiKey || undefined)
+    chat.state.apiKey = ''
+    embed.state.apiKey = ''
+    rerank.state.apiKey = ''
     savedMsg.value = '密钥已保存'
     setTimeout(() => (savedMsg.value = ''), 3000)
   } catch (e: any) {
@@ -319,14 +249,14 @@ async function handleSaveSettings() {
   saveError.value = ''
   try {
     const result = await settings.save({
-      'llm.baseUrl': llmBaseUrl.value,
-      'llm.model': llmModel.value,
-      'llm.temperature': llmTemperature.value,
-      'embed.baseUrl': embedBaseUrl.value,
-      'embed.model': embedModel.value,
-      'embed.dimensions': embedDimensions.value,
-      'rerank.baseUrl': rerankBaseUrl.value,
-      'rerank.model': rerankModel.value,
+      'llm.baseUrl': chat.state.baseUrl,
+      'llm.model': chat.state.model,
+      'llm.temperature': chat.state.temperature,
+      'embed.baseUrl': embed.state.baseUrl,
+      'embed.model': embed.state.model,
+      'embed.dimensions': embed.state.dimensions,
+      'rerank.baseUrl': rerank.state.baseUrl,
+      'rerank.model': rerank.state.model,
       'markitdown.pythonPath': pythonPath.value,
       'markitdown.command': command.value,
       'markitdown.markitdownCmd': markitdownCmd.value,
@@ -337,16 +267,16 @@ async function handleSaveSettings() {
       'workspace.path': workspacePath.value ?? undefined,
     })
     // 顺带保存表单里填写的密钥（非空才覆盖，保持"留空不修改"语义）。
-    const hasKeys = llmApiKey.value || embedApiKey.value || rerankApiKey.value
+    const hasKeys = chat.state.apiKey || embed.state.apiKey || rerank.state.apiKey
     if (hasKeys) {
       await settings.saveSecrets(
-        llmApiKey.value || undefined,
-        embedApiKey.value || undefined,
-        rerankApiKey.value || undefined,
+        chat.state.apiKey || undefined,
+        embed.state.apiKey || undefined,
+        rerank.state.apiKey || undefined,
       )
-      llmApiKey.value = ''
-      embedApiKey.value = ''
-      rerankApiKey.value = ''
+      chat.state.apiKey = ''
+      embed.state.apiKey = ''
+      rerank.state.apiKey = ''
     }
     // 三种提示：需重启 / 维度变更自动重建 / 纯保存成功
     if (result.reindexRequired) {
@@ -381,23 +311,10 @@ async function handleInitWorkspace() {
         pythonPath: pythonPath.value || undefined,
         command: command.value || undefined,
       },
-      llm: {
-        baseUrl: llmBaseUrl.value,
-        apiKey: llmApiKey.value || undefined,
-        model: llmModel.value || undefined,
-        temperature: llmTemperature.value || undefined,
-      },
-      embed: {
-        baseUrl: embedBaseUrl.value,
-        apiKey: embedApiKey.value || undefined,
-        model: embedModel.value || undefined,
-        dimensions: embedDimensions.value || undefined,
-      },
-      rerank: {
-        baseUrl: rerankBaseUrl.value || undefined,
-        apiKey: rerankApiKey.value || undefined,
-        model: rerankModel.value || undefined,
-      },
+      // 载荷仍按各区块原形状组装（chat 带 temperature、rerank 空地址省略），线格式不变
+      llm: chat.buildSection({ includeTemperature: true }),
+      embed: embed.buildSection(),
+      rerank: rerank.buildSection({ omitEmptyBaseUrl: true }),
     })
     initMsg.value = ws.initialized ? '✓ 工作区已初始化并开始索引' : '✓ 配置已应用'
   } catch (e: any) {
@@ -499,32 +416,14 @@ async function handleTest(type: string) {
       const res = await testMarkitdown(pythonPath.value || 'python3', command.value || 'markitdown')
       testMarkitdownResult.value = res.ok ? '✓ 测试通过' : `✗ ${translateApiError(res.message)}`
     } else if (type === 'embed') {
-      const res = await testLLM({
-        type: 'embed',
-        baseUrl: embedBaseUrl.value,
-        model: embedModel.value,
-        apiKey: embedApiKey.value || undefined,
-      })
-      testEmbedResult.value = res.ok ? '✓ 测试通过' : `✗ ${translateApiError(res.message)}`
+      testEmbedResult.value = await embed.testConnection()
     } else if (type === 'rerank') {
-      const res = await testLLM({
-        type: 'rerank',
-        baseUrl: rerankBaseUrl.value,
-        model: rerankModel.value,
-        apiKey: rerankApiKey.value || undefined,
-      })
-      testRerankResult.value = res.ok ? '✓ 测试通过' : `✗ ${translateApiError(res.message)}`
+      testRerankResult.value = await rerank.testConnection()
     } else {
-      const res = await testLLM({
-        type: 'chat',
-        baseUrl: llmBaseUrl.value,
-        model: llmModel.value,
-        apiKey: llmApiKey.value || undefined,
-        temperature: llmTemperature.value,
-      })
-      testChatResult.value = res.ok ? '✓ 测试通过' : `✗ ${translateApiError(res.message)}`
+      testChatResult.value = await chat.testConnection()
     }
   } catch (e: any) {
+    // 控制器内部已吞掉各自的错误；此 catch 仅兜底 markitdown 传输层异常
     const msg = `✗ ${translateApiError(e.message)}`
     if (type === 'chat') testChatResult.value = msg
     else if (type === 'embed') testEmbedResult.value = msg
@@ -856,9 +755,9 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <select
-                    :value="embedProviderId"
+                    :value="embed.state.providerId"
                     class="select"
-                    @change="(e) => { embedProviderId = (e.target as HTMLSelectElement).value; onProviderChange('embed', embedProviderId) }"
+                    @change="(e) => embed.applyPreset((e.target as HTMLSelectElement).value)"
                   >
                     <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                     <option :value="CUSTOM_PROVIDER_ID">自定义（手动填写）</option>
@@ -873,7 +772,7 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <input
-                    v-model="embedBaseUrl"
+                    v-model="embed.state.baseUrl"
                     class="input"
                     placeholder="https://api.openai.com/v1"
                   />
@@ -887,7 +786,7 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <input
-                    v-model="embedApiKey"
+                    v-model="embed.state.apiKey"
                     class="input"
                     type="password"
                     placeholder="留空不修改"
@@ -903,14 +802,14 @@ async function handleTest(type: string) {
                 <div class="settings-row__control settings-row__control--wide">
                   <select
                     v-if="embedUseSelect"
-                    v-model="embedModel"
+                    v-model="embed.state.model"
                     class="select"
                   >
                     <option v-for="m in embedModelOptions" :key="m" :value="m">{{ m }}</option>
                   </select>
                   <input
                     v-else
-                    v-model="embedModel"
+                    v-model="embed.state.model"
                     class="input"
                     placeholder="text-embedding-3-small"
                   />
@@ -934,7 +833,7 @@ async function handleTest(type: string) {
                     </div>
                     <div class="settings-row__control settings-row__control--narrow">
                       <input
-                        v-model.number="embedDimensions"
+                        v-model.number="embed.state.dimensions"
                         class="input"
                         type="number"
                         min="64"
@@ -963,7 +862,7 @@ async function handleTest(type: string) {
                   </span>
                 </div>
               </div>
-              <span v-if="embedModelsError" class="settings-row__error">{{ embedModelsError }}</span>
+              <span v-if="embed.state.modelsError" class="settings-row__error">{{ embed.state.modelsError }}</span>
             </div>
           </section>
 
@@ -978,9 +877,9 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <select
-                    :value="rerankProviderId"
+                    :value="rerank.state.providerId"
                     class="select"
-                    @change="(e) => { rerankProviderId = (e.target as HTMLSelectElement).value; onProviderChange('rerank', rerankProviderId) }"
+                    @change="(e) => rerank.applyPreset((e.target as HTMLSelectElement).value)"
                   >
                     <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                     <option :value="CUSTOM_PROVIDER_ID">自定义（手动填写）</option>
@@ -995,7 +894,7 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <input
-                    v-model="rerankBaseUrl"
+                    v-model="rerank.state.baseUrl"
                     class="input"
                     placeholder="https://api.siliconflow.cn/v1"
                   />
@@ -1009,7 +908,7 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <input
-                    v-model="rerankApiKey"
+                    v-model="rerank.state.apiKey"
                     class="input"
                     type="password"
                     placeholder="留空不修改"
@@ -1025,14 +924,14 @@ async function handleTest(type: string) {
                 <div class="settings-row__control settings-row__control--wide">
                   <select
                     v-if="rerankUseSelect"
-                    v-model="rerankModel"
+                    v-model="rerank.state.model"
                     class="select"
                   >
                     <option v-for="m in rerankModelOptions" :key="m" :value="m">{{ m }}</option>
                   </select>
                   <input
                     v-else
-                    v-model="rerankModel"
+                    v-model="rerank.state.model"
                     class="input"
                     placeholder="Pro/BAAI/bge-reranker-v2-m3"
                   />
@@ -1065,7 +964,7 @@ async function handleTest(type: string) {
                   </span>
                 </div>
               </div>
-              <span v-if="rerankModelsError" class="settings-row__error">{{ rerankModelsError }}</span>
+              <span v-if="rerank.state.modelsError" class="settings-row__error">{{ rerank.state.modelsError }}</span>
             </div>
           </section>
 
@@ -1080,9 +979,9 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <select
-                    :value="llmProviderId"
+                    :value="chat.state.providerId"
                     class="select"
-                    @change="(e) => { llmProviderId = (e.target as HTMLSelectElement).value; onProviderChange('chat', llmProviderId) }"
+                    @change="(e) => chat.applyPreset((e.target as HTMLSelectElement).value)"
                   >
                     <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                     <option :value="CUSTOM_PROVIDER_ID">自定义（手动填写）</option>
@@ -1097,7 +996,7 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <input
-                    v-model="llmBaseUrl"
+                    v-model="chat.state.baseUrl"
                     class="input"
                     placeholder="https://api.openai.com/v1"
                   />
@@ -1111,7 +1010,7 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--wide">
                   <input
-                    v-model="llmApiKey"
+                    v-model="chat.state.apiKey"
                     class="input"
                     type="password"
                     placeholder="留空不修改"
@@ -1127,14 +1026,14 @@ async function handleTest(type: string) {
                 <div class="settings-row__control settings-row__control--wide">
                   <select
                     v-if="llmUseSelect"
-                    v-model="llmModel"
+                    v-model="chat.state.model"
                     class="select"
                   >
                     <option v-for="m in llmModelOptions" :key="m" :value="m">{{ m }}</option>
                   </select>
                   <input
                     v-else
-                    v-model="llmModel"
+                    v-model="chat.state.model"
                     class="input"
                     placeholder="gpt-4o-mini"
                   />
@@ -1155,7 +1054,7 @@ async function handleTest(type: string) {
                 </div>
                 <div class="settings-row__control settings-row__control--narrow">
                   <input
-                    v-model.number="llmTemperature"
+                    v-model.number="chat.state.temperature"
                     class="input"
                     type="number"
                     step="0.1"
@@ -1184,7 +1083,7 @@ async function handleTest(type: string) {
                   </span>
                 </div>
               </div>
-              <span v-if="llmModelsError" class="settings-row__error">{{ llmModelsError }}</span>
+              <span v-if="chat.state.modelsError" class="settings-row__error">{{ chat.state.modelsError }}</span>
             </div>
           </section>
 

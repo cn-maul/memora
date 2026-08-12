@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, computed, watch, nextTick } from 'vue'
+import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useTagsStore } from '@/stores/tags'
@@ -14,6 +14,7 @@ import {
   type QueueStatus,
   type CommitFileStatus,
 } from '@/api/client'
+import ChatSurface from '@/components/ChatSurface.vue'
 import Icon, { type IconName } from '@/components/Icon.vue'
 
 const router = useRouter()
@@ -159,32 +160,25 @@ function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
 }
 const sidebarRef = ref<HTMLElement | null>(null)
-const chatRef = ref<HTMLElement | null>(null)
 const sidebarWidth = ref(260)
-const chatWidth = ref(320)
-const dragging = ref<'sidebar' | 'chat' | null>(null)
+const dragging = ref(false)
 
-function startDrag(target: 'sidebar' | 'chat', e: MouseEvent) {
-  const el = (target === 'sidebar' ? sidebarRef.value : chatRef.value) as HTMLElement | null
+function startDrag(e: MouseEvent) {
+  const el = sidebarRef.value as HTMLElement | null
   if (!el) return
   const sideEl = el
-  dragging.value = target
+  dragging.value = true
   document.body.style.cursor = 'col-resize'
   e.preventDefault()
 
   function onMove(ev: MouseEvent) {
-    if (target === 'sidebar') {
-      const w =
-        ev.clientX - sideEl.getBoundingClientRect().left + sidebarWidth.value - sideEl.offsetWidth
-      if (w >= 180 && w <= 420) sidebarWidth.value = w
-    } else {
-      const w = window.innerWidth - ev.clientX
-      if (w >= 280 && w <= 560) chatWidth.value = w
-    }
+    const w =
+      ev.clientX - sideEl.getBoundingClientRect().left + sidebarWidth.value - sideEl.offsetWidth
+    if (w >= 180 && w <= 420) sidebarWidth.value = w
   }
 
   function onUp() {
-    dragging.value = null
+    dragging.value = false
     document.body.style.cursor = ''
     document.removeEventListener('mousemove', onMove)
     document.removeEventListener('mouseup', onUp)
@@ -194,51 +188,10 @@ function startDrag(target: 'sidebar' | 'chat', e: MouseEvent) {
   document.addEventListener('mouseup', onUp)
 }
 
-// ── 对话输入 ────────
-const chatInput = ref('')
-const chatInputRef = ref<HTMLTextAreaElement | null>(null)
-const chatListRef = ref<HTMLElement | null>(null) // 消息列表容器，用于自动滚动
-const chatError = ref('')
-function autosize() {
-  const ta = chatInputRef.value
-  if (!ta) return
-  ta.style.height = 'auto'
-  ta.style.height = Math.min(ta.scrollHeight, 180) + 'px'
-}
-function scrollChatToBottom() {
-  nextTick(() => {
-    if (chatListRef.value) {
-      chatListRef.value.scrollTop = chatListRef.value.scrollHeight
-    }
-  })
-}
-// 新消息出现（发送消息 / 恢复历史会话）时始终滚到底部最新对话
-watch(
-  () => qa.messages.length,
-  () => {
-    scrollChatToBottom()
-  },
-)
-// 流式输出期间持续跟随滚动：等待回复时内容不断变长，始终停在最新内容处
-watch(
-  () => {
-    const last = qa.messages[qa.messages.length - 1]
-    return last ? last.content.length : 0
-  },
-  () => {
-    if (qa.sending) scrollChatToBottom()
-  },
-)
-// 侧栏对话显示（进入 /files 页）时确保停在最新消息，兼容恢复完成晚于面板渲染的场景
-watch(hideChatPanel, (hidden) => {
-  if (!hidden) scrollChatToBottom()
-})
-async function send() {
-  const text = chatInput.value.trim()
-  if (!text || qa.sending) return
-  chatInput.value = ''
-  autosize()
-  chatError.value = ''
+// ── 对话发送 ────────
+// 侧栏聊天统一收敛到 ChatSurface 组件渲染；此处仅转发用户输入给 qa store。
+function handleChatSend(text: string) {
+  if (!text.trim() || qa.sending) return
   // 侧栏始终按全局问答发送：若当前恢复的会话是 file 模式，先新建会话，
   // 避免把全局消息写进文件问答会话（review 发现：复用 sessionId 会混合模式）
   let sessionId: number | undefined = qa.currentSessionId ?? undefined
@@ -246,83 +199,7 @@ async function send() {
     const cur = qa.sessions.find((s) => s.id === sessionId)
     if (cur && cur.mode === 'file') sessionId = undefined
   }
-  await qa.send({ question: text, mode: 'global', sessionId })
-  // 发送后滚到底部（流式过程中由上面 watch 持续跟随）
-  scrollChatToBottom()
-  // 注：错误提示由 qa store 写入助手消息气泡，此处不再需要空消息兜底分支
-}
-function cancelSend() {
-  qa.cancel()
-}
-
-// 将答案中的文件引用转换为可点击链接
-function renderAnswer(text: string): string {
-  if (!text) return ''
-  // 先提取 [文件=路径, 段落=N] 引用占位，再转义其余文本，最后插入链接
-  const refs: { path: string; seq: string }[] = []
-  const placeholder = '\u0000REF\u0000'
-  // 路径贪婪匹配到 ]（允许含逗号），段落号为可选项。修复 L-3：路径含逗号被截断
-  const withPlaceholders = text.replace(/\[文件=([^\]]+?)(?:,\s*段落=(\d+))?\]/g, (_full, path, seq) => {
-    // 若路径本身以 ", 段落=N" 结尾（LLM 同时输出），剥离出来作为 seq
-    let p = (path || '').trim()
-    let s = seq || ''
-    const segMatch = p.match(/,\s*段落=(\d+)$/)
-    if (segMatch && !s) {
-      s = segMatch[1]
-      p = p.slice(0, segMatch.index).trim()
-    }
-    refs.push({ path: p, seq: s })
-    return placeholder
-  })
-  // 转义非引用部分
-  let html = withPlaceholders
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-  // 把占位替换回链接；ref.path 来自 LLM 输出（prompt injection 可控）。
-  // 链接文本 HTML 转义，路径经 URL 编码后放 data-* 属性，点击由根元素事件委托处理——
-  // 不把用户数据拼进任何内联 JS 字符串（消除 onclick 注入面）。
-  html = html.replace(new RegExp(placeholder, 'g'), () => {
-    const ref = refs.shift()
-    if (!ref) return ''
-    const encoded = encodeURIComponent(ref.path)
-    const safePath = ref.path
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;')
-    return `<a class="chat-file-link" href="/files?highlight=${encoded}" data-path="${encoded}">📄 ${safePath}${ref.seq ? ` (§${ref.seq})` : ''}</a>`
-  })
-  // 处理换行
-  html = html.replace(/\n/g, '<br>')
-  return html
-}
-function formatChatTime(ms?: number) {
-  if (!ms) return ''
-  const d = new Date(ms)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-// 聊天文件引用链接的点击委托处理（读取 data-path，避免内联 onclick 注入）
-function handleChatFileLinkClick(e: MouseEvent) {
-  const target = (e.target as HTMLElement | null)?.closest?.('a.chat-file-link') as HTMLAnchorElement | null
-  if (!target) return
-  e.preventDefault()
-  const raw = target.getAttribute('data-path')
-  if (!raw) return
-  let relPath = ''
-  try {
-    relPath = decodeURIComponent(raw)
-  } catch {
-    return
-  }
-  ;(window as any).__navigateToFile?.(relPath)
-}
-function newChat() {
-  qa.currentSessionId = null
-  qa.messages = []
-  chatError.value = ''
+  qa.send({ question: text, mode: 'global', sessionId })
 }
 
 // ──────── 明暗模式 ────────
@@ -349,20 +226,8 @@ onMounted(async () => {
   await ws.fetchInfo()
 // 自动恢复上一次 AI 对话到侧栏聊天（需求：再次打开软件显示上次会话，而不是空的新对话）
 	qa.restoreLastSession().then(() => {
-		// 恢复完成后滚动到最新对话（restore 是异步的，必须等消息真正载入后再滚）
-		scrollChatToBottom()
+		// 侧栏聊天由 ChatSurface 渲染，恢复完成后由其内部逻辑滚动到最新对话
 	}).catch(() => {})
-  // 挂载文件导航函数到 window，供 renderAnswer 生成的链接使用
-  ;(window as any).__navigateToFile = (relPath: string) => {
-    ;(window as any).__highlightFile = relPath
-    // 带 query 跳转：已在 /files 页时 query 变化会触发 AllFilesPage 的 watch，
-    // 不在 /files 时挂载后 onMounted 读 query.highlight——两种场景都能高亮。
-    // 修复：之前 push('/files') 无 query，已在文件页时组件不重挂载导致高亮失效。
-    router.push({ path: '/files', query: { highlight: relPath } })
-  }
-  // 文件引用链接事件委托：点击 .chat-file-link 时从 data-path 读取路径导航。
-  // 用事件委托而非内联 onclick，避免用户数据进入 JS 字符串（防注入）。
-  document.addEventListener('click', handleChatFileLinkClick)
   cleanupSSE = createSSEConnection((topic: string, data: any) => {
     if (topic === 'index_progress' && data) {
       // 仅处理 FullReindex 的事件（带 phase 字段：reset/processing/done）。
@@ -432,7 +297,6 @@ onUnmounted(() => {
   if (queueTimer) clearInterval(queueTimer)
   if (reindexDoneTimer) clearTimeout(reindexDoneTimer)
   if (incrementalRefreshTimer) clearTimeout(incrementalRefreshTimer)
-  document.removeEventListener('click', handleChatFileLinkClick)
 })
 </script>
 
@@ -530,8 +394,8 @@ onUnmounted(() => {
     <div
       v-show="!hideSidePanels"
       class="drag-handle"
-      :class="{ dragging: dragging === 'sidebar' }"
-      @mousedown="startDrag('sidebar', $event)"
+      :class="{ dragging }"
+      @mousedown="startDrag"
     ></div>
 
     <!-- 路由出口 -->
@@ -539,96 +403,18 @@ onUnmounted(() => {
       <router-view />
     </main>
 
-    <div
-      v-show="!hideSidePanels && !hideChatPanel"
-      class="drag-handle chat-handle"
-      :class="{ dragging: dragging === 'chat' }"
-      @mousedown="startDrag('chat', $event)"
-    ></div>
-
     <!-- 右侧：对话区（仅主页 /files 显示） -->
     <aside
       v-show="!hideSidePanels && !hideChatPanel"
-      ref="chatRef"
       class="chat-panel"
-      :style="{ width: chatWidth + 'px' }"
     >
-      <div v-if="qa.messages.length === 0" class="chat-greeting">
-        <div class="greeting-avatar">
-          <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="8.5" cy="10.5" r="1.5" fill="#fff"/><circle cx="15.5" cy="10.5" r="1.5" fill="#fff"/><path d="M12 17.5c2.33 0 4.32-1.45 5.12-3.5H6.88c.8 2.05 2.79 3.5 5.12 3.5z" fill="#fff"/></svg>
-        </div>
-        <span class="greeting-text">向文档提问，获取基于内容的回答</span>
-      </div>
-
-      <div v-else ref="chatListRef" class="chat-messages">
-        <div v-for="msg in qa.messages" :key="msg.id" class="chat-msg" :class="`chat-msg--${msg.role}`">
-          <div class="chat-msg__role">{{ msg.role === 'user' ? '你' : 'Memora' }}</div>
-          <div class="chat-msg__content">
-            <details v-if="msg.thinking" class="chat-thinking" open>
-              <summary>思考过程</summary>
-              <div class="chat-thinking__body">{{ msg.thinking }}</div>
-            </details>
-            <template v-if="msg.role === 'assistant' && !msg.content && qa.sending">
-              <span class="chat-msg__thinking">正在思考</span>
-              <span class="chat-msg__dots"><span></span><span></span><span></span></span>
-            </template>
-            <template v-else>
-              <span v-html="renderAnswer(msg.content)"></span>
-            </template>
-          </div>
-          <div class="chat-msg__time">{{ formatChatTime(msg.createdAt) }}</div>
-        </div>
-      </div>
-
-      <div v-if="chatError" class="alert alert--error chat-error">{{ chatError }}</div>
-
-      <div class="input-area">
-        <div class="input-box">
-          <textarea
-            ref="chatInputRef"
-            v-model="chatInput"
-            class="input-textarea"
-            :placeholder="qa.sending ? '等待回答…' : '输入问题…'"
-            :disabled="qa.sending"
-            rows="1"
-            @input="autosize"
-            @keydown.enter.exact.prevent="send"
-          ></textarea>
-          <div class="input-toolbar">
-            <div class="input-toolbar-right">
-              <button
-                v-if="qa.sending"
-                class="send-btn send-btn--cancel"
-                title="中止"
-                @click="cancelSend"
-              >
-                <svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-              </button>
-              <button
-                v-else
-                class="send-btn"
-                :class="{ 'has-content': chatInput.trim().length > 0 }"
-                title="发送"
-                :disabled="!chatInput.trim()"
-                @click="send"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div class="quick-actions">
-          <button class="quick-chip" @click="newChat">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-            新对话
-          </button>
-          <button class="quick-chip" @click="router.push('/qa')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-8 8H5l-3 2 1-3.5A8 8 0 1 1 21 12z"/></svg>
-            详细问答
-          </button>
-        </div>
-      </div>
+      <template v-if="!hideChatPanel">
+        <ChatSurface
+          :messages="qa.messages as any[]"
+          :sending="qa.sending"
+          @send="handleChatSend"
+        />
+      </template>
     </aside>
 
     <!-- 手动提交对话框（小白友好：备注可选，留空也能保存） -->
@@ -772,7 +558,6 @@ onUnmounted(() => {
 }
 .app-main > :deep(.settings-layout),
 .app-main > :deep(.workspace-page),
-.app-main > :deep(.all-files-page),
 .app-main > :deep(.index-page),
 .app-main > :deep(.timeline-page),
 .app-main > :deep(.qa-page),
@@ -1302,363 +1087,7 @@ onUnmounted(() => {
   background: var(--c-bg-page);
   position: relative;
   overflow: hidden;
-}
-
-.chat-greeting {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin: 28px 20px;
-  flex-direction: column;
-  text-align: center;
-  flex: 1;
-  justify-content: center;
-}
-.greeting-avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: var(--r-md);
-  background: var(--c-brand);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.greeting-avatar svg {
-  width: 22px;
-  height: 22px;
-  color: var(--c-on-brand);
-}
-.greeting-text {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--c-text-tertiary);
-  letter-spacing: 0.3px;
-  text-align: center;
-  line-height: 1.5;
-}
-
-/* 聊天消息列表 */
-.chat-messages {
-  flex: 1;
-  overflow-y: auto;
-  padding: 12px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  scroll-behavior: smooth;
-}
-
-.chat-msg {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-width: 100%;
-  min-width: 0;
-}
-
-.chat-msg--user {
-  align-items: flex-end;
-}
-
-.chat-msg--assistant {
-  align-items: flex-start;
-}
-
-.chat-msg__role {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--c-text-tertiary);
-  padding: 0 2px;
-}
-
-.chat-msg__content {
-  padding: 8px 12px;
-  border-radius: var(--r-md);
-  font-size: 13px;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  overflow-wrap: break-word;
-  word-break: break-word;
-  max-width: 100%;
-  color: var(--c-text-secondary);
-}
-
-.chat-msg--user .chat-msg__content {
-  background: var(--c-brand);
-  color: var(--c-on-brand);
-  border-bottom-right-radius: 3px;
-}
-
-.chat-msg--assistant .chat-msg__content {
-  background: var(--c-bg-panel);
-  border: 1px solid var(--c-border);
-  border-bottom-left-radius: 3px;
-}
-
-.chat-msg__time {
-  font-size: 10px;
-  color: var(--c-text-tertiary);
-  padding: 0 4px;
-}
-
-/* 思考过程折叠区（推理模型思维链，流式期间实时展示） */
-.chat-thinking {
-  margin-bottom: 6px;
-  background: var(--c-bg-page);
-  border: 1px dashed var(--c-border);
-  border-radius: var(--r-sm);
-  padding: 6px 10px;
-  font-size: 12px;
-  color: var(--c-text-tertiary);
-  line-height: 1.55;
-}
-
-.chat-thinking summary {
-  cursor: pointer;
-  user-select: none;
-  font-weight: 600;
-  color: var(--c-text-secondary);
-}
-
-.chat-thinking__body {
-  margin-top: 4px;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.chat-error {
-  margin: 0 14px 8px;
-  flex-shrink: 0;
-}
-
-/* 输入框 */
-.input-area {
-  width: 100%;
-  max-width: 100%;
-  padding: 0 12px 12px;
-  flex-shrink: 0;
-}
-.input-box {
-  background: var(--c-bg-panel);
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-lg);
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  transition: border-color 0.15s, box-shadow 0.15s;
-}
-.input-box:focus-within {
-  border-color: var(--c-brand-border);
-  box-shadow: 0 0 0 2px var(--c-brand-soft);
-}
-.input-textarea {
-  width: 100%;
-  min-height: 52px;
-  max-height: 180px;
-  resize: none;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: var(--c-text-primary);
-  font-size: 14px;
-  line-height: 1.6;
-  padding: 14px 16px 4px;
-  font-family: inherit;
-}
-.input-textarea::placeholder {
-  color: var(--c-text-tertiary);
-}
-.input-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px 10px;
-}
-.input-toolbar-left {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.input-toolbar-right {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-}
-.toolbar-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: var(--r-md);
-  color: var(--c-icon-secondary);
-  transition: background 0.1s;
-}
-.toolbar-btn:hover {
-  background: var(--c-bg-hover);
-  color: var(--c-text-secondary);
-}
-.toolbar-btn svg {
-  width: 16px;
-  height: 16px;
-}
-.toolbar-label {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  color: var(--c-brand);
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: var(--r-sm);
-  transition: background 0.1s;
-}
-.toolbar-label:hover {
-  background: var(--c-brand-soft);
-}
-.toolbar-label svg {
-  width: 13px;
-  height: 13px;
-}
-.toolbar-model {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11.5px;
-  color: var(--c-icon-secondary);
-  padding: 4px 8px;
-  border-radius: var(--r-sm);
-  cursor: pointer;
-  transition: background 0.1s;
-  max-width: 140px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.toolbar-model:hover {
-  background: var(--c-bg-hover);
-}
-.toolbar-model svg {
-  width: 13px;
-  height: 13px;
-  flex-shrink: 0;
-}
-.toolbar-model__text {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.send-btn {
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  background: var(--c-brand);
-  color: var(--c-on-brand);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.1s, transform 0.08s;
-  opacity: 0.55;
-}
-.send-btn:hover {
-  background: var(--c-brand-hover);
-}
-.send-btn:active {
-  transform: scale(0.92);
-}
-.send-btn.has-content {
-  opacity: 1;
-}
-.send-btn svg {
-  width: 14px;
-  height: 14px;
-}
-.send-btn--cancel {
-  background: var(--c-danger);
-  opacity: 1;
-}
-.send-btn--cancel:hover {
-  background: var(--c-danger);
-}
-
-.chat-msg__thinking {
-  color: var(--c-icon-secondary);
-  font-size: 13px;
-}
-.chat-msg__dots {
-  display: inline-flex;
-  gap: 3px;
-  margin-left: 4px;
-  vertical-align: middle;
-}
-.chat-msg__dots span {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--c-text-tertiary);
-  animation: chat-dot 1.2s infinite ease-in-out;
-}
-.chat-msg__dots span:nth-child(2) {
-  animation-delay: 0.2s;
-}
-.chat-msg__dots span:nth-child(3) {
-  animation-delay: 0.4s;
-}
-@keyframes chat-dot {
-  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
-  40% { opacity: 1; transform: translateY(-3px); }
-}
-
-.chat-file-link {
-  color: var(--c-info);
-  text-decoration: none;
-  font-size: 12.5px;
-  padding: 1px 4px;
-  border-radius: var(--r-xs);
-  background: var(--c-info-soft);
-  white-space: nowrap;
-}
-.chat-file-link:hover {
-  color: var(--c-info);
-  background: var(--c-info-soft);
-}
-
-/* 快捷操作 */
-.quick-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 16px;
-  justify-content: center;
-  flex-wrap: wrap;
-}
-.quick-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 30px;
-  padding: 0 12px;
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-xl);
-  background: var(--c-bg-hover);
-  color: var(--c-text-tertiary);
-  font-size: 12px;
-  cursor: pointer;
-  transition: all 0.12s;
-  white-space: nowrap;
-}
-.quick-chip:hover {
-  border-color: var(--c-brand-border);
-  color: var(--c-text-secondary);
-  background: var(--c-brand-soft);
-}
-.quick-chip svg {
-  width: 13px;
-  height: 13px;
-  opacity: 0.7;
+  width: 320px;
 }
 
 /* ── 首次使用引导 toast ── */

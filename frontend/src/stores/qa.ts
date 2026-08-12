@@ -31,6 +31,8 @@ export const useQAStore = defineStore('qa', () => {
   }
 
   async function selectSession(id: number) {
+    generation.value++ // 切换会话：使旧请求的流式响应无效
+    sendSeq.value++
     currentSessionId.value = id
     try {
       localStorage.setItem(LAST_SESSION_KEY, String(id))
@@ -84,6 +86,7 @@ export const useQAStore = defineStore('qa', () => {
   }
 
   const sendSeq = ref(0)
+  const generation = ref(0) // 递增的请求令牌，切换/新建会话时递增，使过期流式响应无效
 
   // 流式节流状态（store 级，供 cancel() 清理，防跨会话污染）
   // 思考过程块前缀与后端 contract.ThinkChunkPrefix 一致（\x00MTHINK\x00），
@@ -140,17 +143,19 @@ export const useQAStore = defineStore('qa', () => {
     messages.value.push(assistantMsg)
     activeAsstMsg = assistantMsg
 
-    // 中止控制器
+    // 中止旧请求并创建新控制器
+    abortCtrl.value?.abort()
     const ctrl = new AbortController()
     abortCtrl.value = ctrl
     const mySeq = ++sendSeq.value
+    const currentGen = ++generation.value
 
     try {
       await new Promise<void>((resolve) => {
         askQuestionStream(
           params,
           (chunk) => {
-            if (mySeq !== sendSeq.value) return
+            if (generation.value !== currentGen || mySeq !== sendSeq.value) return
             if (chunk.startsWith(THINK_PREFIX)) {
               thinkPending += chunk.slice(THINK_PREFIX.length)
             } else {
@@ -167,7 +172,7 @@ export const useQAStore = defineStore('qa', () => {
             }
           },
           (result) => {
-            if (mySeq !== sendSeq.value) return
+            if (generation.value !== currentGen || mySeq !== sendSeq.value) return
             flush(mySeq) // 立即刷新未写入的增量
             if (result.sessionId && !currentSessionId.value) {
               currentSessionId.value = result.sessionId
@@ -178,7 +183,7 @@ export const useQAStore = defineStore('qa', () => {
             resolve()
           },
           (err) => {
-            if (mySeq !== sendSeq.value) return
+            if (generation.value !== currentGen || mySeq !== sendSeq.value) return
             flush(mySeq)
             const cur = activeAsstMsg
             if (!cur) {
@@ -219,6 +224,22 @@ export const useQAStore = defineStore('qa', () => {
     sending.value = false
   }
 
+  // 新建空会话：递增请求令牌使旧请求的流式响应、增量刷新全部失效，
+  // 避免"发送中新建会话，旧回答完成后覆盖新会话"（P1-07）
+  function newSession() {
+    generation.value++
+    sendSeq.value++
+    if (flushTimer) {
+      clearTimeout(flushTimer)
+      flushTimer = null
+    }
+    pending = ''
+    thinkPending = ''
+    activeAsstMsg = null
+    currentSessionId.value = null
+    messages.value = []
+  }
+
   async function removeSession(id: number) {
     try {
       await deleteQASession(id)
@@ -246,6 +267,7 @@ export const useQAStore = defineStore('qa', () => {
     skipRestore,
     send,
     cancel,
+    newSession,
     removeSession,
   }
 })

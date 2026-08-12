@@ -88,23 +88,6 @@ export interface SearchResult {
   matchedChunks: number
 }
 
-export interface TimelineNode {
-  bucket: string
-  label: string
-  count: number
-  added: number
-  modified: number
-  deleted: number
-  summary?: string
-  files: TimelineFile[]
-}
-
-export interface TimelineFile {
-  relPath: string
-  mtime: number
-  commitHash?: string
-}
-
 export interface QASession {
   id: number
   createdAt: number

@@ -15,7 +15,6 @@ import type {
   TagInfo,
   TagSuggestion,
   SearchResult,
-  TimelineNode,
   QASession,
   QAMessage,
   StatsMetrics,
@@ -283,18 +282,6 @@ export async function acceptSuggestion(id: number): Promise<void> {
 
 export async function rejectSuggestion(id: number): Promise<void> {
   await http.post(`/tag-suggestions/${id}/reject`)
-}
-
-// ──────── 时间线 ────────
-
-export async function getTimeline(params: {
-  granularity?: string
-  tag?: string
-  from?: number
-  to?: number
-}): Promise<TimelineNode[]> {
-  const { data } = await http.get<ApiResponse<{ nodes: TimelineNode[] }>>('/timeline', { params })
-  return unwrapData<{ nodes: TimelineNode[] }>(data).nodes
 }
 
 // ──────── 问答 ────────

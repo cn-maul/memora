@@ -11,11 +11,6 @@ import (
 	"memora/internal/logx"
 )
 
-// IIndex search 模块所需的 index 接口
-type IIndex interface {
-	Query(vec []float32, topK int, tagFilter []string) ([]contract.SearchResult, error)
-}
-
 // ILLM search 模块所需的 llm 接口
 type ILLM interface {
 	Embed(texts []string) ([][]float32, error)
@@ -36,15 +31,13 @@ type IStorage interface {
 
 // Module 搜索模块
 type Module struct {
-	index   IIndex
 	llm     ILLM
 	storage IStorage
 }
 
 // New 创建搜索模块
-func New(index IIndex, llm ILLM, storage IStorage) *Module {
+func New(llm ILLM, storage IStorage) *Module {
 	return &Module{
-		index:   index,
 		llm:     llm,
 		storage: storage,
 	}

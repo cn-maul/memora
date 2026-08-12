@@ -147,7 +147,6 @@ type SearchAPI interface {
 
 // TimelineAPI timeline 模块接口
 type TimelineAPI interface {
-	Get(q *contract.TimelineQuery) ([]*contract.TimelineNode, error)
 	GenerateSummary(commitHash string) (string, error)
 	SuggestCommitMessage() (string, error) // AI 根据未提交变动生成提交备注
 	Restore(relPath, hash string) error
@@ -158,7 +157,6 @@ type QAAPI interface {
 	Ask(req *contract.QARequest) (*contract.QAResponse, error)
 	AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-chan string, <-chan *contract.QAResponse)
 	Sessions() ([]*contract.QASession, error)
-	NewSesion(mode string, fileID int64) (int64, error)
 	DeleteSession(id int64) error
 }
 
@@ -492,9 +490,6 @@ func (m *Module) registerRoutes() {
 	m.mux.HandleFunc("/api/tags", m.handleTags)
 	m.mux.HandleFunc("/api/tag-suggestions", m.handleTagSuggestions)
 	m.mux.HandleFunc("/api/tag-suggestions/", m.handleTagSuggestions)
-
-	// 时间线
-	m.mux.HandleFunc("/api/timeline", m.handleTimeline)
 
 	// 文件历史版本下载
 	m.mux.HandleFunc("/api/files/download-history", m.handleFileDownloadHistory)
@@ -1669,47 +1664,6 @@ func (m *Module) handleFilesRecent(w http.ResponseWriter, r *http.Request) {
 		"window": window,
 		"items":  items,
 	})
-}
-
-// handleTimeline GET /api/timeline
-func (m *Module) handleTimeline(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, "bad_request", "仅支持 GET", http.StatusBadRequest)
-		return
-	}
-	// 工作区未初始化时 Git 日志无意义,明确返回 not_configured 而非 500
-	if m.workspacePath() == "" {
-		writeError(w, "not_configured", "工作区未初始化", http.StatusBadRequest)
-		return
-	}
-
-	granularity := getQueryParam(r, "granularity")
-	if granularity == "" {
-		granularity = "day"
-	}
-	tag := getQueryParam(r, "tag")
-	from := getQueryInt(r, "from", 0)
-	to := getQueryInt(r, "to", 0)
-
-	var tagFilter []string
-	if tag != "" {
-		tagFilter = []string{tag}
-	}
-
-	q := &contract.TimelineQuery{
-		Granularity: granularity,
-		TagFilter:   tagFilter,
-		From:        int64(from),
-		To:          int64(to),
-	}
-
-	nodes, err := m.handler.Timeline.Get(q)
-	if err != nil {
-		writeContractError(w, err)
-		return
-	}
-
-	writeOK(w, map[string]interface{}{"nodes": nodes})
 }
 
 // handleQASessions GET /api/qa/sessions

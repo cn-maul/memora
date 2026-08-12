@@ -3,7 +3,9 @@
 package qa
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -77,8 +79,23 @@ func New(storage IStorage, llm ILLM, events IEvents, maxContextChars int) *Modul
 	}
 }
 
-// Ask 问答（§4.12 内部流程）
-func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
+// QASink 流式问答输出槽：把流水线产生的增量逐块交给调用方。
+// OnChunk 收到每个原始块（内容块或带 ThinkChunkPrefix 的思考块，逐字透传）；
+// Canceled 返回是否已取消（nil 视为永不取消）。sink == nil 表示非流式模式。
+type QASink struct {
+	OnChunk  func(chunk string)
+	Canceled func() bool
+}
+
+// errCanceled 统一的"已取消"哨兵错误：流式管道在任意取消点返回它，
+// 由 AskStream 包装层转换成 done{Error: "已取消"}（与取消响应线协议一致）。
+var errCanceled = errors.New("已取消")
+
+// Execute 统一问答流水线（Ask 与 AskStream 的单一实现，P2-06）。
+// sink == nil → 非流式：走 LLM.Chat，错误直接返回（Ask 使用）；
+// sink != nil → 流式：走 LLM.ChatStream 逐块输出，取消/错误由调用方转成 done 响应（AskStream 使用）。
+// ctx 同样参与取消：任意环节 ctx 取消或 sink.Canceled() 为真时，回滚新建会话并返回 errCanceled。
+func (m *Module) Execute(ctx context.Context, req *contract.QARequest, sink *QASink) (*contract.QAResponse, error) {
 	if req.Question == "" {
 		return nil, fmt.Errorf("[qa] 问题不能为空")
 	}
@@ -118,23 +135,29 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 			return nil, fmt.Errorf("[qa] 保存问答失败: %w", err)
 		}
 		m.events.Notify("qa_ready", map[string]interface{}{"sessionId": sessionID})
+		// 流式：把"未找到"文本也按普通内容块推给 sink（AskStream 直通 ch 的等价物）
+		if err := emitChunk(ctx, sink, notFound); err != nil {
+			if newSession {
+				_ = m.storage.QASessionsDelete(sessionID)
+			}
+			return nil, err
+		}
 		return &contract.QAResponse{Answer: notFound, SessionID: sessionID}, nil
 	}
 
 	userPrompt := fmt.Sprintf("%s\n\n问题：%s", contextStr, req.Question)
 
-	answer, err := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
+	// 模型回答：唯一的 LLM 环节——非流式单次 Chat；流式 ChatStream + 空回答重试
+	answer, err := m.generateAnswer(ctx, req, userPrompt, sink)
 	if err != nil {
 		// 失败回滚：若是本次新建的会话则整会话删除，避免留下孤立空会话（修复 M-03）
 		if newSession {
 			_ = m.storage.QASessionsDelete(sessionID)
 		}
+		if err == errCanceled {
+			return nil, errCanceled
+		}
 		return nil, fmt.Errorf("[qa] 问答失败: %w", err)
-	}
-
-	// 空回答防御：与 AskStream 一致，LLM 返回空/纯空白时给出明确提示（review nit）
-	if strings.TrimSpace(answer) == "" {
-		answer = "（模型未返回内容。请确认模型服务正常、文件已成功索引，或换个问法重试。）"
 	}
 
 	// 把回答里的文件路径（含反引号/裸路径）规整为 [文件=path] 标记，保证前端可点击（修复：检索到文件却没超链接）
@@ -163,8 +186,90 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 	}, nil
 }
 
+// generateAnswer 调 LLM 生成回答（Execute 内部的 LLM 环节）。
+// 非流式（sink == nil）：单次 Chat，空回答给出明确提示；
+// 流式：ChatStream 逐块输出（思考块透传不计数），空流用非流式 Chat 重试兜底。
+func (m *Module) generateAnswer(ctx context.Context, req *contract.QARequest, userPrompt string, sink *QASink) (string, error) {
+	// 非流式：单次 Chat
+	if sink == nil {
+		answer, err := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
+		if err != nil {
+			return "", err
+		}
+		// 空回答防御：LLM 返回空/纯空白时给出明确提示（review nit）
+		if strings.TrimSpace(answer) == "" {
+			return "（模型未返回内容。请确认模型服务正常、文件已成功索引，或换个问法重试。）", nil
+		}
+		return answer, nil
+	}
+
+	// 流式：ChatStream + 逐块输出，取消通道合并 ctx 与 sink.Canceled
+	chunks, err := m.llm.ChatStream(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens}, streamCancel(ctx, sink))
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	for chunk := range chunks {
+		if strings.HasPrefix(chunk, "__ERROR__:") {
+			// __ERROR__: 哨兵块：中止，错误携带已累计的内容与上游错误信息
+			sb.WriteString(strings.TrimPrefix(chunk, "__ERROR__:"))
+			return "", errors.New(sb.String())
+		}
+		if strings.HasPrefix(chunk, contract.ThinkChunkPrefix) {
+			// 思考过程块（推理模型思维链）：转发给前端实时渲染，但不计入最终回答
+			// （answer 仅含 delta.content，避免思维链被持久化进会话消息）。
+			if err := emitChunk(ctx, sink, chunk); err != nil {
+				return "", err
+			}
+			continue
+		}
+		sb.WriteString(chunk)
+		if err := emitChunk(ctx, sink, chunk); err != nil {
+			return "", err
+		}
+	}
+
+	answer := sb.String()
+
+	// 空回答防御：流式返回空/纯空白时，用非流式 Chat 重试一次兜底。
+	// 修复：部分端点流式格式不标准（如 message 字段、空 delta）导致流式内容为空，
+	// 直接给提示无法自愈；非流式重试可拿到完整回答。
+	if strings.TrimSpace(answer) == "" {
+		// 重试前检查取消：非流式 Chat 无法中途打断，取消后不应再发起重试（review 发现）
+		if canceled(ctx, sink) {
+			return "", errCanceled
+		}
+
+		logx.Warn("qa", "流式回答为空，改用非流式重试", "question", req.Question)
+		retried, rerr := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
+		// 重试完成后再次检查取消：用户中止时丢弃重试结果，不写入会话（review 发现）
+		if canceled(ctx, sink) {
+			return "", errCanceled
+		}
+		if rerr != nil {
+			// 非流式也失败：返回真实错误而非"未返回内容"，便于排查
+			return "", fmt.Errorf("模型未返回内容且重试失败: %v", rerr)
+		}
+		if strings.TrimSpace(retried) != "" {
+			// 保持 AskStream 既有线上行为：重试结果只在 done 携带，不重新流式输出
+			answer = retried
+		} else {
+			answer = "（模型未返回内容。请确认模型服务正常、文件已成功索引，或换个问法重试。）"
+		}
+	}
+
+	return answer, nil
+}
+
+// Ask 问答（§4.12 内部流程，非流式：sink 为空）
+func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
+	return m.Execute(context.Background(), req, nil)
+}
+
 // AskStream 流式问答。ch 返回内容增量，done 携带最终结果（含 sessionId 与 sources）。
-// 调用方可通过 cancel 中止。
+// 调用方可通过 cancel 中止。内部为 Execute 的流式包装：sink 把块转发到 ch、
+// 取消状态透传给流水线，错误/结果统一转成 done 响应。
 func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-chan string, <-chan *contract.QAResponse) {
 	ch := make(chan string, 32)
 	done := make(chan *contract.QAResponse, 1)
@@ -173,178 +278,100 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 		defer close(ch)
 		defer close(done)
 
-		if req.Question == "" {
-			done <- &contract.QAResponse{Error: "[qa] 问题不能为空"}
-			return
-		}
-
-		// 创建或复用会话
-		sessionID := req.SessionID
-		newSession := sessionID == 0
-		if newSession {
-			id, err := m.storage.QASessionsCreate(req.Mode, req.FileID)
-			if err != nil {
-				done <- &contract.QAResponse{Error: fmt.Sprintf("[qa] 创建会话失败: %v", err)}
-				return
-			}
-			sessionID = id
-		}
-
-		contextBlocks, sources, err := m.buildContext(req)
-		if err != nil {
-			if newSession {
-				_ = m.storage.QASessionsDelete(sessionID)
-			}
-			done <- &contract.QAResponse{Error: err.Error()}
-			return
-		}
-
-		contextStr := strings.Join(contextBlocks, "\n\n")
-
-		// 空上下文短路：不调用 LLM，直接输出"未找到"
-		if len(contextBlocks) == 0 {
-			notFound := "根据现有文档，未找到相关信息。"
-			if _, _, err := m.storage.SaveExchange(sessionID, req.Mode, req.FileID, req.Question, notFound, "[]", time.Now().UnixMilli()); err != nil {
-				if newSession {
-					_ = m.storage.QASessionsDelete(sessionID)
-				}
-				done <- &contract.QAResponse{Error: fmt.Sprintf("保存问答失败: %v", err)}
-				return
-			}
-			m.events.Notify("qa_ready", map[string]interface{}{"sessionId": sessionID})
+		// 取消传播：调用方 cancel 触发时取消 ctx，供 Execute 的 ctx.Done() 与 sink.Canceled() 感知
+		ctx, cancelCtx := context.WithCancel(context.Background())
+		defer cancelCtx()
+		go func() {
 			select {
-			case ch <- notFound:
 			case <-cancel:
-				// 取消：发取消响应，避免 transport 走"成功完成"流程（修复 review should-fix）
-				// 若为本轮新建会话则整会话删除，避免留下孤立空会话（与 M-03 一致）
-				if newSession {
-					_ = m.storage.QASessionsDelete(sessionID)
-				}
-				done <- &contract.QAResponse{Error: "已取消"}
-				return
+				cancelCtx()
+			case <-ctx.Done():
 			}
-			done <- &contract.QAResponse{Answer: notFound, Sources: sources, SessionID: sessionID}
-			return
-		}
+		}()
 
-		userPrompt := fmt.Sprintf("%s\n\n问题：%s", contextStr, req.Question)
-
-		chunks, err := m.llm.ChatStream(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens}, cancel)
-		if err != nil {
-			if newSession {
-				_ = m.storage.QASessionsDelete(sessionID)
-			}
-			done <- &contract.QAResponse{Error: err.Error()}
-			return
-		}
-
-		var sb strings.Builder
-		for chunk := range chunks {
-			if strings.HasPrefix(chunk, "__ERROR__:") {
-				sb.WriteString(strings.TrimPrefix(chunk, "__ERROR__:"))
-				if newSession {
-					_ = m.storage.QASessionsDelete(sessionID)
-				}
-				done <- &contract.QAResponse{Error: sb.String()}
-				return
-			}
-			if strings.HasPrefix(chunk, contract.ThinkChunkPrefix) {
-				// 思考过程块（推理模型思维链）：转发给前端实时渲染，但不计入最终回答
-				// （answer 仅含 delta.content，避免思维链被持久化进会话消息）。
+		sink := &QASink{
+			OnChunk: func(chunk string) {
 				select {
 				case ch <- chunk:
 				case <-cancel:
-					if newSession {
-						_ = m.storage.QASessionsDelete(sessionID)
-					}
-					done <- &contract.QAResponse{Error: "已取消"}
-					return
+					// 客户端中途断开：丢弃该块，由 Execute 的取消检测兜底转成"已取消"
 				}
-				continue
-			}
-			sb.WriteString(chunk)
-			select {
-			case ch <- chunk:
-			case <-cancel:
-				// 客户端取消：向 done 发送取消响应而非直接 return，
-				// 否则 done 通道关闭时 transport 收到 nil 会 panic（修复审计高危）。
-				// 本轮新建的会话尚未写入任何消息，删除避免留下孤立空会话。
-				if newSession {
-					_ = m.storage.QASessionsDelete(sessionID)
+			},
+			Canceled: func() bool {
+				select {
+				case <-cancel:
+					return true
+				default:
 				}
-				done <- &contract.QAResponse{Error: "已取消"}
-				return
-			}
+				return false
+			},
 		}
 
-		answer := sb.String()
-
-		// 空回答防御：流式返回空/纯空白时，用非流式 Chat 重试一次兜底。
-		// 修复：部分端点流式格式不标准（如 message 字段、空 delta）导致流式内容为空，
-		// 直接给提示无法自愈；非流式重试可拿到完整回答。
-		if strings.TrimSpace(answer) == "" {
-			// 重试前检查取消：非流式 Chat 无法中途打断，取消后不应再发起重试（review 发现）
-			select {
-			case <-cancel:
-				if newSession {
-					_ = m.storage.QASessionsDelete(sessionID)
-				}
-				done <- &contract.QAResponse{Error: "已取消"}
-				return
-			default:
-			}
-
-			logx.Warn("qa", "流式回答为空，改用非流式重试", "question", req.Question)
-			retried, rerr := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
-			// 重试完成后再次检查取消：用户中止时丢弃重试结果，不写入会话（review 发现）
-			select {
-			case <-cancel:
-				if newSession {
-					_ = m.storage.QASessionsDelete(sessionID)
-				}
-				done <- &contract.QAResponse{Error: "已取消"}
-				return
-			default:
-			}
-			if rerr == nil && strings.TrimSpace(retried) != "" {
-				answer = retried
-			} else if rerr != nil {
-				// 非流式也失败：返回真实错误而非"未返回内容"，便于排查
-				if newSession {
-					_ = m.storage.QASessionsDelete(sessionID)
-				}
-				done <- &contract.QAResponse{Error: fmt.Sprintf("模型未返回内容且重试失败: %v", rerr)}
-				return
-			} else {
-				answer = "（模型未返回内容。请确认模型服务正常、文件已成功索引，或换个问法重试。）"
-			}
-		}
-
-		// 把回答里的文件路径（含反引号/裸路径）规整为 [文件=path] 标记，保证前端可点击（修复：检索到文件却没超链接）
-		answer = linkifySourceRefs(answer, sources)
-
-		// 保存消息（用户 + 助手），单事务原子写入（P1-12：失败不得发送成功终态）
-		sourcesJSON := marshalSources(sources)
-		sid, _, err := m.storage.SaveExchange(sessionID, req.Mode, req.FileID, req.Question, answer, sourcesJSON, time.Now().UnixMilli())
+		resp, err := m.Execute(ctx, req, sink)
 		if err != nil {
-			if newSession {
-				_ = m.storage.QASessionsDelete(sessionID)
-			}
-			done <- &contract.QAResponse{Error: fmt.Sprintf("保存问答失败: %v", err)}
+			done <- &contract.QAResponse{Error: err.Error()}
 			return
 		}
-		sessionID = sid
-
-		m.events.Notify("qa_ready", map[string]interface{}{"sessionId": sessionID})
-
 		done <- &contract.QAResponse{
-			Answer:    answer,
-			Sources:   sources,
-			SessionID: sessionID,
+			Answer:    resp.Answer,
+			Sources:   resp.Sources,
+			SessionID: resp.SessionID,
 		}
 	}()
 
 	return ch, done
+}
+
+// emitChunk 把流式块推给 sink，并在任意取消点中止：
+// 发送前检查一次、发送后再检查一次，保证"取消 → 立即停止"的语义
+// （等价于原 AskStream 每个 select 发送点的取消分支）。
+func emitChunk(ctx context.Context, sink *QASink, chunk string) error {
+	if sink == nil || sink.OnChunk == nil {
+		return nil
+	}
+	if canceled(ctx, sink) {
+		return errCanceled
+	}
+	sink.OnChunk(chunk)
+	if canceled(ctx, sink) {
+		return errCanceled
+	}
+	return nil
+}
+
+// canceled 判断是否已取消：ctx 取消，或 sink.Canceled() 为真（nil 视为永不取消）。
+func canceled(ctx context.Context, sink *QASink) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+	}
+	return sink != nil && sink.Canceled != nil && sink.Canceled()
+}
+
+// streamCancel 把 ctx 与 sink.Canceled 合并成 ChatStream 的取消通道：
+// 任一触发即关闭，通知 llm 模块打断流式请求（连接阶段/背退等待/读侧监视）。
+func streamCancel(ctx context.Context, sink *QASink) <-chan struct{} {
+	if sink == nil || sink.Canceled == nil {
+		return ctx.Done()
+	}
+	c := make(chan struct{})
+	go func() {
+		defer close(c)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if sink.Canceled() {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return c
 }
 
 // buildContext 构建问答上下文（单文件/全局 RAG），返回上下文块与来源
@@ -567,16 +594,6 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 // Sessions 列出所有会话
 func (m *Module) Sessions() ([]*contract.QASession, error) {
 	return m.storage.QASessionsList()
-}
-
-// NewSesion 创建新会话
-func (m *Module) NewSesion(mode string, fileID int64) (int64, error) {
-	return m.storage.QASessionsCreate(mode, fileID)
-}
-
-// ClearSesion 清空会话（暂不实现，用删除代替）
-func (m *Module) ClearSesion(id int64) error {
-	return m.storage.QASessionsDelete(id)
 }
 
 // DeleteSession 删除会话

@@ -2,11 +2,13 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
-import { browseDir, browseSearch, browseOpen, getFileHistory, downloadHistoryVersion, resolveFileId, getCommitList, getCommitFiles, restoreFile, getCommitFileContent } from '@/api/client'
+import { browseDir, browseSearch, browseOpen, downloadHistoryVersion, getCommitList, getCommitFiles, getCommitFileContent } from '@/api/client'
 import type { BrowseEntry, BrowseSearchItem, CommitItem, VersionFile } from '@/types'
 import TreeBranch, { type TreeNode } from '@/components/TreeBranch.vue'
 import Crumbs from '@/components/Crumbs.vue'
 import Icon, { type IconName } from '@/components/Icon.vue'
+import FileHistoryDialog from '@/components/FileHistoryDialog.vue'
+import { safeErrorMsg } from '@/utils/fileHistory'
 
 const router = useRouter()
 const route = useRoute()
@@ -35,24 +37,6 @@ const searchTotal = ref(0)
 const searching = ref(false)
 const showSearch = ref(false)
 const searchError = ref('') // 搜索失败提示（修复：失败不再静默误报"未找到"）
-
-// 下载/预览类请求失败时，错误体可能是 Blob、原始 HTTP 文本或完整 JSON body，
-// 一律映射为友好提示，绝不把原始内容展示给用户（修复：[object Blob]/body 泄漏）
-function safeErrorMsg(e: any, fallback: string): string {
-  const raw = e?.message
-  if (typeof raw !== 'string' || !raw.trim()) return fallback
-  const s = raw.trim()
-  if (/\[object (Blob|File)\]/.test(s) || /request failed with status code/i.test(s)) return fallback
-  if (/^[{[]/.test(s)) return fallback // 完整 JSON body 不直接展示
-  return s
-}
-
-// 文件未索引/不存在（not_found）属预期的"无版本历史"空态；其余失败需明确提示
-function isNotFound(e: any): boolean {
-  if (e?.code === 'not_found') return true
-  const m = String(e?.message || '')
-  return /文件不存在|未索引|not ?found/i.test(m)
-}
 
 // ── 提交版本浏览 ──
 // commitHash 为空 = 查看工作区（最新）；非空 = 查看某提交快照的全部文件
@@ -292,18 +276,6 @@ function clearSearch() {
 const openError = ref('')
 const openingPath = ref('')
 
-// 文件详情弹窗
-const detailEntry = ref<BrowseEntry | null>(null)
-const detailVersions = ref<Array<{ hash: string; time: number; message: string; author: string }>>([])
-const detailLoadingHistory = ref(false)
-const detailDownloading = ref<string | null>(null)
-const detailRestoring = ref<string | null>(null)
-const detailConfirmRestore = ref<{ hash: string; time: number; message: string } | null>(null)
-const detailFileId = ref(0)
-const detailError = ref('')
-const detailHistoryError = ref('') // 版本历史加载失败（非 not_found 时展示，修复：失败伪装"暂无版本"）
-const detailNotice = ref('')
-
 async function openFile(relPath: string) {
   openingPath.value = relPath
   openError.value = ''
@@ -316,88 +288,19 @@ async function openFile(relPath: string) {
   }
 }
 
-async function openDetailModal(e: BrowseEntry) {
+// 文件详情弹窗（版本历史 + 下载 + 一键恢复）由共享 FileHistoryDialog 承担
+const detailOpen = ref(false)
+const detailEntry = ref<BrowseEntry | null>(null)
+
+function openDetailModal(e: BrowseEntry) {
   detailEntry.value = e
-  detailVersions.value = []
-  detailError.value = ''
-  detailHistoryError.value = ''
-  detailNotice.value = ''
-  detailConfirmRestore.value = null
-  detailLoadingHistory.value = true
-  try {
-    const fileId = await resolveFileId(e.relPath)
-    detailFileId.value = fileId
-    const history = await getFileHistory(fileId)
-    detailVersions.value = history.commits
-      .map((c: any) => ({ hash: c.hash, time: c.time, message: c.message, author: c.author }))
-      .slice(0, 30)
-  } catch (err: any) {
-    if (isNotFound(err)) {
-      // 文件未索引则无版本历史，属预期空态
-      detailVersions.value = []
-    } else {
-      // 其它失败（网络/服务异常）明确提示，不伪装成"暂无版本"
-      detailVersions.value = []
-      detailHistoryError.value = err?.message || '加载版本历史失败'
-    }
-  } finally {
-    detailLoadingHistory.value = false
-  }
+  detailOpen.value = true
 }
 
-// 一键恢复：小白点「恢复」→ 行内确认 → 后端自动先保存当前状态再恢复
-function askRestore(v: { hash: string; time: number; message: string }) {
-  detailError.value = ''
-  detailNotice.value = ''
-  detailConfirmRestore.value = v
-}
-
-async function doRestore() {
-  const v = detailConfirmRestore.value
-  if (!v || detailFileId.value <= 0) return
-  detailRestoring.value = v.hash
-  detailError.value = ''
-  detailNotice.value = ''
-  try {
-    await restoreFile(detailFileId.value, v.hash)
-    detailConfirmRestore.value = null
-    detailNotice.value = '已恢复 ✓ 当前文件已还原为该版本（若此前有改动，已先自动保存）'
-  } catch (e: any) {
-    detailError.value = e.message || '恢复失败'
-  } finally {
-    detailRestoring.value = null
-  }
-}
-
-async function downloadVersion(version: { hash: string; time: number }) {
-  if (!detailEntry.value) return
-  detailDownloading.value = version.hash
-  try {
-    const blob = await downloadHistoryVersion(detailEntry.value.relPath, version.hash)
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    const extIdx = detailEntry.value.name.lastIndexOf('.')
-    const base = extIdx > 0 ? detailEntry.value.name.slice(0, extIdx) : detailEntry.value.name
-    const ext = extIdx > 0 ? detailEntry.value.name.slice(extIdx) : ''
-    a.download = `${base}-${version.hash.slice(0, 7)}${ext}`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    URL.revokeObjectURL(url)
-  } catch (e: any) {
-    detailError.value = safeErrorMsg(e, '下载失败，请重试')
-  } finally {
-    detailDownloading.value = null
-  }
-}
-
-function openFromDetail() {
-  if (detailEntry.value) {
-    const rel = detailEntry.value.relPath
-    detailEntry.value = null
-    openFile(rel)
-  }
+// 弹窗内「打开当前版本」→ 关闭弹窗并调起系统打开
+function onNavigateFile(relPath: string) {
+  detailOpen.value = false
+  openFile(relPath)
 }
 
 // ──────── 工具 ────────
@@ -640,77 +543,13 @@ function docIcon(e: BrowseEntry) {
     <div v-else-if="!ws.info" class="loading">加载工作区信息…</div>
     <div v-else class="empty-state">请先初始化工作区以浏览文件</div>
 
-    <!-- 文件详情弹窗 -->
-    <div v-if="detailEntry" class="modal-overlay" @click.self="detailEntry = null">
-      <div class="modal modal--detail">
-        <div class="modal-title">
-          <Icon :name="detailEntry.isDir ? 'folder' : docIcon(detailEntry)" :size="16" />
-          <span class="modal-title__name" :title="detailEntry.name">{{ detailEntry.name }}</span>
-        </div>
-        <div class="modal-meta">
-          <span class="modal-meta__item">
-            <Icon name="folder" :size="12" />
-            {{ detailEntry.isDir ? '文件夹' : (detailEntry.docType || '文件') }}
-          </span>
-          <span v-if="!detailEntry.isDir" class="modal-meta__item">
-            <Icon name="file" :size="12" />
-            {{ formatSize(detailEntry.size) }}
-          </span>
-          <span class="modal-meta__item">
-            <Icon name="clock" :size="12" />
-            {{ formatTime(detailEntry.mtime) }}
-          </span>
-        </div>
-
-        <div class="detail-section">
-          <div class="detail-section__head">
-            <span class="detail-section__title">版本历史</span>
-            <span class="detail-section__hint">每次自动提交即一个版本</span>
-          </div>
-          <div v-if="detailLoadingHistory" class="loading">加载历史中…</div>
-          <div v-else-if="detailHistoryError" class="alert alert--error">{{ detailHistoryError }}</div>
-          <div v-else-if="detailVersions.length === 0" class="detail-empty">暂无版本历史（该文件未发生过自动提交）</div>
-          <div v-else class="version-list">
-            <div v-for="(v, i) in detailVersions" :key="v.hash" class="version-item">
-              <span class="version-num">v{{ detailVersions.length - i }}</span>
-              <div class="version-info">
-                <div class="version-message" :title="v.message">{{ v.message }}</div>
-                <div class="version-meta">
-                  <span>{{ formatTime(v.time) }}</span>
-                  <span class="version-hash" :title="v.hash">{{ v.hash.slice(0, 7) }}</span>
-                </div>
-              </div>
-              <div class="version-actions">
-                <button class="btn btn-ghost btn-sm" @click="downloadVersion(v)" :disabled="detailDownloading === v.hash">
-                  <Icon name="download" :size="13" />
-                  {{ detailDownloading === v.hash ? '下载中…' : '下载' }}
-                </button>
-                <button class="btn btn-primary btn-sm" @click="askRestore(v)" :disabled="detailRestoring === v.hash">
-                  {{ detailRestoring === v.hash ? '恢复中…' : '恢复此版本' }}
-                </button>
-              </div>
-              <div v-if="detailConfirmRestore && detailConfirmRestore.hash === v.hash" class="restore-confirm">
-                <span class="restore-confirm__text">将把文件恢复为这个版本；若当前有未保存改动，会先自动保存。</span>
-                <div class="restore-confirm__actions">
-                  <button class="btn btn-primary btn-sm" :disabled="detailRestoring !== null" @click="doRestore">
-                    {{ detailRestoring === v.hash ? '恢复中…' : '确认恢复' }}
-                  </button>
-                  <button class="btn btn-ghost btn-sm" :disabled="detailRestoring !== null" @click="detailConfirmRestore = null">取消</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="detailNotice" class="alert alert--success">{{ detailNotice }}</div>
-        <div v-if="detailError" class="alert alert--error">{{ detailError }}</div>
-
-        <div class="modal-actions">
-          <button class="btn btn-ghost btn-sm" @click="detailEntry = null">关闭</button>
-          <button v-if="!detailEntry.isDir" class="btn btn-primary btn-sm" @click="openFromDetail">打开当前版本</button>
-        </div>
-      </div>
-    </div>
+    <!-- 文件详情弹窗（共享组件：版本历史 + 下载 + 恢复） -->
+    <FileHistoryDialog
+      :file="detailEntry"
+      :open="detailOpen"
+      @close="detailOpen = false"
+      @navigate-file="onNavigateFile"
+    />
 
     <!-- 版本快照文件内容预览弹窗 -->
     <div v-if="previewFile" class="modal-overlay" @click.self="previewFile = null">
@@ -1088,9 +927,6 @@ function docIcon(e: BrowseEntry) {
 .version-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .version-size { color: var(--c-text-tertiary); font-size: 12px; text-align: right; }
 
-/* ──────── 文件详情弹窗 ──────── */
-.modal--detail { width: 480px; max-width: 90vw; }
-
 /* 版本内容预览弹窗 */
 .modal--preview {
   width: 560px;
@@ -1119,7 +955,6 @@ function docIcon(e: BrowseEntry) {
   font-size: 13px;
 }
 .modal--preview .version-count { margin-left: auto; font-size: 11px; color: var(--c-text-tertiary); font-weight: 400; }
-
 .modal-title {
   display: flex;
   align-items: center;
@@ -1128,75 +963,6 @@ function docIcon(e: BrowseEntry) {
   font-weight: 600;
   margin-bottom: 8px;
 }
-
 .modal-title__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.modal-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 16px;
-  margin-bottom: 16px;
-  font-size: 12px;
-  color: var(--c-text-tertiary);
-}
-
-.modal-meta__item { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
-.modal-meta__item svg { color: var(--c-icon-secondary); }
-
-.detail-section { margin-bottom: 14px; font-size: 13px; }
-
-.detail-section__head {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  margin-bottom: 10px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--c-border);
-}
-
-.detail-section__title { font-weight: 600; font-size: 14px; }
-.detail-section__hint { font-size: 11px; color: var(--c-text-tertiary); }
-
-.detail-empty { font-size: 12px; color: var(--c-text-tertiary); padding: 16px 0; text-align: center; }
-
-.version-list { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow-y: auto; }
-
-.version-item {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-md);
-  background: var(--c-bg-secondary);
-}
-
-.version-actions { display: flex; gap: 6px; }
-
-/* 行内恢复确认条 */
-.restore-confirm {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding: 8px 10px;
-  border-radius: var(--r-sm);
-  background: var(--c-bg-panel);
-  border: 1px solid var(--c-warning);
-}
-.restore-confirm__text { font-size: 12px; color: var(--c-text-secondary); line-height: 1.5; }
-.restore-confirm__actions { display: flex; gap: 6px; flex-shrink: 0; }
-
-.version-num { font-size: 11px; font-weight: 700; color: var(--c-brand); background: var(--c-brand-soft); padding: 2px 6px; border-radius: var(--r-xs); }
-
-.version-info { min-width: 0; }
-.version-message { font-size: 12px; color: var(--c-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.version-meta { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--c-text-tertiary); margin-top: 2px; }
-.version-hash { font-family: monospace; color: var(--c-text-secondary); }
-
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
 </style>
