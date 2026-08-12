@@ -85,36 +85,38 @@ func (m *Module) Summary(r *contract.StatsRange) (*contract.StatsMetrics, error)
 	fileChangeCount := make(map[string]int)
 	fileChangeDays := make(map[string]map[string]bool) // relPath → set of dates
 
+	// 计算时间下界（用于提前终止：go-git Log 按时间倒序返回，越过下界即停止）
+	var cutoff int64
+	if r.Range != "" && r.Range != "custom" {
+		now := time.Now()
+		switch r.Range {
+		case "week":
+			cutoff = now.AddDate(0, 0, -7).UnixMilli()
+		case "month":
+			cutoff = now.AddDate(0, -1, 0).UnixMilli()
+		case "quarter":
+			cutoff = now.AddDate(0, -3, 0).UnixMilli()
+		}
+	} else if r.From > 0 {
+		cutoff = r.From
+	}
+	// 文件级 diff 上限：避免上万提交时逐次 git diff 拖垮页面加载。
+	// 提交数/时段统计不受影响（无需 diff），仅热点榜/文件变更/迭代速率在超出时近似。
+	const maxFileStats = 300
+	fileStatsDone := 0
+
 	for _, commit := range commits {
-		// 范围过滤
-		t := time.UnixMilli(commit.Time)
-		if r.Range != "" && r.Range != "custom" {
-			now := time.Now()
-			switch r.Range {
-			case "week":
-				if t.Before(now.AddDate(0, 0, -7)) {
-					continue
-				}
-			case "month":
-				if t.Before(now.AddDate(0, -1, 0)) {
-					continue
-				}
-			case "quarter":
-				if t.Before(now.AddDate(0, -3, 0)) {
-					continue
-				}
-			}
-		} else if r.From > 0 && commit.Time < r.From {
-			continue
-		} else if r.To > 0 && commit.Time > r.To {
+		if cutoff > 0 && commit.Time < cutoff {
+			break
+		}
+		if r.To > 0 && commit.Time > r.To {
 			continue
 		}
 
-		// 按天
+		t := time.UnixMilli(commit.Time)
 		dayKey := t.Format("2006-01-02")
 		dayCount[dayKey]++
 
-		// 时段
 		hour := t.Hour()
 		switch {
 		case hour >= 6 && hour < 12:
@@ -127,20 +129,21 @@ func (m *Module) Summary(r *contract.StatsRange) (*contract.StatsMetrics, error)
 			hourBuckets.Night++
 		}
 
-		// 文件改动统计
-		stat, err := m.git.DiffStats(commit.Hash)
-		if err == nil {
-			totalAdded += stat.Added
-			totalModified += stat.Modified
-			totalDeleted += stat.Deleted
-			// 从 DiffStat.Files 中提取文件名（自 go-git 的 commit tree diff）
-			for _, f := range stat.Files {
-				fileChangeCount[f]++
-				if fileChangeDays[f] == nil {
-					fileChangeDays[f] = make(map[string]bool)
+		if fileStatsDone < maxFileStats {
+			stat, err := m.git.DiffStats(commit.Hash)
+			if err == nil {
+				totalAdded += stat.Added
+				totalModified += stat.Modified
+				totalDeleted += stat.Deleted
+				for _, f := range stat.Files {
+					fileChangeCount[f]++
+					if fileChangeDays[f] == nil {
+						fileChangeDays[f] = make(map[string]bool)
+					}
+					fileChangeDays[f][dayKey] = true
 				}
-				fileChangeDays[f][dayKey] = true
 			}
+			fileStatsDone++
 		}
 	}
 

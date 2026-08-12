@@ -50,11 +50,11 @@ type APIHandler struct {
 	LLM      LLMAPI
 	Browser  BrowserAPI
 
-	// RebuildWorkspace 工作区初始化后由处理器回调，用于原地重建工作区相关模块（修复 B-01）。
+	// RebuildWorkspace 工作区初始化后由处理器回调,用于原地重建工作区相关模块（修复 B-01）。
 	// 由装配层注入。
 	RebuildWorkspace func(workspace string) error
 
-	// TaskQueue 任务队列（暂停/恢复/状态，修复 B-03）
+	// TaskQueue 任务队列（暂停/恢复/状态,修复 B-03）
 	TaskQueue TaskQueueAPI
 }
 
@@ -84,6 +84,8 @@ type StorageAPI interface {
 	QASessionsDelete(id int64) error
 	QAMessagesBySession(sessionID int64) ([]*contract.QAMessage, error)
 	FilesRecent(sinceMs int64, limit int) ([]*contract.FileInfo, error)
+	// VectorCount 查询存量向量总数（用于判断维度变更后是否需要自动重建索引）
+	VectorCount() (int, error)
 }
 
 // GitAPI git 模块接口
@@ -117,6 +119,9 @@ type ExtractAPI interface {
 // IndexAPI index 模块接口
 type IndexAPI interface {
 	FullReindex() error
+	// SetEmbedDim 运行期刷新嵌入维度（响应 embed.dimensions 配置变更）。
+	// 调用方应随后触发 FullReindex 让存量文件按新维度重嵌入。
+	SetEmbedDim(dim int64)
 }
 
 // TagAPI tag 模块接口
@@ -231,7 +236,7 @@ func New(h *APIHandler, events EventBus) *Module {
 		sseConns: make(map[chan string]struct{}),
 	}
 
-	// 订阅 events，桥接到 SSE
+	// 订阅 events,桥接到 SSE
 	events.Subscribe("index_progress", func(data interface{}) {
 		m.broadcastSSE("index_progress", data)
 	})
@@ -297,7 +302,7 @@ func (m *Module) Handle(routes map[string]interface{}) error {
 	return nil
 }
 
-// findAvailablePort 找可用端口（127.0.0.1，随机端口，冲突自增）
+// findAvailablePort 找可用端口（127.0.0.1,随机端口,冲突自增）
 func findAvailablePort() (string, error) {
 	for port := 19000; port < 20000; port++ {
 		addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -311,9 +316,9 @@ func findAvailablePort() (string, error) {
 }
 
 // withCORS CORS 中间件
-// 服务仅监听 127.0.0.1，但 CORS `*` 会让任意外部网页通过浏览器 fetch 静默读取本地 API（文档全文等）。
+// 服务仅监听 127.0.0.1,但 CORS `*` 会让任意外部网页通过浏览器 fetch 静默读取本地 API（文档全文等）。
 // 修复：仅回显 localhost/127.0.0.1 来源的 Origin；无 Origin 的同源请求（Go 内嵌静态资源）直接放行；
-// 外部来源不设置 CORS 头，浏览器将拦截响应。
+// 外部来源不设置 CORS 头,浏览器将拦截响应。
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -321,12 +326,12 @@ func withCORS(next http.Handler) http.Handler {
 		if origin != "" {
 			if !isLocalOrigin(origin) {
 				// 非本地来源：拒绝所有跨域请求（CSRF 防护）。
-				// 浏览器对带 Origin 的跨域 POST 均带此头；外部网页 form/no-cors 也会带，
+				// 浏览器对带 Origin 的跨域 POST 均带此头；外部网页 form/no-cors 也会带,
 				// 直接拒绝可阻断对本地 API 的副作用调用（commits/auto、queue/pause 等无 body 端点）。
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
-			// 回显式 ACAO：声明 Vary: Origin，防止缓存把带某 Origin 的响应复用于其他来源
+			// 回显式 ACAO：声明 Vary: Origin,防止缓存把带某 Origin 的响应复用于其他来源
 			w.Header().Add("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
@@ -342,7 +347,7 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-// isLocalOrigin 判断 Origin 是否为本机来源（localhost / 127.0.0.1 / ::1，任意端口）
+// isLocalOrigin 判断 Origin 是否为本机来源（localhost / 127.0.0.1 / ::1,任意端口）
 func isLocalOrigin(origin string) bool {
 	if !strings.HasPrefix(origin, "http://") && !strings.HasPrefix(origin, "https://") {
 		return false
@@ -351,12 +356,12 @@ func isLocalOrigin(origin string) bool {
 	if err != nil {
 		return false
 	}
-	// 拒绝带 userinfo 的构造（如 http://evil.com@localhost），浏览器 Origin 序列化从不含 userinfo
+	// 拒绝带 userinfo 的构造（如 http://evil.com@localhost）,浏览器 Origin 序列化从不含 userinfo
 	if u.User != nil {
 		return false
 	}
 	host := u.Hostname()
-	// URL.Hostname() 对 IPv6 返回无括号形式（::1），不匹配 "[::1]"
+	// URL.Hostname() 对 IPv6 返回无括号形式（::1）,不匹配 "[::1]"
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
@@ -393,7 +398,7 @@ func (m *Module) registerRoutes() {
 	// 文件历史版本下载
 	m.mux.HandleFunc("/api/files/download-history", m.handleFileDownloadHistory)
 
-	// 最近文件（时间窗筛选，按 mtime 倒序）
+	// 最近文件（时间窗筛选,按 mtime 倒序）
 	m.mux.HandleFunc("/api/files/recent", m.handleFilesRecent)
 
 	// 按相对路径解析文件 id（供详情弹窗关联版本历史用）
@@ -438,11 +443,11 @@ func (m *Module) registerRoutes() {
 }
 
 // handleStatic 托管前端静态资源 + SPA 回退到 index.html。
-// 优先磁盘目录（webDir，如 MEMORA_WEB），否则用内嵌文件系统（webFS）。
+// 优先磁盘目录（webDir,如 MEMORA_WEB）,否则用内嵌文件系统（webFS）。
 func (m *Module) handleStatic(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
-	// /api 未匹配到的路径视为 API 404，不落入静态目录
+	// /api 未匹配到的路径视为 API 404,不落入静态目录
 	if path == "/api" || strings.HasPrefix(path, "/api/") {
 		http.NotFound(w, r)
 		return
@@ -484,9 +489,9 @@ func (m *Module) handleStatic(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// serveEmbedded 从内嵌文件系统提供单个文件，返回是否成功写出。
+// serveEmbedded 从内嵌文件系统提供单个文件,返回是否成功写出。
 func serveEmbedded(w http.ResponseWriter, r *http.Request, webFS fs.FS, name string) bool {
-	// 先确认存在且是文件（ServeFileFS 对目录会 302 重定向，干扰 SPA 回退判断）
+	// 先确认存在且是文件（ServeFileFS 对目录会 302 重定向,干扰 SPA 回退判断）
 	info, err := fs.Stat(webFS, name)
 	if err != nil || info.IsDir() {
 		return false
@@ -681,7 +686,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── M-01：提交配置前先做探测与模型测试，失败不得留下半初始化状态 ──
+	// ── M-01：提交配置前先做探测与模型测试,失败不得留下半初始化状态 ──
 	// 1) 提取（MarkItDown）探测
 	if req.Markitdown.PythonPath != "" || req.Markitdown.Command != "" {
 		probePython := req.Markitdown.PythonPath
@@ -710,7 +715,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 1. 保存工作区路径（错误须检查，M-02）
+	// 1. 保存工作区路径（错误须检查,M-02）
 	if err := m.handler.Config.Set("workspace.path", req.WorkspacePath); err != nil {
 		writeError(w, "internal", fmt.Sprintf("保存工作区路径失败: %v", err), http.StatusInternalServerError)
 		return
@@ -722,7 +727,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. 保存 markitdown 配置（错误须检查，M-02）
+	// 2. 保存 markitdown 配置（错误须检查,M-02）
 	if req.Markitdown.PythonPath != "" {
 		if err := m.handler.Config.Set("markitdown.pythonPath", req.Markitdown.PythonPath); err != nil {
 			writeError(w, "internal", fmt.Sprintf("保存 pythonPath 失败: %v", err), http.StatusInternalServerError)
@@ -736,7 +741,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. 保存 LLM 配置（错误须检查，M-02）
+	// 3. 保存 LLM 配置（错误须检查,M-02）
 	if req.LLM != nil {
 		if req.LLM.BaseURL != "" {
 			if err := m.handler.Config.Set("llm.baseUrl", req.LLM.BaseURL); err != nil {
@@ -757,8 +762,8 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if req.LLM != nil && (req.LLM.BaseURL != "" || req.LLM.Model != "") {
-			// init 请求携带完整 LLM 配置时保存 temperature（含 0，确定性输出）。
-			// 仅当 LLM 有实质配置时才保存，避免用户未配置 LLM 时误覆盖现有值（review warn）
+			// init 请求携带完整 LLM 配置时保存 temperature（含 0,确定性输出）。
+			// 仅当 LLM 有实质配置时才保存,避免用户未配置 LLM 时误覆盖现有值（review warn）
 			if err := m.handler.Config.Set("llm.temperature", req.LLM.Temperature); err != nil {
 				writeError(w, "internal", fmt.Sprintf("保存 LLM 温度失败: %v", err), http.StatusInternalServerError)
 				return
@@ -766,7 +771,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. 保存 Embed 配置（错误须检查，M-02）
+	// 4. 保存 Embed 配置（错误须检查,M-02）
 	if req.Embed.BaseURL != "" {
 		if err := m.handler.Config.Set("embed.baseUrl", req.Embed.BaseURL); err != nil {
 			writeError(w, "internal", fmt.Sprintf("保存 Embed 接口失败: %v", err), http.StatusInternalServerError)
@@ -814,7 +819,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 
 	// 5. 原地重建工作区相关模块（停止旧监视、重建存储/索引/时间线/监视、
 	//    更新传输层引用、确保 Git 仓库、加载向量索引并触发全量重建）。
-	//    若未注入重建回调，则退化为仅初始化 Git 并触发重建（修复 B-01）。
+	//    若未注入重建回调,则退化为仅初始化 Git 并触发重建（修复 B-01）。
 	if m.handler.RebuildWorkspace != nil {
 		if err := m.handler.RebuildWorkspace(req.WorkspacePath); err != nil {
 			writeError(w, "internal", fmt.Sprintf("应用工作区失败: %v", err), http.StatusInternalServerError)
@@ -877,7 +882,7 @@ func (m *Module) handleWorkspaceInfo(w http.ResponseWriter, r *http.Request) {
 	llmCfg, _ := snapshot["llm"].(map[string]interface{})
 	embedCfg, _ := snapshot["embed"].(map[string]interface{})
 	// markitdown 已配置：pythonPath / markitdownCmd 任一显式配置即视为已配置。
-	// command 有默认值 `python -m markitdown "{file}"`，不能作为判断依据，否则恒为 true。
+	// command 有默认值 `python -m markitdown "{file}"`,不能作为判断依据,否则恒为 true。
 	mdConfigured := false
 	if md, ok := snapshot["markitdown"].(map[string]interface{}); ok {
 		mdConfigured = md["pythonPath"] != "" || md["markitdownCmd"] != ""
@@ -905,7 +910,7 @@ func (m *Module) handleFiles(w http.ResponseWriter, r *http.Request) {
 	tag := getQueryParam(r, "tag")
 	page := getQueryInt(r, "page", 0)
 	pageSize := getQueryInt(r, "pageSize", 50)
-	// 钳制 pageSize 上限：批量标签查询的 IN 占位符受 SQLite 变量上限（32766）约束，
+	// 钳制 pageSize 上限：批量标签查询的 IN 占位符受 SQLite 变量上限（32766）约束,
 	// 且超大 pageSize 无意义（security_review low 观察）
 	if pageSize < 1 {
 		pageSize = 50
@@ -921,7 +926,7 @@ func (m *Module) handleFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 构造 items（含标签），批量查询避免逐文件 N+1（修复审计发现）
+	// 构造 items（含标签）,批量查询避免逐文件 N+1（修复审计发现）
 	type FileItem struct {
 		contract.FileInfo
 		Tags []contract.FileTag `json:"tags"`
@@ -955,7 +960,7 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 
 	if idStr == "" || idStr == "search" {
 		// /api/files/search 与 /api/files/ 无对应资源：
-		// 此前直接 return 留下空 200 响应体，前端拿到 undefined 再点属性会白屏（review 发现）
+		// 此前直接 return 留下空 200 响应体,前端拿到 undefined 再点属性会白屏（review 发现）
 		writeError(w, "not_found", "文件不存在", http.StatusNotFound)
 		return
 	}
@@ -1137,7 +1142,7 @@ func (m *Module) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleIndexReindex POST /api/index/reindex
-// 触发全量重建索引（异步执行，返回立即）。
+// 触发全量重建索引（异步执行,返回立即）。
 func (m *Module) handleIndexReindex(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, "bad_request", "仅支持 POST", http.StatusBadRequest)
@@ -1181,12 +1186,12 @@ func (m *Module) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// 为可索引的文件补充实际索引状态（indexed/pending/failed 等），不支持的保持空
+	// 为可索引的文件补充实际索引状态（indexed/pending/failed 等）,不支持的保持空
 	for _, e := range entries {
 		if e.IsDir || !e.Indexable {
 			continue
 		}
-		// 数据库 rel_path 用系统分隔符（Windows 为反斜杠），浏览器返回正斜杠，需归一化
+		// 数据库 rel_path 用系统分隔符（Windows 为反斜杠）,浏览器返回正斜杠,需归一化
 		dbPath := filepath.FromSlash(e.RelPath)
 		rec, ferr := m.handler.Storage.FilesFindByRelPath(dbPath)
 		if ferr == nil && rec != nil {
@@ -1200,7 +1205,7 @@ func (m *Module) handleBrowse(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBrowseSearch GET /api/browse/search?q=xxx
-// 按文件名/相对路径模糊搜索（不依赖索引，实时扫描磁盘）。
+// 按文件名/相对路径模糊搜索（不依赖索引,实时扫描磁盘）。
 func (m *Module) handleBrowseSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, "bad_request", "仅支持 GET", http.StatusBadRequest)
@@ -1226,7 +1231,7 @@ func (m *Module) handleBrowseSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBrowseOpen POST /api/browse/open
-// 用系统默认应用打开指定相对路径的文件（资源管理器/搜索结果可操作，修复 H-05）。
+// 用系统默认应用打开指定相对路径的文件（资源管理器/搜索结果可操作,修复 H-05）。
 func (m *Module) handleBrowseOpen(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, "bad_request", "仅支持 POST", http.StatusBadRequest)
@@ -1256,7 +1261,7 @@ func (m *Module) handleBrowseOpen(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBrowsePickDir POST /api/browse/pickdir
-// 弹出系统原生目录选择对话框，返回所选路径。
+// 弹出系统原生目录选择对话框,返回所选路径。
 func (m *Module) handleBrowsePickDir(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, "bad_request", "仅支持 POST", http.StatusBadRequest)
@@ -1351,7 +1356,7 @@ func (m *Module) handleTagSuggestions(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFileDownloadHistory GET /api/files/download-history?relPath=...&hash=...
-// 下载文件在指定 git 提交时的历史版本内容，返回文件字节流。
+// 下载文件在指定 git 提交时的历史版本内容,返回文件字节流。
 func (m *Module) handleFileDownloadHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, "bad_request", "仅支持 GET", http.StatusBadRequest)
@@ -1364,7 +1369,7 @@ func (m *Module) handleFileDownloadHistory(w http.ResponseWriter, r *http.Reques
 		writeError(w, "bad_request", "缺少 relPath 或 hash 参数", http.StatusBadRequest)
 		return
 	}
-	// 校验 hash 为 40 位 hex（git 完整 SHA-1），非法输入返回 400 而非 500
+	// 校验 hash 为 40 位 hex（git 完整 SHA-1）,非法输入返回 400 而非 500
 	if !isHexSHA1(hash) {
 		writeError(w, "bad_request", "无效版本哈希", http.StatusBadRequest)
 		return
@@ -1376,7 +1381,7 @@ func (m *Module) handleFileDownloadHistory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// 用 mime.FormatMediaType 生成 Content-Disposition，自动转义引号/反斜杠并剥离 CR/LF
+	// 用 mime.FormatMediaType 生成 Content-Disposition,自动转义引号/反斜杠并剥离 CR/LF
 	name := filepath.Base(relPath)
 	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": name})
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -1409,8 +1414,8 @@ func (m *Module) handleFileResolve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "bad_request", "缺少 relPath 参数", http.StatusBadRequest)
 		return
 	}
-	// 前端传的是浏览器模块的正斜杠路径，数据库 rel_path 在 Windows 上是反斜杠，
-	// 需归一化后再查，否则子目录文件恒返回"未索引"（review 发现）
+	// 前端传的是浏览器模块的正斜杠路径,数据库 rel_path 在 Windows 上是反斜杠,
+	// 需归一化后再查,否则子目录文件恒返回"未索引"（review 发现）
 	file, err := m.handler.Storage.FilesFindByRelPath(filepath.FromSlash(relPath))
 	if err != nil || file == nil {
 		writeError(w, "not_found", "文件未索引", http.StatusNotFound)
@@ -1449,7 +1454,7 @@ func (m *Module) handleFilesRecent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 批量附带标签（与 handleFiles 一致，避免逐文件 N+1）
+	// 批量附带标签（与 handleFiles 一致,避免逐文件 N+1）
 	type RecentItem struct {
 		contract.FileInfo
 		Tags []contract.FileTag `json:"tags"`
@@ -1476,7 +1481,7 @@ func (m *Module) handleTimeline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "bad_request", "仅支持 GET", http.StatusBadRequest)
 		return
 	}
-	// 工作区未初始化时 Git 日志无意义，明确返回 not_configured 而非 500
+	// 工作区未初始化时 Git 日志无意义,明确返回 not_configured 而非 500
 	if m.workspacePath() == "" {
 		writeError(w, "not_configured", "工作区未初始化", http.StatusBadRequest)
 		return
@@ -1554,7 +1559,7 @@ func (m *Module) handleQA(w http.ResponseWriter, r *http.Request) {
 	writeError(w, "bad_request", "不支持的请求", http.StatusBadRequest)
 }
 
-// handleQAStream POST /api/qa/stream —— 流式问答，返回 SSE
+// handleQAStream POST /api/qa/stream —— 流式问答,返回 SSE
 func (m *Module) handleQAStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, "bad_request", "仅支持 POST", http.StatusBadRequest)
@@ -1601,8 +1606,8 @@ func (m *Module) handleQAStream(w http.ResponseWriter, r *http.Request) {
 			return
 		default:
 		}
-		// chunk 可能含真实换行（\n\n），直接写 SSE 会破坏帧结构导致前端丢内容。
-		// 用 JSON 字符串编码传输，前端解码还原。
+		// chunk 可能含真实换行（\n\n）,直接写 SSE 会破坏帧结构导致前端丢内容。
+		// 用 JSON 字符串编码传输,前端解码还原。
 		chunkJSON, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
 		flusher.Flush()
@@ -1611,13 +1616,13 @@ func (m *Module) handleQAStream(w http.ResponseWriter, r *http.Request) {
 	// 等待最终结果
 	result := <-done
 	if result == nil {
-		// 防御：goroutine 异常退出时 done 可能关闭无值，避免 nil 解引用
+		// 防御：goroutine 异常退出时 done 可能关闭无值,避免 nil 解引用
 		fmt.Fprintf(w, "event: error\ndata: %s\n\n", `"问答中断"`)
 		flusher.Flush()
 		return
 	}
 	if result.Error != "" {
-		// error 数据同样可能含换行，JSON 编码传输
+		// error 数据同样可能含换行,JSON 编码传输
 		errJSON, _ := json.Marshal(result.Error)
 		fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(errJSON))
 		flusher.Flush()
@@ -1692,7 +1697,7 @@ func (m *Module) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, &Response{Code: "stats_disabled", Message: "统计已关闭", Data: map[string]bool{"enabled": false}})
 		return
 	}
-	// 工作区未初始化时统计无数据，明确返回 not_configured 而非 500
+	// 工作区未初始化时统计无数据,明确返回 not_configured 而非 500
 	if m.workspacePath() == "" {
 		writeError(w, "not_configured", "工作区未初始化", http.StatusBadRequest)
 		return
@@ -1725,7 +1730,7 @@ func (m *Module) handleStatsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 统计关闭或工作区未初始化时明确提示，避免 500（修复审计发现）
+	// 统计关闭或工作区未初始化时明确提示,避免 500（修复审计发现）
 	if !m.handler.Stats.Enabled() {
 		writeJSON(w, http.StatusOK, &Response{Code: "stats_disabled", Message: "统计已关闭", Data: map[string]bool{"enabled": false}})
 		return
@@ -1816,7 +1821,7 @@ func (m *Module) handleCommitAuto(w http.ResponseWriter, r *http.Request) {
 	aiMsg, aiErr := m.handler.Timeline.SuggestCommitMessage()
 
 	if aiErr == nil && aiMsg != "" {
-		// AI 成功，用 AI 备注手动提交
+		// AI 成功,用 AI 备注手动提交
 		hash, err := m.handler.Git.CommitManual(aiMsg)
 		if err != nil {
 			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
@@ -1826,7 +1831,7 @@ func (m *Module) handleCommitAuto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// AI 不可用，回退到默认自动提交
+	// AI 不可用,回退到默认自动提交
 	hash, skipped, err := m.handler.Git.CommitAuto(nil)
 	if err != nil {
 		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
@@ -1860,6 +1865,9 @@ func (m *Module) handleCommitList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "bad_request", "仅支持 GET", http.StatusBadRequest)
 		return
 	}
+	// withFiles=true 时附带每个提交的改动文件明细（用于展开后的文件列表）；
+	// 默认不附带（避免逐提交 git diff 拖慢列表加载，改由展开时按需获取）。
+	withFiles := getQueryParam(r, "withFiles") == "true"
 	commits, err := m.handler.Git.Log()
 	if err != nil {
 		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
@@ -1871,22 +1879,25 @@ func (m *Module) handleCommitList(w http.ResponseWriter, r *http.Request) {
 		Time    int64                  `json:"time"`
 		Message string                 `json:"message"`
 		Author  string                 `json:"author"`
-		Files   []*contract.CommitFile `json:"files"`
+		Files   []*contract.CommitFile `json:"files,omitempty"`
 	}
 
 	items := make([]*commitItem, 0, len(commits))
 	for _, c := range commits {
-		files, err := m.handler.Git.CommitFiles(c.Hash)
-		if err != nil {
-			files = nil
-		}
-		items = append(items, &commitItem{
+		item := &commitItem{
 			Hash:    c.Hash,
 			Time:    c.Time,
 			Message: c.Message,
 			Author:  c.Author,
-			Files:   files,
-		})
+		}
+		if withFiles {
+			files, err := m.handler.Git.CommitFiles(c.Hash)
+			if err != nil {
+				files = nil
+			}
+			item.Files = files
+		}
+		items = append(items, item)
 	}
 
 	writeOK(w, map[string]interface{}{"commits": items})
@@ -1905,6 +1916,24 @@ func (m *Module) handleCommitByHash(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		files, err := m.handler.Git.ListTreeAt(hash)
+		if err != nil {
+			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeOK(w, map[string]interface{}{"hash": hash, "files": files})
+		return
+	}
+
+	// GET /api/commits/{hash}/diff —— 该提交的改动文件列表（新增/修改/删除），
+	// 供版本记录页展开单个提交时按需获取（避免列表接口逐提交全量 diff）。
+	if strings.HasSuffix(path, "/diff") && r.Method == http.MethodGet {
+		hash := getPathParam(path, "/api/commits/")
+		hash = strings.TrimSuffix(hash, "/diff")
+		if !isHexSHA1(hash) {
+			writeError(w, "bad_request", "无效提交哈希", http.StatusBadRequest)
+			return
+		}
+		files, err := m.handler.Git.CommitFiles(hash)
 		if err != nil {
 			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
 			return
@@ -1995,7 +2024,7 @@ func (m *Module) handleCommitManual(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := strings.TrimSpace(req.Message)
 
-	// 无变更时返回 skipped，不报错（前端据此提示"无变更"）
+	// 无变更时返回 skipped,不报错（前端据此提示"无变更"）
 	status, err := m.handler.Git.Status()
 	if err != nil {
 		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
@@ -2090,16 +2119,45 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 热更新收集（修复 H-09：明确区分热更新项与需重启项）
-		var newPythonPath, newCommand, newMarkitdownCmd string
-		hasMarkitdown := false
-		restartKeys := make(map[string]bool)
+			// 热更新收集（修复 H-09：明确区分热更新项与需重启项）
+			var newPythonPath, newCommand, newMarkitdownCmd string
+			hasMarkitdown := false
+			restartKeys := make(map[string]bool)
+			// embed.dimensions 变更检测：若新值与旧值不同,标记需自动重建索引。
+			dimChanged := false
+			newDim := int64(0)
 
-		for key, value := range req {
-			if err := m.handler.Config.Set(key, value); err != nil {
-				writeError(w, "bad_request", err.Error(), http.StatusBadRequest)
-				return
-			}
+			for key, value := range req {
+				// embed.dimensions 变更：先读旧值,变更则刷新索引模块维度并触发自动重建。
+				// 维度变更后若仍用旧 dim 查询,cosine 全 0、检索恒为空,必须重建索引。
+				if key == "embed.dimensions" {
+					oldVal, _ := m.handler.Config.Get("embed.dimensions")
+					var oldDim int64
+					switch v := oldVal.(type) {
+					case int:
+						oldDim = int64(v)
+					case int64:
+						oldDim = v
+					}
+					var newDimVal int64
+					switch v := value.(type) {
+					case int:
+						newDimVal = int64(v)
+					case int64:
+						newDimVal = v
+					case float64:
+						newDimVal = int64(v)
+					}
+					if oldDim != 0 && oldDim != newDimVal {
+						dimChanged = true
+						newDim = newDimVal
+					}
+				}
+
+				if err := m.handler.Config.Set(key, value); err != nil {
+					writeError(w, "bad_request", err.Error(), http.StatusBadRequest)
+					return
+				}
 			// 同步 stats.enabled 到 stats 模块（运行时开关）
 			if key == "stats.enabled" {
 				if b, ok := value.(bool); ok {
@@ -2128,8 +2186,8 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 				}
 			default:
 				// 其余配置项属于需重启生效项（或已由特定模块热更新）
-				// llm/embed 配置由 llm 模块每次调用实时读取（GetLLMConfig/GetEmbedConfig），
-				// 改完即生效，不算"需重启"（修复：此前误标导致提示误导小白）。
+				// llm/embed 配置由 llm 模块每次调用实时读取（GetLLMConfig/GetEmbedConfig）,
+				// 改完即生效,不算"需重启"（修复：此前误标导致提示误导小白）。
 				switch key {
 				case "stats.enabled", "recent.windowHours", "rerank.baseUrl", "rerank.model",
 					"rerank.apiKey", "llm.baseUrl", "llm.model", "llm.temperature",
@@ -2140,20 +2198,40 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 热更新 Extract（MarkItDown）运行参数
-		if hasMarkitdown && m.handler.Extract != nil {
-			m.handler.Extract.ApplyConfig(newPythonPath, newCommand, newMarkitdownCmd)
-		}
+			// 热更新 Extract（MarkItDown）运行参数
+			if hasMarkitdown && m.handler.Extract != nil {
+				m.handler.Extract.ApplyConfig(newPythonPath, newCommand, newMarkitdownCmd)
+			}
 
-		// 返回需重启生效的配置项提示，避免“假成功”
-		restartList := make([]string, 0, len(restartKeys))
-		for k := range restartKeys {
-			restartList = append(restartList, k)
-		}
-		writeOK(w, map[string]interface{}{
-			"ok":              true,
-			"restartRequired": restartList,
-		})
+			// embed.dimensions 变更：刷新索引模块运行期维度,并在确有存量向量时
+			// 异步触发全量重建索引（沿用 handleIndexReindex 的 fire & forget 模式）。
+			reindexRequired := false
+			if dimChanged && m.handler.Index != nil {
+				m.handler.Index.SetEmbedDim(newDim)
+				if m.handler.Storage != nil {
+					if cnt, err := m.handler.Storage.VectorCount(); err == nil && cnt > 0 {
+						reindexRequired = true
+						logx.Info("transport", "检测到向量维度变更,后台自动重建索引",
+							"oldDim", "见上一步", "newDim", newDim, "vectorCount", cnt)
+						go func() {
+							if err := m.handler.Index.FullReindex(); err != nil {
+								logx.Error("transport", "自动重建索引失败", "err", err.Error())
+							}
+						}()
+					}
+				}
+			}
+
+			// 返回需重启生效的配置项提示,避免"假成功"
+			restartList := make([]string, 0, len(restartKeys))
+			for k := range restartKeys {
+				restartList = append(restartList, k)
+			}
+			writeOK(w, map[string]interface{}{
+				"ok":              true,
+				"restartRequired": restartList,
+				"reindexRequired": reindexRequired,
+			})
 	default:
 		writeError(w, "bad_request", "不支持的请求方法", http.StatusBadRequest)
 	}
@@ -2187,7 +2265,7 @@ func (m *Module) handleTest(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(path, "/llm") {
 		var req struct {
 			Type        string  `json:"type"` // chat|embed|models
-			Kind        string  `json:"kind"` // models 时区分 chat/embed/rerank，用于回退正确密钥
+			Kind        string  `json:"kind"` // models 时区分 chat/embed/rerank,用于回退正确密钥
 			BaseURL     string  `json:"baseUrl"`
 			Model       string  `json:"model"`
 			ApiKey      string  `json:"apiKey"`
@@ -2242,7 +2320,7 @@ func (m *Module) handleDetectPython(w http.ResponseWriter, r *http.Request) {
 	}
 	found := pyResult{}
 
-	// 所有候选：优先真实 Python 安装目录，跳过 WindowsApps Store 壳
+	// 所有候选：优先真实 Python 安装目录,跳过 WindowsApps Store 壳
 	candidates := []string{}
 
 	// Windows 常见路径
@@ -2260,7 +2338,7 @@ func (m *Module) handleDetectPython(w http.ResponseWriter, r *http.Request) {
 			`C:\Python39\python.exe`,
 		)
 	}
-	// PATH 里的可执行名（最后兜底，因为可能找到 WindowsApps 壳）
+	// PATH 里的可执行名（最后兜底,因为可能找到 WindowsApps 壳）
 	candidates = append(candidates, "python", "python3", "py")
 
 	for _, c := range candidates {
@@ -2293,14 +2371,14 @@ func (m *Module) handleDetectPython(w http.ResponseWriter, r *http.Request) {
 		// 按 python.exe 路径推导 markitdown 路径
 		pyDir := filepath.Dir(pyExe)
 		scriptsDir := pyDir
-		// 如果 python.exe 在 bin/ 下，Python 根目录在上一级
+		// 如果 python.exe 在 bin/ 下,Python 根目录在上一级
 		if filepath.Base(pyDir) == "bin" {
 			scriptsDir = filepath.Dir(pyDir)
 		}
-		// 如果 Scripts 不在 python.exe 同目录，尝试 pythoncore 子目录
+		// 如果 Scripts 不在 python.exe 同目录,尝试 pythoncore 子目录
 		var mdCandidates []string
 		if filepath.Base(pyDir) == "bin" {
-			// bin/ 下无 Scripts，尝试 pythoncore-<ver>-64/Scripts
+			// bin/ 下无 Scripts,尝试 pythoncore-<ver>-64/Scripts
 			mdCandidates = append(mdCandidates, filepath.Join(scriptsDir, "pythoncore-3.14-64", "Scripts", "markitdown.exe"))
 			mdCandidates = append(mdCandidates, filepath.Join(scriptsDir, "pythoncore-3.13-64", "Scripts", "markitdown.exe"))
 			mdCandidates = append(mdCandidates, filepath.Join(scriptsDir, "pythoncore-3.12-64", "Scripts", "markitdown.exe"))

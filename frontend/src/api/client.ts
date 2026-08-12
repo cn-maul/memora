@@ -18,6 +18,7 @@ import type {
   BrowsePickDirResponse,
   CommitItem,
   VersionFile,
+  CommitFile,
 } from '@/types'
 
 const http = axios.create({
@@ -170,7 +171,9 @@ export async function browseOpen(relPath: string): Promise<void> {
 }
 
 export async function browsePickDir(initial?: string): Promise<BrowsePickDirResponse> {
-  const { data } = await http.post<ApiResponse<BrowsePickDirResponse>>('/browse/pickdir', { initial })
+  // 原生目录选择对话框：请求会一直挂到用户在对话框里选完/取消才返回（含用户思考时间）。
+  // 后端已常驻 PowerShell 预加载，首次点击也秒开；此处只需给足用户选择时间即可。
+  const { data } = await http.post<ApiResponse<BrowsePickDirResponse>>('/browse/pickdir', { initial }, { timeout: 180000 })
   return data.data!
 }
 
@@ -368,13 +371,19 @@ export async function manualCommit(message: string): Promise<string> {
   return data.data!.hash
 }
 
-export async function getCommitList(): Promise<CommitItem[]> {
-  const { data } = await http.get<ApiResponse<{ commits: CommitItem[] }>>('/commits/list')
+export async function getCommitList(withFiles?: boolean): Promise<CommitItem[]> {
+  const { data } = await http.get<ApiResponse<{ commits: CommitItem[] }>>('/commits/list', { params: withFiles ? { withFiles: 'true' } : undefined })
   return data.data!.commits || []
 }
 
 export async function getCommitFiles(commitHash: string): Promise<VersionFile[]> {
   const { data } = await http.get<ApiResponse<{ files: VersionFile[] }>>(`/commits/${commitHash}/files`)
+  return data.data?.files || []
+}
+
+// getCommitDiff 获取单个提交的改动文件列表（新增/修改/删除），供版本记录页展开时按需获取。
+export async function getCommitDiff(commitHash: string): Promise<CommitFile[]> {
+  const { data } = await http.get<ApiResponse<{ files: CommitFile[] }>>(`/commits/${commitHash}/diff`)
   return data.data?.files || []
 }
 
@@ -385,9 +394,9 @@ export async function getSettings(): Promise<Record<string, any>> {
   return data.data!
 }
 
-export async function updateSettings(settings: Record<string, any>): Promise<{ restartRequired: string[] }> {
-  const { data } = await http.put<ApiResponse<{ restartRequired: string[] }>>('/settings', settings)
-  return data.data ?? { restartRequired: [] }
+export async function updateSettings(settings: Record<string, any>): Promise<{ restartRequired: string[]; reindexRequired: boolean }> {
+  const { data } = await http.put<ApiResponse<{ restartRequired: string[]; reindexRequired: boolean }>>('/settings', settings)
+  return data.data ?? { restartRequired: [], reindexRequired: false }
 }
 
 export async function updateSecrets(llmApiKey?: string, embedApiKey?: string, rerankApiKey?: string): Promise<void> {

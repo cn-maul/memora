@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { getCommitList } from '@/api/client'
-import type { CommitItem } from '@/types'
+import { getCommitList, getCommitDiff } from '@/api/client'
+import type { CommitItem, CommitFile } from '@/types'
 import Icon from '@/components/Icon.vue'
 
 const router = useRouter()
@@ -32,7 +32,30 @@ async function loadData() {
 const expanded = ref<Record<string, boolean>>({})
 
 function toggle(hash: string) {
-  expanded.value[hash] = !expanded.value[hash]
+  const expand = !expanded.value[hash]
+  expanded.value[hash] = expand
+  if (expand) loadFilesForHash(hash)
+}
+
+// 按提交按需获取改动文件明细（缓存，避免重复请求）
+const filesCache = ref<Record<string, CommitFile[]>>({})
+const loadingFiles = ref<Set<string>>(new Set())
+
+async function loadFilesForHash(hash: string) {
+  if (filesCache.value[hash] !== undefined) return
+  if (loadingFiles.value.has(hash)) return
+  loadingFiles.value.add(hash)
+  try {
+    filesCache.value[hash] = await getCommitDiff(hash)
+  } catch {
+    filesCache.value[hash] = []
+  } finally {
+    loadingFiles.value.delete(hash)
+  }
+}
+
+function filesOf(hash: string): CommitFile[] {
+  return filesCache.value[hash] || []
 }
 
 function shortHash(hash: string) {
@@ -66,7 +89,7 @@ function counts(files: CommitItem['files']) {
 
 const totalCommits = computed(() => commits.value.length)
 const totalFiles = computed(() =>
-  commits.value.reduce((sum, c) => sum + (c.files?.length || 0), 0),
+  commits.value.reduce((sum, c) => sum + filesOf(c.hash).length, 0),
 )
 
 function statusLabel(s: string) {
@@ -83,7 +106,7 @@ function statusSign(s: string) {
   <div class="commit-page">
     <div class="page-header">
       <div>
-        <h2>版本历史</h2>
+        <h2>版本记录</h2>
         <p class="page-sub">你保存的每一个版本，以及每次改动了什么</p>
       </div>
       <div class="header-actions">
@@ -112,7 +135,7 @@ function statusSign(s: string) {
     <div v-else-if="commits.length === 0" class="empty-state empty-state--icon">
       <span class="empty-state__icon"><Icon name="git-branch" :size="20" /></span>
       <span class="empty-state__title">还没有版本</span>
-      <span class="empty-state__desc">修改任意文件后，系统会自动保存第一个版本；也可在左侧「版本历史」手动保存</span>
+      <span class="empty-state__desc">修改任意文件后，系统会自动保存第一个版本；有需要时也可手动保存</span>
     </div>
 
     <div v-else class="timeline">
@@ -136,9 +159,9 @@ function statusSign(s: string) {
               <span class="tl-meta tl-author">{{ c.author }}</span>
               <span class="tl-hash" :title="c.hash">{{ shortHash(c.hash) }}</span>
 
-              <span v-if="counts(c.files).added" class="tl-chip tl-chip--added">+{{ counts(c.files).added }} 新增</span>
-              <span v-if="counts(c.files).modified" class="tl-chip tl-chip--modified">~{{ counts(c.files).modified }} 修改</span>
-              <span v-if="counts(c.files).deleted" class="tl-chip tl-chip--deleted">−{{ counts(c.files).deleted }} 删除</span>
+              <span v-if="counts(filesOf(c.hash)).added" class="tl-chip tl-chip--added">+{{ counts(filesOf(c.hash)).added }} 新增</span>
+              <span v-if="counts(filesOf(c.hash)).modified" class="tl-chip tl-chip--modified">~{{ counts(filesOf(c.hash)).modified }} 修改</span>
+              <span v-if="counts(filesOf(c.hash)).deleted" class="tl-chip tl-chip--deleted">−{{ counts(filesOf(c.hash)).deleted }} 删除</span>
 
               <button class="btn btn-ghost btn-mini tl-view-files" title="查看该提交的全部文件" @click.stop="viewFiles(c.hash)">
                 <Icon name="folder" :size="12" />
@@ -150,12 +173,15 @@ function statusSign(s: string) {
           </button>
 
           <div v-if="expanded[c.hash]" class="tl-files">
-            <div v-if="!c.files || c.files.length === 0" class="tl-files-empty">该提交没有文件改动</div>
-            <div v-for="f in c.files || []" :key="f.status + f.path" class="tl-file">
+            <div v-if="loadingFiles.value.has(c.hash)" class="tl-files-empty">加载文件明细中…</div>
+            <template v-else>
+              <div v-if="filesOf(c.hash).length === 0" class="tl-files-empty">该提交没有文件改动</div>
+              <div v-for="f in filesOf(c.hash)" :key="f.status + f.path" class="tl-file">
               <span class="tl-file-sign" :class="`tf--${f.status}`">{{ statusSign(f.status) }}</span>
               <span class="tl-file-badge" :class="`tf--${f.status}`">{{ statusLabel(f.status) }}</span>
               <span class="tl-file-path" :title="f.path">{{ f.path }}</span>
             </div>
+            </template>
           </div>
         </div>
       </div>
