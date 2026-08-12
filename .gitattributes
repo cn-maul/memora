@@ -1,4 +1,4 @@
-# Normalize text line endings to LF in the repo
+﻿# Normalize text line endings to LF in the repo
 * text=auto
 
 # Windows batch / PowerShell scripts stay CRLF on checkout
@@ -7,7 +7,7 @@
 *.ps1 text eol=crlf
 
 # Text files
-*.go text
+*.go text eol=lf
 *.ts text
 *.vue text
 *.js text
