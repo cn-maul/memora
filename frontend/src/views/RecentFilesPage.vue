@@ -3,9 +3,10 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useSettingsStore } from '@/stores/settings'
-import { getRecentFiles, getFile, browseOpen, getFileHistory, downloadHistoryVersion, resolveFileId, restoreFile } from '@/api/client'
+import { getRecentFiles, getFile, browseOpen, getFileHistory, downloadHistoryVersion, resolveFileId, restoreFile, searchFiles, browseSearch } from '@/api/client'
 import type { FileItem } from '@/types'
 import Icon from '@/components/Icon.vue'
+import { statusLabel, statusClass, isAbnormal } from '@/utils/status'
 
 const router = useRouter()
 const route = useRoute()
@@ -17,6 +18,22 @@ const loading = ref(false)
 const loadError = ref('')
 const openingPath = ref('')
 const openError = ref('')
+
+// ── 统一搜索（S3：一个框同时搜文件名 + 文档内容）──
+const searchQuery = ref('')
+const searching = ref(false)
+const hasSearched = ref(false)
+const searchError = ref('')
+interface SearchHit {
+  relPath: string
+  kind: 'file' | 'content' // file = 文件名命中；content = 内容命中
+  mtime?: number
+  size?: number
+  docType?: string
+  hitText?: string
+  tags?: FileItem['tags']
+}
+const searchHits = ref<SearchHit[]>([])
 
 // ── 按文件过滤（聊天里点击文件链接跳转：?highlight=相对路径）──
 const highlightRel = ref('') // 当前过滤的文件相对路径（空 = 正常列表）
@@ -57,6 +74,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
+  if (searchTimer) clearTimeout(searchTimer)
 })
 
 // 从聊天链接跳转过来时切换过滤
@@ -82,6 +100,80 @@ async function loadRecent() {
     files.value = []
   } finally {
     loading.value = false
+  }
+}
+
+// 输入防抖：停顿 400ms 自动搜索
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+function onSearchInput() {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    if (searchQuery.value.trim()) {
+      doSearch()
+    } else {
+      hasSearched.value = false
+      searchHits.value = []
+      loadRecent()
+    }
+  }, 400)
+}
+function clearSearch() {
+  searchQuery.value = ''
+  hasSearched.value = false
+  searchHits.value = []
+  searchError.value = ''
+  loadRecent()
+}
+
+// 统一搜索：文件名 + 文档内容一起找
+async function doSearch() {
+  const q = searchQuery.value.trim()
+  if (!q) {
+    hasSearched.value = false
+    searchHits.value = []
+    searchError.value = ''
+    await loadRecent()
+    return
+  }
+  searching.value = true
+  searchError.value = ''
+  hasSearched.value = true
+  try {
+    const [content, names] = await Promise.all([
+      searchFiles({ q }),
+      browseSearch(q, 50),
+    ])
+    const hits: SearchHit[] = []
+    const seen = new Set<string>()
+    for (const n of names.items) {
+      if (n.isDir) continue
+      if (seen.has(n.relPath)) continue
+      seen.add(n.relPath)
+      hits.push({
+        relPath: n.relPath,
+        kind: 'file',
+        mtime: n.mtime,
+        size: n.size,
+        docType: n.docType,
+      })
+    }
+    for (const r of content.items) {
+      if (seen.has(r.relPath)) continue
+      seen.add(r.relPath)
+      hits.push({
+        relPath: r.relPath,
+        kind: 'content',
+        mtime: r.mtime,
+        hitText: r.hitText,
+        tags: r.tags,
+      })
+    }
+    searchHits.value = hits
+  } catch (e: any) {
+    searchError.value = e?.message || '搜索失败'
+    searchHits.value = []
+  } finally {
+    searching.value = false
   }
 }
 
@@ -112,7 +204,7 @@ function clearHighlight() {
   router.replace({ path: '/files' })
 }
 
-// 显示列表：过滤模式下只显示目标文件，否则显示最近文件
+// 显示列表：搜索态显示搜索结果，过滤模式只显示目标文件，否则显示最近文件
 const displayItems = computed<FileItem[]>(() => {
   if (highlightRel.value) {
     return highlightedFile.value ? [highlightedFile.value] : []
@@ -244,21 +336,7 @@ function formatTime(ms?: number) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-function statusLabel(s: string) {
-  const map: Record<string, string> = {
-    pending: '待索引', extracting: '提取中', embedding: '嵌入中',
-    indexed: '已索引', failed: '失败', ignored: '已忽略',
-  }
-  return map[s] || s
-}
 
-function statusClass(s: string) {
-  const map: Record<string, string> = {
-    indexed: 'status-chip--ok', extracting: 'status-chip--busy', embedding: 'status-chip--busy',
-    failed: 'status-chip--err', pending: 'status-chip--muted', ignored: 'status-chip--muted',
-  }
-  return map[s] || 'status-chip--muted'
-}
 </script>
 
 <template>
@@ -266,15 +344,28 @@ function statusClass(s: string) {
     <div class="page-header">
       <div>
         <h2>最近文件</h2>
-        <p class="page-sub">{{ windowLabel(windowHours) }}内修改的文件</p>
+        <p class="page-sub">{{ hasSearched ? '同时搜索文件名和文档内容' : `${windowLabel(windowHours)}内修改的文件` }}</p>
       </div>
       <div class="header-actions">
-        <select v-model.number="windowHours" class="select window-select" title="时间窗">
+        <div class="unified-search">
+          <Icon name="search" :size="14" class="unified-search__icon" />
+          <input
+            v-model="searchQuery"
+            class="input unified-search__input"
+            placeholder="搜索文件名或内容…"
+            @input="onSearchInput"
+            @keyup.enter="doSearch"
+          />
+          <button v-if="searchQuery" class="unified-search__clear" title="清空" @click="clearSearch">
+            <Icon name="x" :size="12" />
+          </button>
+        </div>
+        <select v-if="!hasSearched" v-model.number="windowHours" class="select window-select" title="时间窗">
           <option v-for="o in windowOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
         </select>
-        <button class="btn btn-ghost btn-sm" @click="loadRecent" :disabled="loading">
+        <button class="btn btn-ghost btn-sm" @click="hasSearched ? doSearch() : loadRecent()" :disabled="loading || searching">
           <Icon name="refresh" :size="14" />
-          {{ loading ? '加载中…' : '刷新' }}
+          {{ loading || searching ? '加载中…' : hasSearched ? '重搜' : '刷新' }}
         </button>
       </div>
     </div>
@@ -302,6 +393,56 @@ function statusClass(s: string) {
         </button>
       </div>
 
+      <div v-if="hasSearched">
+        <div v-if="searching" class="loading">搜索中…</div>
+        <div v-else-if="searchError" class="alert alert--error">{{ searchError }}</div>
+        <div v-else-if="searchHits.length === 0" class="empty-state empty-state--icon">
+          <span class="empty-state__icon"><Icon name="search" :size="20" /></span>
+          <span class="empty-state__title">没有找到「{{ searchQuery }}」</span>
+          <span class="empty-state__desc">换个关键词试试，搜索会同时匹配文件名和文档内容</span>
+        </div>
+        <div v-else class="file-list file-list--panel">
+          <div class="file-list-head list-head">
+            <span class="file-col-name">文件</span>
+            <span>匹配</span>
+            <span class="file-col-right">大小</span>
+            <span class="file-col-right">修改时间</span>
+            <span class="file-col-right">操作</span>
+          </div>
+          <div class="file-rows">
+            <div v-for="(h, i) in searchHits" :key="i" class="file-row">
+              <span class="file-row-cell file-row-name-cell">
+                <span class="file-row-name" :title="h.relPath">
+                  <Icon name="file" :size="14" class="file-row-icon" />
+                  <span class="file-row-name__text">{{ h.relPath }}</span>
+                </span>
+                <span v-if="h.tags?.length" class="file-row-tags">
+                  <span v-for="t in h.tags" :key="t.name" class="tag-chip tag-chip--mini">{{ t.name }}</span>
+                </span>
+              </span>
+              <span class="file-row-cell">
+                <span v-if="h.kind === 'content'" class="search-match">
+                  <Icon name="chat" :size="12" />
+                  {{ h.hitText || '内容命中' }}
+                </span>
+                <span v-else class="search-match search-match--file">
+                  <Icon name="folder" :size="12" />
+                  文件名命中
+                </span>
+              </span>
+              <span class="file-row-cell file-row-size">{{ formatSize(h.size) }}</span>
+              <span class="file-row-cell file-row-time">{{ formatTime(h.mtime) }}</span>
+              <span class="file-row-cell file-row-actions">
+                <button class="btn btn-ghost btn-mini" @click.stop="openFile(h.relPath)" :disabled="openingPath === h.relPath">
+                  {{ openingPath === h.relPath ? '打开中…' : '打开' }}
+                </button>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <template v-else>
       <div v-if="highlightRel ? highlightLoading : loading" class="loading">加载中…</div>
       <div v-else-if="highlightRel && highlightError" class="alert alert--error">{{ highlightError }}</div>
       <div v-else-if="displayItems.length === 0" class="empty-state empty-state--icon">
@@ -332,7 +473,7 @@ function statusClass(s: string) {
             <span class="file-row-cell file-doc">{{ f.docType }}</span>
             <span class="file-row-cell file-row-size">{{ formatSize(f.size) }}</span>
             <span class="file-row-cell">
-              <span class="status-chip" :class="statusClass(f.indexStatus)">{{ statusLabel(f.indexStatus) }}</span>
+              <span v-if="isAbnormal(f.indexStatus)" class="status-chip" :class="statusClass(f.indexStatus)">{{ statusLabel(f.indexStatus) }}</span>
               <span v-if="f.lastError" class="file-err" :title="f.lastError">{{ f.lastError }}</span>
             </span>
             <span class="file-row-cell file-row-time">{{ formatTime(f.mtime) }}</span>
@@ -345,6 +486,7 @@ function statusClass(s: string) {
           </div>
         </div>
       </div>
+      </template>
     </template>
     <div v-else-if="!ws.info" class="loading">加载工作区信息…</div>
     <div v-else class="empty-state">
@@ -438,6 +580,63 @@ function statusClass(s: string) {
 .page-sub { font-size: 12px; color: var(--c-text-tertiary); margin: 2px 0 0; }
 
 .window-select { width: auto; padding: 5px 10px; font-size: 12.5px; }
+
+/* 统一搜索框（S3） */
+.unified-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.unified-search__icon {
+  position: absolute;
+  left: 9px;
+  color: var(--c-text-tertiary);
+  pointer-events: none;
+}
+.unified-search__input {
+  width: 220px;
+  padding: 5px 28px 5px 30px;
+  font-size: 12.5px;
+  border-radius: var(--r-md);
+}
+.unified-search__clear {
+  position: absolute;
+  right: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  color: var(--c-text-tertiary);
+  cursor: pointer;
+  border-radius: 50%;
+}
+.unified-search__clear:hover {
+  background: var(--c-bg-hover);
+  color: var(--c-text-primary);
+}
+
+/* 搜索结果：命中类型徽记 */
+.search-match {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 320px;
+  padding: 2px 8px;
+  border-radius: var(--r-sm);
+  background: var(--c-brand-soft);
+  color: var(--c-brand);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.search-match--file {
+  background: var(--c-bg-hover);
+  color: var(--c-text-secondary);
+}
 
 /* 按文件过滤横幅 */
 .filter-banner {

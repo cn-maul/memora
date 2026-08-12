@@ -8,7 +8,6 @@ import { useFilesStore } from '@/stores/files'
 import {
   createSSEConnection,
   getQueueStatus,
-  autoCommit,
   getCommitStatus,
   suggestCommitMessage,
   manualCommit,
@@ -43,46 +42,20 @@ async function refreshQueue() {
 
 let queueTimer: ReturnType<typeof setInterval> | null = null
 
-const navItems: { path: string; label: string; icon: IconName }[] = [
-  { path: '/files', label: '最近文件', icon: 'clock' },
-  { path: '/workspace', label: '全部文件', icon: 'folder' },
-  { path: '/index', label: '内容整理', icon: 'search' },
-  { path: '/timeline', label: '版本历史', icon: 'git-branch' },
-  { path: '/qa', label: '问答', icon: 'chat' },
+// 主导航（S2 收敛）：只放小白最常用的三个，其余收进「更多」
+const mainNavItems: { path: string; label: string; icon: IconName }[] = [
+  { path: '/files', label: '文件', icon: 'folder' },
+  { path: '/qa', label: '问问题', icon: 'chat' },
+  { path: '/timeline', label: '版本记录', icon: 'git-branch' },
+]
+const moreNavItems: { path: string; label: string; icon: IconName }[] = [
+  { path: '/workspace', label: '全部文件', icon: 'folder-open' },
+  { path: '/index', label: '搜索', icon: 'search' },
   { path: '/stats', label: '统计', icon: 'chart' },
   { path: '/settings', label: '设置', icon: 'settings' },
 ]
-
-const gitBranchName = computed(() => {
-  // 优先展示后端返回的真实分支名；未初始化/未就绪时回退为占位（修复分支名硬编码问题）
-  return ws.info?.head?.branch || '主分支'
-})
-const autoCommitting = ref(false)
-const autoCommitResult = ref('')
-// 首次使用「版本历史」引导 toast（localStorage 去重，只出现一次）
+const moreOpen = ref(false)
 const vcGuideVisible = ref(false)
-
-function headHashShort(): string {
-  const h = ws.info?.head?.hash
-  return h ? h.slice(0, 8) : ''
-}
-
-async function handleAutoCommit() {
-  autoCommitting.value = true
-  autoCommitResult.value = ''
-  try {
-    const res = await autoCommit()
-    if (res.hash) {
-      autoCommitResult.value = '已保存 ✓'
-    } else {
-      autoCommitResult.value = '没有需要保存的改动'
-    }
-  } catch (e: any) {
-    autoCommitResult.value = e.message || '保存失败'
-  } finally {
-    autoCommitting.value = false
-  }
-}
 
 function gitDirtySum(): number {
   if (!ws.info?.dirtyCounts) return 0
@@ -172,7 +145,6 @@ async function handleManualCommit() {
     commitSuccess.value = hash ? '已保存 ✓' : '没有需要保存的改动'
     commitDialogOpen.value = false
     await ws.fetchInfo()
-    autoCommitResult.value = hash ? '已保存 ✓' : ''
   } catch (e: any) {
     commitError.value = e.message || '保存失败'
   } finally {
@@ -481,7 +453,7 @@ onUnmounted(() => {
 
       <nav class="nav">
         <router-link
-          v-for="item in navItems"
+          v-for="item in mainNavItems"
           :key="item.path"
           :to="item.path"
           class="nav-item"
@@ -492,10 +464,34 @@ onUnmounted(() => {
           <Icon :name="item.icon" :size="16" />
           <span v-show="!sidebarCollapsed" class="nav-label">{{ item.label }}</span>
         </router-link>
+
+        <!-- 更多（收起的低频页面） -->
+        <button
+          class="nav-item nav-item--more"
+          :class="{ 'nav-item--collapsed': sidebarCollapsed, 'nav-item--active': moreOpen }"
+          :title="sidebarCollapsed ? '更多' : undefined"
+          @click="moreOpen = !moreOpen"
+        >
+          <Icon name="chevron-down" :size="16" />
+          <span v-show="!sidebarCollapsed" class="nav-label">更多</span>
+        </button>
+        <div v-show="moreOpen && !sidebarCollapsed" class="more-menu">
+          <router-link
+            v-for="item in moreNavItems"
+            :key="item.path"
+            :to="item.path"
+            class="nav-item nav-item--more-link"
+            active-class="nav-item--active"
+            @click="moreOpen = false"
+          >
+            <Icon :name="item.icon" :size="16" />
+            <span class="nav-label">{{ item.label }}</span>
+          </router-link>
+        </div>
       </nav>
 
       <div class="git-section" v-show="!sidebarCollapsed">
-        <div class="git-label">版本历史</div>
+        <div class="git-label">自动保存</div>
 
         <!-- 通俗状态：小白只看「待保存 / 已保存」 -->
         <div class="git-state-row" v-if="ws.initialized">
@@ -503,77 +499,21 @@ onUnmounted(() => {
           <span class="git-state-text">
             {{
               hasUncommitted()
-                ? `${gitDirtySum()} 个文件有改动，待保存`
+                ? `${gitDirtySum()} 个文件有改动，稍后自动保存`
                 : ws.info?.head?.hasCommits
-                  ? '已保存 · 改动都已记录成版本'
-                  : '尚未保存过版本'
+                  ? '已自动保存'
+                  : '改动会自动保存成版本'
             }}
           </span>
         </div>
 
-        <div class="git-status-row" v-if="ws.initialized">
-          <span class="git-status-item" title="相对上次保存被修改的文件数">
-            <span class="git-status-dot" :class="{ 'dot--modified': (ws.info?.dirtyCounts?.modified || 0) > 0 }"></span>
-            <span class="git-status-num">{{ ws.info?.dirtyCounts?.modified || 0 }}</span>
-            <span class="git-status-text">修改</span>
-          </span>
-          <span class="git-status-item" title="工作区里新出现的文件数">
-            <span class="git-status-dot" :class="{ 'dot--untracked': (ws.info?.dirtyCounts?.untracked || 0) > 0 }"></span>
-            <span class="git-status-num">{{ ws.info?.dirtyCounts?.untracked || 0 }}</span>
-            <span class="git-status-text">新文件</span>
-          </span>
-          <span class="git-status-item" title="相对上次保存被删除的文件数">
-            <span class="git-status-dot" :class="{ 'dot--deleted': (ws.info?.dirtyCounts?.deleted || 0) > 0 }"></span>
-            <span class="git-status-num">{{ ws.info?.dirtyCounts?.deleted || 0 }}</span>
-            <span class="git-status-text">删除</span>
-          </span>
-        </div>
-
-        <div class="git-btn-row">
-          <button
-            class="git-commit-btn git-commit-btn--auto"
-            :disabled="autoCommitting || !hasUncommitted()"
-            @click="handleAutoCommit"
-            title="把当前所有改动保存成一个新版本"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
-            {{ autoCommitting ? '…' : '保存' }}
-          </button>
-          <button
-            class="git-commit-btn git-commit-btn--manual"
-            :disabled="!hasUncommitted()"
-            @click="openCommitDialog"
-            title="保存当前改动，并给这个版本写一句说明（可选）"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-            <span class="git-commit-btn__label">{{ autoCommitting ? '…' : '保存并备注' }}</span>
-          </button>
-        </div>
-
-        <!-- 高级：分支 / HEAD 等专业信息（默认折叠，给想看的用户） -->
-        <details class="git-advanced" v-if="ws.initialized && ws.info?.head">
-          <summary class="git-advanced__summary">高级</summary>
-          <div class="git-advanced__body">
-            <div class="git-branch-row">
-              <Icon name="git-branch" :size="14" :color="'var(--c-icon-secondary)'" />
-              <span class="git-branch-name">{{ gitBranchName }}</span>
-            </div>
-            <div class="git-head-row">
-              <span class="git-head">
-                <span class="git-head__label">HEAD</span>
-                <span class="git-head__hash">{{ headHashShort() || '—' }}</span>
-                <span class="git-head__sep">·</span>
-                <span class="git-head__count">{{ ws.info.head?.countFiles ?? 0 }} 文件</span>
-                <span class="git-head__sep">·</span>
-                <span class="git-head__count">{{ ws.info.head?.changedFiles ?? 0 }} 改动</span>
-              </span>
-            </div>
-          </div>
-        </details>
-
-        <div v-if="autoCommitResult" class="git-result" :class="autoCommitResult.startsWith('已保存') ? 'git-result--success' : ''">
-          {{ autoCommitResult }}
-        </div>
+        <button
+          v-if="hasUncommitted()"
+          class="git-save-quick"
+          @click="openCommitDialog()"
+        >
+          保存改动
+        </button>
       </div>
 
       <div class="sidebar-footer">
@@ -596,14 +536,6 @@ onUnmounted(() => {
 
     <!-- 路由出口 -->
     <main class="app-main">
-      <!-- 队列异常提示条（修复 L-4：轮询的队列状态现在有 UI 消费） -->
-      <div v-if="queueStatus?.paused || queueStatus?.error" class="queue-banner">
-        <Icon name="git-branch" :size="13" />
-        <span class="queue-banner__text">
-          {{ queueStatus.paused ? '任务队列已暂停' : '任务队列异常' }}
-          <template v-if="queueStatus.error">：{{ queueStatus.error }}</template>
-        </span>
-      </div>
       <router-view />
     </main>
 
@@ -769,7 +701,7 @@ onUnmounted(() => {
       <div class="vc-guide-toast__body">
         <span class="vc-guide-toast__title">你的文件会自动记录版本</span>
         <span class="vc-guide-toast__text">
-          修改或删除文件后，稍等片刻系统会自动保存一个版本。想找回旧内容，随时在左侧「版本历史」或文件详情里点「恢复此版本」。
+          修改或删除文件后，稍等片刻系统会自动保存一个版本。想找回旧内容，随时在左侧「版本记录」或文件详情里点「恢复此版本」。
         </span>
       </div>
       <button class="vc-guide-toast__close" title="知道了" @click="vcGuideVisible = false">×</button>
@@ -932,6 +864,25 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
+/* ── 「更多」折叠菜单（S2）── */
+.nav-item--more {
+  background: none;
+  border: none;
+  width: 100%;
+}
+.more-menu {
+  margin: 2px 0 4px 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--c-border);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.nav-item--more-link {
+  font-size: 12.5px;
+  padding: 6px 10px;
+}
+
 /* ── 版本控制 ── */
 .git-section {
   margin-top: 8px;
@@ -968,6 +919,21 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--c-text-secondary);
   line-height: 1.4;
+}
+/* 保存快捷按钮（仅在有改动时出现） */
+.git-save-quick {
+  margin: 2px 10px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  border: none;
+  background: var(--c-accent);
+  color: #fff;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: opacity 0.1s;
+}
+.git-save-quick:hover {
+  opacity: 0.9;
 }
 /* 高级折叠区：分支 / HEAD 等专业信息 */
 .git-advanced {

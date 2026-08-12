@@ -3,7 +3,7 @@
 // 目标：小白在 3 步内成功用起来，无需理解 base_url/模型名等概念。
 import { ref, computed } from 'vue'
 import { useWorkspaceStore } from '@/stores/workspace'
-import { browsePickDir } from '@/api/client'
+import { browsePickDir, fetchModels, translateApiError } from '@/api/client'
 import { PROVIDER_PRESETS, CUSTOM_PROVIDER_ID } from '@/data/providers'
 import Icon from '@/components/Icon.vue'
 
@@ -29,10 +29,16 @@ async function pickFolder() {
     const res = await browsePickDir(workspacePath.value || undefined)
     if (!res.cancelled && res.path) workspacePath.value = res.path
   } catch (e: any) {
-    pickMsg.value = e.message || '选择文件夹失败'
+    pickMsg.value = translateApiError(e?.message)
   } finally {
     pickingDir.value = false
   }
+}
+
+// 关闭向导：正在初始化时不允许关闭（避免打断保存流程）
+function closeWizard() {
+  if (starting.value) return
+  emit('done')
 }
 
 // ── 步骤 2：连接 AI（可选）──
@@ -56,22 +62,59 @@ const rerankBaseUrl = ref('')
 function applyProvider(kind: 'chat' | 'embed' | 'rerank', id: string) {
   const p = PROVIDER_PRESETS.find((x) => x.id === id)
   if (!p) return
+  // 只填接口地址与默认维度；模型由「获取模型」拉取真实列表后选择（避免预设与账户可用模型不符）
   if (kind === 'chat') {
     if (p.chatBaseUrl) llmBaseUrl.value = p.chatBaseUrl
-    if (p.chatModels.length) llmModel.value = p.chatModels[0]
+    llmModel.value = ''
+    llmFetchedModels.value = []
+    llmModelsError.value = ''
   } else if (kind === 'embed') {
     if (p.embedBaseUrl) embedBaseUrl.value = p.embedBaseUrl
-    if (p.embedModels.length) embedModel.value = p.embedModels[0]
     if (p.embedDim) embedDimensions.value = p.embedDim
+    embedModel.value = ''
+    embedFetchedModels.value = []
+    embedModelsError.value = ''
   } else {
     if (p.rerankBaseUrl) rerankBaseUrl.value = p.rerankBaseUrl
-    if (p.rerankModels.length) rerankModel.value = p.rerankModels[0]
+    rerankModel.value = ''
+    rerankFetchedModels.value = []
+    rerankModelsError.value = ''
   }
 }
 
-const llmPreset = computed(() => PROVIDER_PRESETS.find((x) => x.id === llmProviderId.value) || null)
-const embedPreset = computed(() => PROVIDER_PRESETS.find((x) => x.id === embedProviderId.value) || null)
-const rerankPreset = computed(() => PROVIDER_PRESETS.find((x) => x.id === rerankProviderId.value) || null)
+// 获取模型：填好密钥后拉取该服务的真实模型列表
+const llmFetchedModels = ref<string[]>([])
+const embedFetchedModels = ref<string[]>([])
+const rerankFetchedModels = ref<string[]>([])
+const fetchingModels = ref<'chat' | 'embed' | 'rerank' | ''>('')
+const llmModelsError = ref('')
+const embedModelsError = ref('')
+const rerankModelsError = ref('')
+
+async function fetchWizardModels(kind: 'chat' | 'embed' | 'rerank') {
+  const baseUrl = kind === 'chat' ? llmBaseUrl.value : kind === 'embed' ? embedBaseUrl.value : rerankBaseUrl.value
+  const apiKey = kind === 'chat' ? llmApiKey.value : kind === 'embed' ? embedApiKey.value : rerankApiKey.value
+  const errRef = kind === 'chat' ? llmModelsError : kind === 'embed' ? embedModelsError : rerankModelsError
+  const hitRef = kind === 'chat' ? llmFetchedModels : kind === 'embed' ? embedFetchedModels : rerankFetchedModels
+  errRef.value = ''
+  if (!baseUrl.trim()) {
+    errRef.value = '请先选择服务商'
+    return
+  }
+  if (!apiKey.trim()) {
+    errRef.value = '请先填入 API Key 再获取模型'
+    return
+  }
+  fetchingModels.value = kind
+  try {
+    hitRef.value = await fetchModels({ kind, baseUrl: baseUrl.trim(), apiKey: apiKey.trim() || undefined })
+    if (hitRef.value.length === 0) errRef.value = '该服务没有返回可用模型，请检查服务地址和密钥'
+  } catch (e: any) {
+    errRef.value = translateApiError(e?.message) || '获取模型失败'
+  } finally {
+    fetchingModels.value = ''
+  }
+}
 
 function modelOptions(models: string[], current: string): string[] {
   const opts = [...models]
@@ -118,14 +161,18 @@ function next() {
     pickMsg.value = '请先选择要管理的文件夹'
     return
   }
+  startError.value = ''
   step.value++
 }
 </script>
 
 <template>
   <Teleport to="body">
-    <div v-if="visible" class="obw-mask">
+    <div v-if="visible" class="obw-mask" @click.self="closeWizard">
       <div class="obw-card">
+        <button class="obw-close" title="关闭向导" @click="closeWizard">
+          <Icon name="x" :size="16" />
+        </button>
         <!-- 步骤指示 -->
         <div class="obw-head">
           <div class="obw-logo">
@@ -157,6 +204,7 @@ function next() {
             </button>
           </div>
           <span v-if="pickMsg" class="obw-err">{{ pickMsg }}</span>
+          <span v-if="startError" class="obw-err">{{ startError }}</span>
         </div>
 
         <!-- 步骤 2：连接 AI（可选） -->
@@ -181,20 +229,28 @@ function next() {
                 <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                 <option :value="CUSTOM_PROVIDER_ID">自定义</option>
               </select>
-              <select
-                v-if="llmPreset && llmPreset.chatModels.length"
-                v-model="llmModel"
-                class="select obp-model"
-              >
-                <option v-for="m in modelOptions(llmPreset.chatModels, llmModel)" :key="m" :value="m">{{ m }}</option>
-              </select>
               <input
                 v-model="llmApiKey"
                 class="input obw-key"
                 type="password"
                 placeholder="API Key（粘贴）"
               />
+              <button
+                class="btn btn-ghost btn-sm obw-fetch"
+                :disabled="fetchingModels === 'chat'"
+                @click="fetchWizardModels('chat')"
+              >
+                {{ fetchingModels === 'chat' ? '获取中…' : '获取模型' }}
+              </button>
             </div>
+            <select
+              v-if="llmFetchedModels.length"
+              v-model="llmModel"
+              class="select obw-model"
+            >
+              <option v-for="m in modelOptions(llmFetchedModels, llmModel)" :key="m" :value="m">{{ m }}</option>
+            </select>
+            <span v-if="llmModelsError" class="obw-err">{{ llmModelsError }}</span>
           </div>
 
           <!-- 内容整理 -->
@@ -212,20 +268,28 @@ function next() {
                 <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                 <option :value="CUSTOM_PROVIDER_ID">自定义</option>
               </select>
-              <select
-                v-if="embedPreset && embedPreset.embedModels.length"
-                v-model="embedModel"
-                class="select obp-model"
-              >
-                <option v-for="m in modelOptions(embedPreset.embedModels, embedModel)" :key="m" :value="m">{{ m }}</option>
-              </select>
               <input
                 v-model="embedApiKey"
                 class="input obw-key"
                 type="password"
                 placeholder="API Key（粘贴）"
               />
+              <button
+                class="btn btn-ghost btn-sm obw-fetch"
+                :disabled="fetchingModels === 'embed'"
+                @click="fetchWizardModels('embed')"
+              >
+                {{ fetchingModels === 'embed' ? '获取中…' : '获取模型' }}
+              </button>
             </div>
+            <select
+              v-if="embedFetchedModels.length"
+              v-model="embedModel"
+              class="select obw-model"
+            >
+              <option v-for="m in modelOptions(embedFetchedModels, embedModel)" :key="m" :value="m">{{ m }}</option>
+            </select>
+            <span v-if="embedModelsError" class="obw-err">{{ embedModelsError }}</span>
           </div>
 
           <!-- 排序优化（可选） -->
@@ -240,20 +304,28 @@ function next() {
                 <option v-for="p in PROVIDER_PRESETS" :key="p.id" :value="p.id">{{ p.name }}</option>
                 <option :value="CUSTOM_PROVIDER_ID">自定义</option>
               </select>
-              <select
-                v-if="rerankPreset && rerankPreset.rerankModels.length"
-                v-model="rerankModel"
-                class="select obp-model"
-              >
-                <option v-for="m in modelOptions(rerankPreset.rerankModels, rerankModel)" :key="m" :value="m">{{ m }}</option>
-              </select>
               <input
                 v-model="rerankApiKey"
                 class="input obw-key"
                 type="password"
                 placeholder="API Key（粘贴）"
               />
+              <button
+                class="btn btn-ghost btn-sm obw-fetch"
+                :disabled="fetchingModels === 'rerank'"
+                @click="fetchWizardModels('rerank')"
+              >
+                {{ fetchingModels === 'rerank' ? '获取中…' : '获取模型' }}
+              </button>
             </div>
+            <select
+              v-if="rerankFetchedModels.length"
+              v-model="rerankModel"
+              class="select obw-model"
+            >
+              <option v-for="m in modelOptions(rerankFetchedModels, rerankModel)" :key="m" :value="m">{{ m }}</option>
+            </select>
+            <span v-if="rerankModelsError" class="obw-err">{{ rerankModelsError }}</span>
           </details>
 
           <p v-if="hasAnyAI" class="obw-ok">✓ 已填写 AI 信息，可直接下一步</p>
@@ -284,7 +356,7 @@ function next() {
               <span class="obw-done__icon">🎉</span>
               <h3 class="obw-title">已开始使用！</h3>
               <p class="obw-desc">
-                你的文件会自动记录版本，改动后稍等片刻即生成新版本，随时可在左侧「版本历史」找回。
+                你的文件会自动记录版本，改动后稍等片刻即生成新版本，随时可在左侧「版本记录」找回。
                 {{ hasAnyAI ? 'AI 功能已就绪，可以开始按内容搜索和问答了。' : '连接 AI 后即可按内容搜索和问答，随时可在设置里补。' }}
               </p>
             </div>
@@ -330,6 +402,7 @@ function next() {
   padding: 20px;
 }
 .obw-card {
+  position: relative;
   width: 560px;
   max-width: 94vw;
   max-height: 90vh;
@@ -341,6 +414,25 @@ function next() {
   padding: 24px 28px;
   display: flex;
   flex-direction: column;
+}
+.obw-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--r-md);
+  background: none;
+  color: var(--c-text-tertiary);
+  cursor: pointer;
+}
+.obw-close:hover {
+  background: var(--c-bg-hover);
+  color: var(--c-text-primary);
 }
 .obw-head {
   display: flex;
@@ -451,11 +543,15 @@ function next() {
 .obw-provider {
   flex: 1.2;
 }
-.obp-model {
-  flex: 1.4;
+.obw-fetch {
+  flex-shrink: 0;
 }
 .obw-key {
   flex: 1;
+}
+.obw-model {
+  margin-top: 8px;
+  width: 100%;
 }
 .obw-ai-advanced {
   font-size: 12.5px;

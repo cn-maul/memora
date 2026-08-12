@@ -145,14 +145,20 @@ export const useQAStore = defineStore('qa', () => {
           params,
           (chunk) => {
             if (mySeq !== sendSeq.value) return
-            // 流式节流：chunk 高频到达时先累积，定时（60ms）批量刷新 content，
-            // 避免每个 chunk 都触发整条消息的 Markdown 全量重渲染
             if (chunk.startsWith(THINK_PREFIX)) {
               thinkPending += chunk.slice(THINK_PREFIX.length)
             } else {
               pending += chunk
             }
-            if (!flushTimer) flushTimer = setTimeout(() => flush(mySeq), 60)
+            // 流式节流：高频 chunk 先累积再刷新，避免每 chunk 触发整条消息
+            // 的 Markdown 全量重渲染。但"累积"会让用户看到"字一次性出来"的错觉，
+            // 故采用双策略：①小增量走 16ms 批量刷新（接近刷新率，肉眼仍为渐进）；
+            // ②一旦累积达 8 字符立即刷新，保证首字与节奏及时可见。
+            if (!flushTimer) {
+              flushTimer = setTimeout(() => flush(mySeq), 16)
+            } else if (pending.length >= 8 || thinkPending.length >= 8) {
+              flush(mySeq)
+            }
           },
           (result) => {
             if (mySeq !== sendSeq.value) return

@@ -147,6 +147,18 @@ async function handleSend() {
   scrollToBottom()
 }
 
+// 示例问题：新手点一下就能问（S4：降低提问门槛）
+const exampleQuestions = [
+  '帮我把工作文件夹里的文档做个总结',
+  '我在哪些文档里写过关于预算的内容？',
+  '最近一个月有哪些文件改动比较大？',
+]
+function askExample(q: string) {
+  if (mode.value === 'file') return
+  question.value = q
+  handleSend()
+}
+
 function selectSession(s: QASession) {
   qa.selectSession(s.id)
   mode.value = s.mode
@@ -202,7 +214,13 @@ function renderMarkdown(text: string): string {
     refs.push({ path: (path || '').trim(), seq: seq || '' })
     return FILE_REF_PLACEHOLDER
   })
-  let html = marked.parse(withPlaceholders, { async: false }) as string
+  // 配置：启用 GFM 换行（单个 \n 渲染为 <br>），
+  // 保证 #-标题 / -无序 / 1.有序 / **粗体 等 Markdown 按预期呈现。
+  let html = marked.parse(withPlaceholders, {
+    async: false,
+    gfm: true,
+    breaks: true,
+  }) as string
   if (!html) return ''
   // 先还原链接再做 XSS 剥离：链接本身安全（href 仅 #，真实路径在 data-path），
   // 且占位符若先过 DOMParser 会被替换为 U+FFFD 导致匹配失败
@@ -372,6 +390,16 @@ function stripDangerousHtml(html: string): string {
           </div>
           <h3>{{ qa.currentSessionId ? '开始提问吧' : '选择会话或创建新会话开始提问' }}</h3>
           <p>基于文档向内容语义问答，引用可溯源。</p>
+          <div v-if="mode !== 'file'" class="qa-examples">
+            <button
+              v-for="q in exampleQuestions"
+              :key="q"
+              class="qa-example"
+              @click="askExample(q)"
+            >
+              {{ q }}
+            </button>
+          </div>
         </div>
         <div v-else>
           <div
@@ -668,6 +696,32 @@ function stripDangerousHtml(html: string): string {
   margin: 0;
 }
 
+/* 示例问题（S4） */
+.qa-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 24px;
+  width: 100%;
+  max-width: 340px;
+}
+.qa-example {
+  padding: 10px 14px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-panel);
+  color: var(--c-text-secondary);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.1s, color 0.1s, background 0.1s;
+}
+.qa-example:hover {
+  border-color: var(--c-accent);
+  color: var(--c-text-primary);
+  background: var(--c-bg-hover);
+}
+
 /* 消息气泡 */
 .message {
   display: flex;
@@ -760,6 +814,132 @@ function stripDangerousHtml(html: string): string {
   border: 1px solid var(--c-border);
   border-top-left-radius: var(--r-xs);
   color: var(--c-text-primary);
+}
+
+/* ─────── Markdown 元素样式（AI 回答） ─────── */
+
+/* 段间距：标题/列表前后留呼吸感，但不把整个段落撑得太开 */
+.message-content h1,
+.message-content h2,
+.message-content h3,
+.message-content h4,
+.message-content h5,
+.message-content h6,
+.message-content p,
+.message-content ul,
+.message-content ol,
+.message-content pre,
+.message-content blockquote {
+  margin: 0.45em 0;
+}
+.message-content > h1:first-child,
+.message-content > h2:first-child,
+.message-content > h3:first-child,
+.message-content > h4:first-child,
+.message-content > h5:first-child,
+.message-content > h6:first-child,
+.message-content > p:first-child {
+  margin-top: 0;
+}
+.message-content > :last-child {
+  margin-bottom: 0;
+}
+
+/* 标题：缩小到对话可读范围，避免 h1 喧宾夺主 */
+.message-content h1 {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.4;
+  margin-top: 0.7em;
+  color: var(--c-text-primary);
+}
+.message-content h2 {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.45;
+  color: var(--c-text-primary);
+}
+.message-content h3 {
+  font-size: 14.5px;
+  font-weight: 700;
+  line-height: 1.5;
+  color: var(--c-brand);
+}
+.message-content h4,
+.message-content h5,
+.message-content h6 {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--c-text-primary);
+}
+
+/* 加粗：在正文色之上再压一档对比 */
+.message-content strong {
+  font-weight: 700;
+  color: var(--c-text-primary);
+}
+
+/* 无序列表：自定义小圆点（默认 ::marker 在 pre-wrap 下易跑偏） */
+.message-content ul,
+.message-content ol {
+  padding-left: 20px;
+}
+.message-content li {
+  margin: 0.15em 0;
+  line-height: 1.7;
+}
+.message-content ul ul,
+.message-content ol ol,
+.message-content ul ol,
+.message-content ol ul {
+  margin: 0.2em 0;
+}
+
+/* 行内代码：与文件链接/正文区分 */
+.message-content code {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.1em 0.4em;
+  margin: 0 0.05em;
+  background: var(--c-bg-hover, #f1f3f5);
+  border-radius: var(--r-xs);
+  color: var(--c-text-primary);
+}
+
+/* 代码块 */
+.message-content pre {
+  overflow-x: auto;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: var(--c-bg-hover, #f1f3f5);
+  border: 1px solid var(--c-border);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.message-content pre code {
+  padding: 0;
+  margin: 0;
+  background: transparent;
+}
+
+/* 引用 */
+.message-content blockquote {
+  margin-left: 0;
+  padding: 2px 10px;
+  border-left: 3px solid var(--c-border);
+  color: var(--c-text-secondary);
+}
+
+/* 链接 */
+.message-content a:not(.msg-file-link) {
+  color: var(--c-brand);
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  transition: text-decoration-color 0.12s;
+}
+.message-content a:not(.msg-file-link):hover {
+  text-decoration-color: var(--c-brand);
 }
 
 /* 消息内的文件引用链接 */

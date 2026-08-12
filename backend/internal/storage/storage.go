@@ -727,6 +727,16 @@ func (m *Module) VectorsSearch(queryVec []float32, topK int) ([]contract.VectorE
 	return result, nil
 }
 
+// VectorCount 查询已存在的向量总数（用于判断"维度变更后是否确有存量向量需重建"）。
+// 单独统计：不依赖内存索引，直接从 chunk_vectors 表计数。
+func (m *Module) VectorCount() (int, error) {
+	var cnt int
+	if err := m.db.QueryRow("SELECT COUNT(*) FROM chunk_vectors").Scan(&cnt); err != nil {
+		return 0, fmt.Errorf("[storage] 统计向量数量失败: %w", err)
+	}
+	return cnt, nil
+}
+
 // ──────────────────── 标签操作 ─────────────────────
 
 // TagsList 列出所有标签（含计数）

@@ -11,6 +11,7 @@ const enabled = ref(true)
 const range = ref('week')
 const loading = ref(false)
 const exporting = ref(false)
+const exportOpen = ref(false)
 const loadError = ref('')
 
 onMounted(async () => {
@@ -76,14 +77,20 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
         <p class="page-sub">工作节奏与文档活跃度总览</p>
       </div>
       <div class="header-actions">
-        <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="doExport('csv')">
-          <Icon name="external" :size="13" />
-          导出 CSV
-        </button>
-        <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="doExport('md')">
-          <Icon name="external" :size="13" />
-          导出 Markdown
-        </button>
+        <div class="export-menu">
+          <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportOpen = !exportOpen">
+            <Icon name="external" :size="13" />
+            {{ exporting ? '导出中…' : '导出' }}
+          </button>
+          <div v-if="exportOpen" class="export-menu__pop">
+            <button class="export-menu__item" :disabled="exporting" @click="doExport('csv'); exportOpen = false">
+              CSV（表格，适合 Excel 打开）
+            </button>
+            <button class="export-menu__item" :disabled="exporting" @click="doExport('md'); exportOpen = false">
+              Markdown（适合文档）
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -387,5 +394,38 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
   margin-top: 8px;
   font-size: 12.5px;
   color: var(--c-text-tertiary);
+}
+
+/* 导出菜单（S4：收敛为单个入口） */
+.export-menu {
+  position: relative;
+}
+.export-menu__pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 50;
+  min-width: 210px;
+  padding: 4px;
+  background: var(--c-bg-panel);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-pop);
+}
+.export-menu__item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: none;
+  text-align: left;
+  font-size: 12.5px;
+  color: var(--c-text-secondary);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.export-menu__item:hover {
+  background: var(--c-bg-hover);
+  color: var(--c-text-primary);
 }
 </style>

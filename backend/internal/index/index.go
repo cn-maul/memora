@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -57,13 +58,16 @@ type Module struct {
 	workspace    string
 	chunkSize    int
 	chunkOverlap int
-	embedDim     int
-	mu           sync.Mutex
+	// embedDim 用原子量承载：构造时注入，运行期可由 SetEmbedDim 刷新（如用户改了
+	// embed.dimensions 配置触发自动重建索引）。FullReindex 跑在独立 goroutine，
+	// ProcessFile 读取维度也必须走原子读，避免"配置已更新但维度仍取旧值"导致幂等跳过失效。
+	embedDim atomic.Int64
+	mu       sync.Mutex
 }
 
 // New 创建索引模块
 func New(storage IStorage, extract IExtract, llm ILLM, events IEvents, workspace string, chunkSize, chunkOverlap, embedDim int) *Module {
-	return &Module{
+	m := &Module{
 		storage:      storage,
 		extract:      extract,
 		llm:          llm,
@@ -71,8 +75,22 @@ func New(storage IStorage, extract IExtract, llm ILLM, events IEvents, workspace
 		workspace:    workspace,
 		chunkSize:    chunkSize,
 		chunkOverlap: chunkOverlap,
-		embedDim:     embedDim,
 	}
+	m.embedDim.Store(int64(embedDim))
+	return m
+}
+
+// SetEmbedDim 运行期刷新嵌入维度（响应 embed.dimensions 配置变更）。
+// 调用方随后应触发 FullReindex，让存量文件按新维度重嵌入；否则查询侧维度与存量
+// 向量不匹配，cosine 全 0、检索恒为空。
+func (m *Module) SetEmbedDim(dim int64) {
+	m.embedDim.Store(dim)
+	logx.Info("index", "嵌入维度已刷新", "dim", dim)
+}
+
+// embedDimGet 原子读取当前嵌入维度
+func (m *Module) embedDimGet() int64 {
+	return m.embedDim.Load()
 }
 
 // ──────────────────── 分块算法（附录 C.4）────────────────────
@@ -499,11 +517,11 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 		skip := false
 		if existingChunks, cerr := m.storage.ChunksByFile(file.ID); cerr == nil && len(existingChunks) > 0 {
 			dim, hasVec, derr := m.storage.FileVectorDim(file.ID)
-			if derr == nil && hasVec && dim == m.embedDim {
-				skip = true
-			} else {
-				logx.Info("index", "幂等跳过失效（维度变化），重新索引", "relPath", file.RelPath, "storedDim", dim, "expectDim", m.embedDim, "hasVec", hasVec)
-			}
+		if derr == nil && hasVec && int(dim) == int(m.embedDimGet()) {
+			skip = true
+		} else {
+			logx.Info("index", "幂等跳过失效（维度变化），重新索引", "relPath", file.RelPath, "storedDim", dim, "expectDim", int(m.embedDimGet()), "hasVec", hasVec)
+		}
 		} else {
 			// hash 相同但无分块：上次索引未完成，继续走完整流程以自愈
 			logx.Info("index", "幂等跳过失效，重新索引", "relPath", file.RelPath)
@@ -552,16 +570,17 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 		allVectors = append(allVectors, vecs...)
 	}
 
-	// 校验向量维度
-	for i, vec := range allVectors {
-		if len(vec) != m.embedDim {
-			errMsg := fmt.Sprintf("向量维度不匹配: 期望 %d, 实际 %d (第 %d 块)", m.embedDim, len(vec), i+1)
-			m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
-			// 控制台同步输出：排查"找不到文件"的关键日志（sources=[] 时查文件是否 failed）
-			logx.Error("index", "向量维度不匹配，文件标记失败", "relPath", file.RelPath, "expect", m.embedDim, "actual", len(vec))
-			return fmt.Errorf("[index] %s", errMsg)
+		// 校验向量维度
+		wantDim := int(m.embedDimGet())
+		for i, vec := range allVectors {
+			if len(vec) != wantDim {
+				errMsg := fmt.Sprintf("向量维度不匹配: 期望 %d, 实际 %d (第 %d 块)", wantDim, len(vec), i+1)
+				m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
+				// 控制台同步输出：排查"找不到文件"的关键日志（sources=[] 时查文件是否 failed）
+				logx.Error("index", "向量维度不匹配，文件标记失败", "relPath", file.RelPath, "expect", wantDim, "actual", len(vec))
+				return fmt.Errorf("[index] %s", errMsg)
+			}
 		}
-	}
 
 	// Step 5: 事务写入分块和向量
 	if err := m.storage.ChunksReplaceForFile(file.ID, chunks); err != nil {
@@ -578,7 +597,7 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 
 	for i, dbChunk := range dbChunks {
 		if i < len(allVectors) {
-			if err := m.storage.VectorsInsert(dbChunk.ID, allVectors[i], m.embedDim); err != nil {
+			if err := m.storage.VectorsInsert(dbChunk.ID, allVectors[i], int(m.embedDimGet())); err != nil {
 				m.storage.FilesMarkStatus(file.ID, "failed", fmt.Sprintf("写入向量失败: %v", err))
 				return fmt.Errorf("[index] 写入向量失败: %w", err)
 			}

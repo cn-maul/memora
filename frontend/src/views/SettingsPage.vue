@@ -304,6 +304,7 @@ function restartLabel(key: string): string {
     'markitdown.pythonPath': 'Python 路径',
     'markitdown.command': '提取命令',
     'markitdown.markitdownCmd': 'MarkItDown 路径',
+    'embed.dimensions': '向量维度',
   }
   return map[key] || key
 }
@@ -312,7 +313,7 @@ async function handleSaveSettings() {
   saving.value = true
   saveError.value = ''
   try {
-    const restartList = await settings.save({
+    const result = await settings.save({
       'llm.baseUrl': llmBaseUrl.value,
       'llm.model': llmModel.value,
       'llm.temperature': llmTemperature.value,
@@ -322,14 +323,13 @@ async function handleSaveSettings() {
       'rerank.baseUrl': rerankBaseUrl.value,
       'rerank.model': rerankModel.value,
       'markitdown.pythonPath': pythonPath.value,
-'markitdown.command': command.value,
-	      'markitdown.markitdownCmd': markitdownCmd.value,
-	      'index.scanIntervalSec': scanIntervalSec.value,
-	      'recent.windowHours': recentWindowHours.value,
-	      'workspace.path': workspacePath.value ?? undefined,
+      'markitdown.command': command.value,
+      'markitdown.markitdownCmd': markitdownCmd.value,
+      'index.scanIntervalSec': scanIntervalSec.value,
+      'recent.windowHours': recentWindowHours.value,
+      'workspace.path': workspacePath.value ?? undefined,
     })
     // 顺带保存表单里填写的密钥（非空才覆盖，保持"留空不修改"语义）。
-    // 修复：此前"保存设置"不保存 API Key，用户测试通过但真正请求仍用旧 key 导致 401。
     const hasKeys = llmApiKey.value || embedApiKey.value || rerankApiKey.value
     if (hasKeys) {
       await settings.saveSecrets(
@@ -341,11 +341,17 @@ async function handleSaveSettings() {
       embedApiKey.value = ''
       rerankApiKey.value = ''
     }
-    savedMsg.value =
-      restartList && restartList.length > 0
-        ? `已保存。以下设置将在重启后生效：${restartList.map((k) => restartLabel(k)).join('、')}`
-        : '已保存'
-    setTimeout(() => (savedMsg.value = ''), 6000)
+    // 三种提示：需重启 / 维度变更自动重建 / 纯保存成功
+    if (result.reindexRequired) {
+      savedMsg.value =
+        '已保存。检测到向量维度变更，正在后台自动重新整理索引，完成后按内容搜索即可生效（可在「内容整理」页查看进度）。'
+    } else if (result.restartRequired && result.restartRequired.length > 0) {
+      savedMsg.value =
+        `已保存。以下设置将在重启后生效：${result.restartRequired.map((k) => restartLabel(k)).join('、')}`
+    } else {
+      savedMsg.value = '已保存'
+    }
+    setTimeout(() => (savedMsg.value = ''), result.reindexRequired ? 12000 : 6000)
   } catch (e: any) {
     saveError.value = e?.message || '保存设置失败'
     setTimeout(() => (saveError.value = ''), 5000)
@@ -876,10 +882,10 @@ async function handleTest(type: string) {
                   />
                   <button
                     class="btn btn-ghost btn-sm"
-                    :disabled="testing === 'embed'"
-                    @click="handleTest('embed')"
+                    :disabled="fetchingModels === 'embed'"
+                    @click="handleFetchModels('embed')"
                   >
-                    {{ testing === 'embed' ? '测试中…' : '测试连接' }}
+                    {{ fetchingModels === 'embed' ? '获取中…' : '获取模型' }}
                   </button>
                 </div>
               </div>
@@ -909,10 +915,10 @@ async function handleTest(type: string) {
                 <div class="settings-row__control settings-row__control--action">
                   <button
                     class="btn btn-ghost btn-sm"
-                    :disabled="fetchingModels === 'embed'"
-                    @click="handleFetchModels('embed')"
+                    :disabled="testing === 'embed'"
+                    @click="handleTest('embed')"
                   >
-                    {{ fetchingModels === 'embed' ? '获取中…' : '获取模型' }}
+                    {{ testing === 'embed' ? '测试中…' : '测试连接' }}
                   </button>
                   <span
                     v-if="testEmbedResult"
@@ -998,10 +1004,10 @@ async function handleTest(type: string) {
                   />
                   <button
                     class="btn btn-ghost btn-sm"
-                    :disabled="testing === 'rerank'"
-                    @click="handleTest('rerank')"
+                    :disabled="fetchingModels === 'rerank'"
+                    @click="handleFetchModels('rerank')"
                   >
-                    {{ testing === 'rerank' ? '测试中…' : '测试连接' }}
+                    {{ fetchingModels === 'rerank' ? '获取中…' : '获取模型' }}
                   </button>
                 </div>
               </div>
@@ -1011,10 +1017,10 @@ async function handleTest(type: string) {
                 <div class="settings-row__control settings-row__control--action">
                   <button
                     class="btn btn-ghost btn-sm"
-                    :disabled="fetchingModels === 'rerank'"
-                    @click="handleFetchModels('rerank')"
+                    :disabled="testing === 'rerank'"
+                    @click="handleTest('rerank')"
                   >
-                    {{ fetchingModels === 'rerank' ? '获取中…' : '获取模型' }}
+                    {{ testing === 'rerank' ? '测试中…' : '测试连接' }}
                   </button>
                   <span
                     v-if="testRerankResult"
@@ -1100,10 +1106,10 @@ async function handleTest(type: string) {
                   />
                   <button
                     class="btn btn-ghost btn-sm"
-                    :disabled="testing === 'chat'"
-                    @click="handleTest('chat')"
+                    :disabled="fetchingModels === 'chat'"
+                    @click="handleFetchModels('chat')"
                   >
-                    {{ testing === 'chat' ? '测试中…' : '测试连接' }}
+                    {{ fetchingModels === 'chat' ? '获取中…' : '获取模型' }}
                   </button>
                 </div>
               </div>
@@ -1130,10 +1136,10 @@ async function handleTest(type: string) {
                 <div class="settings-row__control settings-row__control--action">
                   <button
                     class="btn btn-ghost btn-sm"
-                    :disabled="fetchingModels === 'chat'"
-                    @click="handleFetchModels('chat')"
+                    :disabled="testing === 'chat'"
+                    @click="handleTest('chat')"
                   >
-                    {{ fetchingModels === 'chat' ? '获取中…' : '获取模型' }}
+                    {{ testing === 'chat' ? '测试中…' : '测试连接' }}
                   </button>
                   <span
                     v-if="testChatResult"

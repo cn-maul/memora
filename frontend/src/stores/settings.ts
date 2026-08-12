@@ -20,12 +20,12 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  async function save(data: Record<string, any>): Promise<string[]> {
+  async function save(data: Record<string, any>): Promise<{ restartRequired: string[]; reindexRequired: boolean }> {
     loading.value = true
     try {
       const res = await updateSettings(data)
       await fetch()
-      return res.restartRequired ?? []
+      return { restartRequired: res.restartRequired ?? [], reindexRequired: res.reindexRequired ?? false }
     } finally {
       loading.value = false
     }

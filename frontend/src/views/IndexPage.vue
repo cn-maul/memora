@@ -7,6 +7,7 @@ import { useTagsStore } from '@/stores/tags'
 import { searchFiles, updateFileTags, browseOpen, reindexAll, retryFile as apiRetryFile, acceptSuggestion, rejectSuggestion } from '@/api/client'
 import type { SearchResult, FileItem } from '@/types'
 import Icon from '@/components/Icon.vue'
+import { statusLabel, statusClass, isAbnormal } from '@/utils/status'
 
 const router = useRouter()
 const ws = useWorkspaceStore()
@@ -25,12 +26,12 @@ const hasSearched = ref(false)
 // 状态/标签筛选（与后端 FilesList 状态机一致：pending/extracting/embedding/indexed/failed/ignored）
 const statusOptions = [
   { value: '', label: '全部状态' },
-  { value: 'pending', label: '等待整理' },
-  { value: 'extracting', label: '处理中' },
-  { value: 'embedding', label: '处理中' },
-  { value: 'indexed', label: '已整理' },
-  { value: 'failed', label: '失败' },
-  { value: 'ignored', label: '已忽略' },
+  { value: 'pending', label: '等待处理' },
+  { value: 'extracting', label: '正在准备' },
+  { value: 'embedding', label: '正在准备' },
+  { value: 'indexed', label: '可搜索' },
+  { value: 'failed', label: '出问题了' },
+  { value: 'ignored', label: '已跳过' },
 ]
 
 const fileError = ref('')
@@ -226,29 +227,6 @@ function formatTime(ms?: number) {
   const d = new Date(ms)
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-function statusLabel(s: string) {
-  const map: Record<string, string> = {
-    pending: '等待整理',
-    extracting: '处理中',
-    embedding: '处理中',
-    indexed: '已整理',
-    failed: '失败',
-    ignored: '已忽略',
-  }
-  return map[s] || s
-}
-
-function statusClass(s: string) {
-  const map: Record<string, string> = {
-    indexed: 'status-chip--ok',
-    extracting: 'status-chip--busy',
-    embedding: 'status-chip--busy',
-    failed: 'status-chip--err',
-    ignored: 'status-chip--muted',
-  }
-  return map[s] || 'status-chip--muted'
 }
 
 // 相关度分数 → 通俗等级（对小白不展示百分比，避免误以为是"准确率"）
@@ -479,7 +457,7 @@ function scoreLevel(score: number): string {
               f.docType
             }}</span>
             <span class="file-cell">
-              <span class="status-chip" :class="statusClass(f.indexStatus)">{{ statusLabel(f.indexStatus) }}</span>
+              <span v-if="isAbnormal(f.indexStatus)" class="status-chip" :class="statusClass(f.indexStatus)">{{ statusLabel(f.indexStatus) }}</span>
               <span v-if="f.lastError" class="file-err" :title="f.lastError">{{ f.lastError }}</span>
             </span>
             <span class="file-cell file-tags">

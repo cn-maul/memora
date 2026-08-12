@@ -353,34 +353,20 @@ function fileExt(name: string): string {
   return name.slice(i).toLowerCase()
 }
 
-// 索引状态文案与样式（与后端状态机一致：pending/extracting/embedding/indexed/failed/ignored。
-// 此前缺失 extracting/embedding，提取中/嵌入中的文件被误显示为"待索引"）
+// 索引状态文案与样式（共享模块统一，AllFilesPage 追加“不支持/忽略”特例。
+// 后端状态机：pending/extracting/embedding/indexed/failed/ignored）
+import { statusLabel as statusLabelShared, statusClass as statusClassShared, isAbnormal } from '@/utils/status'
+
 function statusLabel(e: BrowseEntry): string {
   if (e.isDir) return ''
   if (!e.indexable) return '不支持'
-  const map: Record<string, string> = {
-    indexed: '已索引',
-    pending: '待索引',
-    extracting: '提取中',
-    embedding: '嵌入中',
-    failed: '失败',
-    ignored: '已忽略',
-  }
-  return map[e.indexStatus || ''] || '待索引'
+  return statusLabelShared(e.indexStatus)
 }
 
 function statusClass(e: BrowseEntry): string {
   if (e.isDir) return ''
   if (!e.indexable) return 'status-chip--muted'
-  const map: Record<string, string> = {
-    indexed: 'status-chip--ok',
-    extracting: 'status-chip--busy',
-    embedding: 'status-chip--busy',
-    failed: 'status-chip--err',
-    pending: 'status-chip--muted',
-    ignored: 'status-chip--muted',
-  }
-  return map[e.indexStatus || ''] || 'status-chip--muted'
+  return statusClassShared(e.indexStatus)
 }
 </script>
 
@@ -513,7 +499,7 @@ function statusClass(e: BrowseEntry): string {
                 <span class="file-row-cell file-row-size">{{ e.isDir ? '' : formatSize(e.size) }}</span>
                 <span class="file-row-cell file-row-time">{{ formatTime(e.mtime) }}</span>
                 <span class="file-row-cell">
-                  <span v-if="!e.isDir" class="status-chip" :class="statusClass(e)">{{ statusLabel(e) }}</span>
+                  <span v-if="!e.isDir && (isAbnormal(e.indexStatus) || !e.indexable)" class="status-chip" :class="statusClass(e)">{{ statusLabel(e) }}</span>
                 </span>
                 <span class="file-row-cell file-row-actions">
                   <button
