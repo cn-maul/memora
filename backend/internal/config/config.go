@@ -122,7 +122,7 @@ func defaultConfig() *Config {
 	c.AutoCommit.DebounceSec = 90
 	c.Index.ChunkSize = 2000
 	c.Index.ChunkOverlap = 256
-	c.Index.ScanIntervalSec = 8
+	c.Index.ScanIntervalSec = 60                   // 低频 reconcile 兜底间隔（P2-16）：实时变更由 watcher 驱动，全盘扫描仅作低频 reconcile
 	c.Recent.WindowHours = 24                      // 最近文件默认展示"最近 24 小时"内修改的文件
 	c.Rerank.Model = "Pro/BAAI/bge-reranker-v2-m3" // 重排模型默认值（SiliconFlow）
 	c.QA.MaxContextChars = 30000

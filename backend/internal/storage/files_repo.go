@@ -132,6 +132,38 @@ func (m *Module) FilesGet(id int64) (*contract.FileInfo, error) {
 	return f, nil
 }
 
+// FilesByIDs 按 ID 集合批量获取文件（单条 WHERE id IN (...) 查询）。
+// 返回 map[id]*FileInfo；未命中的 ID 不出现在 map 中。替代逐条 FilesGet（消除 N+1）。
+func (m *Module) FilesByIDs(ids []int64) (map[int64]*contract.FileInfo, error) {
+	args := dedupeIDs(ids)
+	if len(args) == 0 {
+		return map[int64]*contract.FileInfo{}, nil
+	}
+	placeholders := strings.Repeat("?,", len(args))
+	placeholders = placeholders[:len(placeholders)-1]
+	rows, err := m.db.Query(
+		`SELECT id, rel_path, size, mtime, content_hash, doc_type, index_status, COALESCE(last_error,''), first_seen_at, COALESCE(last_indexed_at,0)
+		 FROM files WHERE id IN (`+placeholders+`)`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("[storage] 批量获取文件失败: %w", err)
+	}
+	defer rows.Close()
+
+	files := make(map[int64]*contract.FileInfo, len(args))
+	for rows.Next() {
+		f := &contract.FileInfo{}
+		if err := rows.Scan(&f.ID, &f.RelPath, &f.Size, &f.Mtime, &f.ContentHash, &f.DocType, &f.IndexStatus, &f.LastError, &f.FirstSeenAt, &f.LastIndexedAt); err != nil {
+			return nil, fmt.Errorf("[storage] 扫描批量文件行失败: %w", err)
+		}
+		files[f.ID] = f
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("[storage] 遍历批量文件失败: %w", err)
+	}
+	return files, nil
+}
+
 // FilesFindByName 按文件名/路径模糊搜索（LIKE 匹配），返回已索引文件。
 // 供 AI 问答的"标题模糊搜索"兜底：语义检索无结果时用文件名匹配定位文件。
 func (m *Module) FilesFindByName(keyword string, limit int) ([]*contract.FileInfo, error) {

@@ -64,6 +64,7 @@ func (s *charStorage) FilesRecent(sinceMs int64, limit int) ([]*contract.FileInf
 	return nil, nil
 }
 func (s *charStorage) VectorCount() (int, error) { return 0, nil }
+func (s *charStorage) Ping() error               { return nil }
 
 type charGit struct {
 	status map[string]string

@@ -14,6 +14,7 @@ import (
 
 	"memora/internal/browser"
 	"memora/internal/config"
+	"memora/internal/contract"
 	"memora/internal/credstore"
 	"memora/internal/events"
 	"memora/internal/extract"
@@ -89,7 +90,11 @@ type App struct {
 	credStore credstore.Store // 凭据存储（Windows DPAPI / 其他平台兜底）
 
 	ctx    context.Context
-	cancel context.CancelFunc // 关闭时取消后台轮询（pollPendingFiles）
+	cancel context.CancelFunc // 关闭时取消后台轮询（reconcileLoop 等）
+
+	// reconcile 低频 reconciliation 参数（默认 base=60s, max=300s, factor=2；测试可覆盖为毫秒级）
+	reconcile reconcileSettings
+
 	wsPath string
 }
 
@@ -119,7 +124,7 @@ func NewApp(ctx context.Context, configPath string) (*App, error) {
 		return nil, fmt.Errorf("[assembler] 创建配置模块失败: %w", err)
 	}
 
-	// 派生可取消 context，供关闭时停止 pollPendingFiles 等后台轮询（P0-04）
+	// 派生可取消 context，供关闭时停止 reconcileLoop 等后台轮询（P0-04）
 	runCtx, runCancel := context.WithCancel(ctx)
 
 	app := &App{
@@ -490,6 +495,9 @@ func (a *App) createTransport(evt *events.Module) *transport.Module {
 	handler.TaskQueue = a.TaskQueue
 	// 注入全量重建触发回调（P0-03）：经任务队列同 gen 合并执行，避免并发 FullReindex
 	handler.TriggerReindex = a.TriggerReindex
+	// 注入诊断信息（Phase 5）：/ready 与 /diagnostics 需要当前代标识与版本
+	handler.GenerationFunc = func() string { return a.runtime.Generation() }
+	handler.Version = "dev" // TODO(Phase 6): 发布时注入 buildVersion/commit
 
 	tr := transport.New(handler, evt)
 
@@ -563,8 +571,9 @@ func (a *App) Run() error {
 	// 7. 订阅 commit_done 事件，自动派发摘要任务
 	a.subscribeCommitDone()
 
-	// 8. 定期扫描 pending 文件，自动入队索引（修复 watch 漏检或防抖未触发的情况）
-	go a.pollPendingFiles()
+	// 8. 低频 reconcile 兜底循环：watcher 主导实时增量（见第 5 步 consumeWatchChanges），
+	//    本循环仅做低频 reconcile（一次磁盘遍历 + 批量 DB 比较），空闲时指数退避，不做 8 秒高频全盘扫描
+	go a.reconcileLoop()
 
 	// 9. 打开浏览器进入前端界面（自包含模式，纯网页形态）
 	if addr := a.Transport.Addr(); addr != "" {
@@ -656,63 +665,147 @@ func isHeavyDir(name string) bool {
 	return false
 }
 
-// pollPendingFiles 定期扫描磁盘新文件 + 数据库中 pending 文件，自动入队索引。
-// 扫描间隔从 config.index.scanIntervalSec 读取，运行时修改可立即生效。
-func (a *App) pollPendingFiles() {
-	for {
-		interval := 8
+// ──────────────────── 低频 reconciliation ────────────────────
+
+// defaultReconcileInterval 默认 reconcile 基础间隔（60s）。
+// 原 8 秒全盘扫描改为低频兜底（P2-16）：实时变更由 watcher 驱动，本循环只做低频 reconcile。
+const defaultReconcileInterval = 60 * time.Second
+
+// defaultReconcileMax 空闲退避上限（300s）：无变更时指数退避到此封顶。
+const defaultReconcileMax = 300 * time.Second
+
+// reconcileSettings reconcile 循环参数（base 默认 60s；测试可覆盖为毫秒级）。
+type reconcileSettings struct {
+	base   time.Duration // 基础间隔
+	max    time.Duration // 退避上限
+	factor float64       // 退避倍率（默认 2）
+}
+
+// withDefaults 补齐未设置的参数为默认值。
+func (s reconcileSettings) withDefaults() reconcileSettings {
+	if s.base <= 0 {
+		s.base = defaultReconcileInterval
+	}
+	if s.max <= 0 {
+		s.max = defaultReconcileMax
+	}
+	if s.factor <= 1 {
+		s.factor = 2
+	}
+	return s
+}
+
+// fileMeta 磁盘文件快照元数据
+type fileMeta struct {
+	size  int64 // 字节
+	mtime int64 // 毫秒
+}
+
+// reconcileDiff 一次 reconcile 的磁盘/DB 差异
+type reconcileDiff struct {
+	added   []string // 磁盘有而 DB 无（或 DB 已标记 ignored 后重新出现）
+	changed []string // DB 有且 size/mtime 变化
+	missing []string // DB 有（非 ignored）而磁盘无 → 标记删除
+}
+
+// reconcileBaseInterval 返回本次循环的基础间隔：
+// 优先取 config.index.scanIntervalSec（运行时修改可立即生效），否则用默认 60s。
+func (a *App) reconcileBaseInterval() time.Duration {
+	if a.Config != nil {
 		if v, err := a.Config.Get("index.scanIntervalSec"); err == nil {
-			if n, ok := v.(int); ok && n > 0 {
-				interval = n
+			if n := asInt(v); n > 0 {
+				return time.Duration(n) * time.Second
 			}
 		}
+	}
+	return a.reconcile.withDefaults().base
+}
+
+// reconcileLoop 低频 reconciliation 兜底循环（替换原 8 秒全盘扫描 pollPendingFiles）。
+// watcher（Changes 通道）在 Run 中已被 consumeWatchChanges 消费，负责实时增量；
+// 本循环仅作低频兜底，覆盖 watcher 遗漏的场景（启动前已存在/重启间隙变更/防抖遗漏等）。
+// 每轮一次 reconcileOnce（一次磁盘遍历 + 一次批量 DB 加载 + 内存比较，无逐文件 N+1），
+// 无变更时指数退避至 max（60→120→240→300s），有变更复位为基础间隔。
+func (a *App) reconcileLoop() {
+	reconcileLoopFunc(a.ctx, a.reconcileBaseInterval, a.reconcile, a.reconcileOnce)
+}
+
+// reconcileLoopFunc reconcile 主循环逻辑（独立函数便于测试）。
+// base 返回基础间隔（循环中可随 config 变化）；run 执行一次 reconcile 并返回是否发现变更。
+func reconcileLoopFunc(ctx context.Context, base func() time.Duration, settings reconcileSettings, run func() bool) {
+	next := base()
+	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
-		case <-time.After(time.Duration(interval) * time.Second):
+		case <-time.After(next):
 		}
 
-		// 1. 扫描磁盘新文件（不在数据库中的）
-		if a.wsPath != "" {
-			filepath.Walk(a.wsPath, func(path string, info os.FileInfo, err error) error {
-				if err != nil || info.IsDir() {
-					if info != nil && info.IsDir() {
-						if strings.HasPrefix(info.Name(), ".") || isHeavyDir(info.Name()) {
-							return filepath.SkipDir
-						}
-					}
-					return nil
-				}
-				relPath, _ := filepath.Rel(a.wsPath, path)
-				if relPath == "" {
-					return nil
-				}
-				// 只处理支持的文件类型
-				ext := strings.ToLower(filepath.Ext(relPath))
-				switch ext {
-				case ".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md":
-				default:
-					return nil
-				}
-				// 检查是否已在数据库中
-				existing, _ := a.Storage.FilesFindByRelPath(relPath)
-				if existing != nil {
-					return nil
-				}
-				// 新文件，提交提取任务
-				a.TaskQueue.Submit(&taskqueue.Task{
-					Type:    "extract",
-					Payload: map[string]interface{}{"relPath": relPath},
-				})
-				return nil
-			})
+		b := base()
+		s := settings.withDefaults()
+		s.base = b
+		if run() {
+			next = b // 有变更：复位为基础间隔
+		} else {
+			next = backoffInterval(next, s) // 无变更：指数退避
 		}
+	}
+}
 
-		// 2. 扫描数据库中 pending 状态的文件（已入库但未处理或处理中断）
-		files, _, err := a.Storage.FilesList("pending", "", 0, 100, "")
-		if err != nil {
-			continue
-		}
+// backoffInterval 计算下一次 reconcile 间隔：
+// 无变更时将 current 指数放大（×factor），封顶于 max；且不低于 base。
+func backoffInterval(current time.Duration, s reconcileSettings) time.Duration {
+	s = s.withDefaults()
+	next := time.Duration(float64(current) * s.factor)
+	if next > s.max {
+		next = s.max
+	}
+	if next < s.base {
+		next = s.base
+	}
+	return next
+}
+
+// reconcileOnce 执行一次 reconcile 并返回是否发现磁盘差异。
+//  1. 遍历磁盘收集受支持文件 → relPath → (size, mtime)；
+//  2. 批量加载 DB 全部文件 → relPath → FileInfo（分页遍历现有 FilesList，无新增 storage 方法）；
+//  3. 批量比较差异：磁盘有而 DB 无/曾删除 → extract；size/mtime 变化 → extract；
+//     DB 有而磁盘无 → delete_index（标记缺失）；
+//  4. 保持原有 pending 处理：DB 中 pending 状态（未完成/中断/失败）文件重新入队 extract。
+//
+// 注：不再逐文件 FilesFindByRelPath（消除 N+1）。
+func (a *App) reconcileOnce() bool {
+	if a.wsPath == "" || a.Storage == nil || a.TaskQueue == nil {
+		return false
+	}
+
+	disk, err := scanDiskSnapshot(a.wsPath)
+	if err != nil {
+		logx.Warn("app", "reconcile 扫描磁盘失败", "err", err.Error())
+		return false
+	}
+	dbFiles, err := loadDBFileMap(a.Storage)
+	if err != nil {
+		logx.Warn("app", "reconcile 加载数据库文件失败", "err", err.Error())
+		return false
+	}
+
+	diff := computeReconcileDiff(disk, dbFiles)
+	changed := false
+	for _, relPath := range append(diff.added, diff.changed...) {
+		a.TaskQueue.Submit(&taskqueue.Task{
+			Type:    "extract",
+			Payload: map[string]interface{}{"relPath": relPath},
+		})
+		changed = true
+	}
+	for _, relPath := range diff.missing {
+		a.TaskQueue.Submit(&taskqueue.Task{Type: "delete_index", Payload: relPath})
+		changed = true
+	}
+
+	// 保持原有 pending 处理：DB 中 pending 状态文件重新入队 extract
+	if files, _, err := a.Storage.FilesList("pending", "", 0, 100, ""); err == nil {
 		for _, f := range files {
 			a.TaskQueue.Submit(&taskqueue.Task{
 				Type:    "extract",
@@ -720,6 +813,92 @@ func (a *App) pollPendingFiles() {
 			})
 		}
 	}
+
+	return changed
+}
+
+// scanDiskSnapshot 遍历工作区，收集受支持文档的 (size, mtime) 快照。
+// 遍历规则与旧 pollPendingFiles 一致：跳过隐藏目录与重型/非文档目录（node_modules 等）。
+func scanDiskSnapshot(workspace string) (map[string]fileMeta, error) {
+	snap := make(map[string]fileMeta)
+	err := filepath.Walk(workspace, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if info != nil && info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.IsDir() {
+			if strings.HasPrefix(info.Name(), ".") || isHeavyDir(info.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		relPath, rerr := filepath.Rel(workspace, path)
+		if rerr != nil || relPath == "" {
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(relPath)) {
+		case ".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md":
+		default:
+			return nil
+		}
+		snap[relPath] = fileMeta{size: info.Size(), mtime: info.ModTime().UnixMilli()}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// loadDBFileMap 批量加载数据库全部文件 → rel_path 索引。
+// 分页遍历 FilesList（现有 API，不新增 storage 方法），排序固定 name:asc（rel_path 唯一，分页稳定）。
+func loadDBFileMap(st *storage.Module) (map[string]*contract.FileInfo, error) {
+	result := make(map[string]*contract.FileInfo)
+	const pageSize = 1000
+	page := 0
+	for {
+		files, total, err := st.FilesList("", "", page, pageSize, "name:asc")
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range files {
+			result[f.RelPath] = f
+		}
+		page++
+		if page*pageSize >= total {
+			break
+		}
+	}
+	return result, nil
+}
+
+// computeReconcileDiff 比较磁盘快照与 DB 快照，返回差异。
+// - added: 磁盘有而 DB 无，或 DB 已标记 ignored（曾被删除，现又出现）→ 入队 extract；
+// - changed: DB 有且 size/mtime 变化 → 入队 extract；
+// - missing: DB 有（非 ignored）而磁盘无 → 入队 delete_index（标记缺失）。
+func computeReconcileDiff(disk map[string]fileMeta, db map[string]*contract.FileInfo) reconcileDiff {
+	var diff reconcileDiff
+	for relPath, meta := range disk {
+		existing, ok := db[relPath]
+		switch {
+		case !ok, existing.IndexStatus == "ignored":
+			diff.added = append(diff.added, relPath)
+		case existing.Size != meta.size || existing.Mtime != meta.mtime:
+			diff.changed = append(diff.changed, relPath)
+		}
+	}
+	for relPath, f := range db {
+		if _, ok := disk[relPath]; ok {
+			continue
+		}
+		if f.IndexStatus == "ignored" {
+			continue // 已标记删除，无需重复处理
+		}
+		diff.missing = append(diff.missing, relPath)
+	}
+	return diff
 }
 
 // Shutdown 优雅关闭
@@ -735,7 +914,7 @@ func (a *App) Shutdown() {
 		}
 	}
 
-	// 2. 取消根 context，停掉 pollPendingFiles 等后台轮询
+	// 2. 取消根 context，停掉 reconcileLoop 等后台轮询
 	if a.cancel != nil {
 		a.cancel()
 	}

@@ -19,6 +19,14 @@ type fakeStorage struct {
 	exchanges []exchangeCall
 	notify    []string
 	createdAt int64
+
+	// buildContext 检索路径（测试用）：向量检索条目与逐条/批量查询数据
+	entries    []contract.VectorEntry
+	chunksByID map[int64]*contract.Chunk
+	filesByID  map[int64]*contract.FileInfo
+
+	chunksGetCalls int
+	filesGetCalls  int
 }
 
 type exchangeCall struct {
@@ -30,14 +38,30 @@ type exchangeCall struct {
 	sources      string
 }
 
-func (f *fakeStorage) FilesGet(id int64) (*contract.FileInfo, error) { return f.file, nil }
+func (f *fakeStorage) FilesGet(id int64) (*contract.FileInfo, error) {
+	f.mu.Lock()
+	f.filesGetCalls++
+	f.mu.Unlock()
+	if f.filesByID != nil {
+		return f.filesByID[id], nil
+	}
+	return f.file, nil
+}
 func (f *fakeStorage) FilesFindByName(keyword string, limit int) ([]*contract.FileInfo, error) {
 	return nil, nil
 }
 func (f *fakeStorage) ChunksByFile(fileID int64) ([]*contract.Chunk, error) { return f.chunks, nil }
-func (f *fakeStorage) ChunksGet(id int64) (*contract.Chunk, error)          { return nil, nil }
-func (f *fakeStorage) VectorsSearch(queryVec []float32, topK int) ([]contract.VectorEntry, error) {
+func (f *fakeStorage) ChunksGet(id int64) (*contract.Chunk, error) {
+	f.mu.Lock()
+	f.chunksGetCalls++
+	f.mu.Unlock()
+	if f.chunksByID != nil {
+		return f.chunksByID[id], nil
+	}
 	return nil, nil
+}
+func (f *fakeStorage) VectorsSearch(queryVec []float32, topK int) ([]contract.VectorEntry, error) {
+	return f.entries, nil
 }
 func (f *fakeStorage) QASessionsCreate(mode string, fileID int64) (int64, error) { return 1, nil }
 func (f *fakeStorage) QASessionsList() ([]*contract.QASession, error)            { return nil, nil }
@@ -108,7 +132,7 @@ func (f *fakeEvents) count() int {
 	return f.ready
 }
 
-func newFakeModule(st *fakeStorage, llm ILLM, ev *fakeEvents) *Module {
+func newFakeModule(st IStorage, llm ILLM, ev *fakeEvents) *Module {
 	if llm == nil {
 		llm = &fakeLLM{answer: "测试回答"}
 	}

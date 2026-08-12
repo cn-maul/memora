@@ -3,6 +3,7 @@
 package qa
 
 import (
+	"container/heap"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,118 @@ type IStorage interface {
 	QASessionsDelete(id int64) error
 	SaveExchange(sessionID int64, mode string, fileID int64, userMsg, assistantMsg, sources string, createdAt int64) (int64, int, error)
 	QAMessagesBySession(sessionID int64) ([]*contract.QAMessage, error)
+}
+
+// batchStore 可选的批量查询能力：实现它的存储可在 buildContext 中一次性取回
+// 多个分块/文件（单条 WHERE id IN 查询）。未实现时回退到逐条 ChunksGet/FilesGet，
+// 行为与旧实现等价（保持 IStorage 不变，不强制伪存储升级）。
+type batchStore interface {
+	ChunksByIDs(ids []int64) (map[int64]*contract.Chunk, error)
+	FilesByIDs(ids []int64) (map[int64]*contract.FileInfo, error)
+}
+
+// chunksForEntries 批量取回候选条目对应的分块（map[ChunkID]*Chunk）。
+// 存储实现 batchStore 时走单条 IN 查询（消除 N+1）；否则回退逐条 ChunksGet。
+func (m *Module) chunksForEntries(entries []contract.VectorEntry) (map[int64]*contract.Chunk, error) {
+	if len(entries) == 0 {
+		return map[int64]*contract.Chunk{}, nil
+	}
+	if b, ok := m.storage.(batchStore); ok {
+		ids := make([]int64, 0, len(entries))
+		for _, e := range entries {
+			ids = append(ids, e.ChunkID)
+		}
+		chunks, err := b.ChunksByIDs(ids)
+		if err != nil {
+			return nil, err
+		}
+		return chunks, nil
+	}
+	chunks := make(map[int64]*contract.Chunk, len(entries))
+	for _, e := range entries {
+		c, err := m.storage.ChunksGet(e.ChunkID)
+		if err != nil || c == nil {
+			continue
+		}
+		chunks[c.ID] = c
+	}
+	return chunks, nil
+}
+
+// filesForChunks 批量取回分块对应的文件（map[FileID]*FileInfo）。
+// 存储实现 batchStore 时走单条 IN 查询（消除 N+1）；否则回退逐条 FilesGet。
+func (m *Module) filesForChunks(chunks map[int64]*contract.Chunk) (map[int64]*contract.FileInfo, error) {
+	if len(chunks) == 0 {
+		return map[int64]*contract.FileInfo{}, nil
+	}
+	if b, ok := m.storage.(batchStore); ok {
+		ids := make([]int64, 0, len(chunks))
+		for _, c := range chunks {
+			ids = append(ids, c.FileID)
+		}
+		files, err := b.FilesByIDs(ids)
+		if err != nil {
+			return nil, err
+		}
+		return files, nil
+	}
+	files := make(map[int64]*contract.FileInfo, len(chunks))
+	for _, c := range chunks {
+		f, err := m.storage.FilesGet(c.FileID)
+		if err != nil || f == nil {
+			continue
+		}
+		files[f.ID] = f
+	}
+	return files, nil
+}
+
+// scoreHeap 固定容量小顶堆：堆顶是分数最低的元素（被优先淘汰）。
+type scoreHeap[T any] struct {
+	items []T
+	score func(T) float64
+}
+
+func (h *scoreHeap[T]) Len() int           { return len(h.items) }
+func (h *scoreHeap[T]) Less(i, j int) bool { return h.score(h.items[i]) < h.score(h.items[j]) }
+func (h *scoreHeap[T]) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *scoreHeap[T]) Push(x any)         { h.items = append(h.items, x.(T)) }
+func (h *scoreHeap[T]) Pop() any {
+	old := h.items
+	n := len(old)
+	x := old[n-1]
+	h.items = old[:n-1]
+	return x
+}
+
+// topKByScore 用固定容量小顶堆选出分数最高的 topK 个元素（bounded top-K，
+// 复杂度 O(N log K)，不做全量排序）。返回按分数从高到低；topK<=0 或空输入返回空切片。
+func topKByScore[T any](items []T, topK int, score func(T) float64) []T {
+	if topK <= 0 || len(items) == 0 {
+		return []T{}
+	}
+	if topK > len(items) {
+		topK = len(items)
+	}
+	h := &scoreHeap[T]{score: score}
+	for _, it := range items {
+		if h.Len() < topK {
+			heap.Push(h, it)
+		} else if score(it) > score(h.items[0]) {
+			// 新元素优于堆顶（当前最低分）：弹出最低分，压入新元素
+			heap.Pop(h)
+			heap.Push(h, it)
+		}
+	}
+	// 依次弹出得到"低分→高分"，反转得到"高分→低分"
+	out := make([]T, 0, h.Len())
+	for h.Len() > 0 {
+		out = append(out, heap.Pop(h).(T))
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
 // ILLM qa 所需的 llm 接口
@@ -420,6 +533,11 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 			// 全库搜索取回 2×块数，容忍其他文件高分块挤占，再按 fileID 过滤
 			entries, err := m.storage.VectorsSearch(queryVec, len(chunks)*2)
 			if err == nil {
+				// 批量拉取候选分块，替代逐条 ChunksGet（消除 N+1）
+				chunksByID, err := m.chunksForEntries(entries)
+				if err != nil {
+					return nil, nil, fmt.Errorf("[qa] 批量获取分块失败: %w", err)
+				}
 				type scoredChunk struct {
 					chunk *contract.Chunk
 					score float64
@@ -431,8 +549,8 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 					if e.ChunkID == 0 {
 						continue
 					}
-					chunk, err := m.storage.ChunksGet(e.ChunkID)
-					if err != nil || chunk == nil || chunk.FileID != req.FileID {
+					chunk := chunksByID[e.ChunkID]
+					if chunk == nil || chunk.FileID != req.FileID {
 						continue
 					}
 					scored = append(scored, scoredChunk{chunk: chunk, score: e.Score})
@@ -449,24 +567,18 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 						}
 					}
 				}
-				sort.Slice(scored, func(i, j int) bool {
-					return scored[i].score > scored[j].score
-				})
-				topK := 8
-				if len(scored) < topK {
-					topK = len(scored)
-				}
+				// bounded top-8：固定容量小顶堆只保留最高分 8 个，替代全量 sort.Slice
+				scored = topKByScore(scored, 8, func(s scoredChunk) float64 { return s.score })
 				// 按 maxContextChars 累计裁剪，防止上下文超限拖慢首 token
 				usedRunes := 0
-				for i := 0; i < topK; i++ {
-					c := scored[i].chunk
-					block := fmt.Sprintf("[文件=%s, 段落=%d]\n%s", file.RelPath, c.Seq, c.Text)
+				for _, c := range scored {
+					block := fmt.Sprintf("[文件=%s, 段落=%d]\n%s", file.RelPath, c.chunk.Seq, c.chunk.Text)
 					usedRunes += utf8.RuneCountInString(block)
 					if usedRunes > m.maxContextChars {
 						break
 					}
 					contextBlocks = append(contextBlocks, block)
-					sources = append(sources, contract.QASource{RelPath: file.RelPath, Seq: c.Seq})
+					sources = append(sources, contract.QASource{RelPath: file.RelPath, Seq: c.chunk.Seq})
 				}
 			}
 		}
@@ -478,6 +590,15 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 		}
 		entries, err := m.storage.VectorsSearch(queryVec, 100)
 		if err == nil {
+			// 批量拉取候选分块与文件，替代逐条 ChunksGet/FilesGet（消除 N+1）
+			chunksByID, err := m.chunksForEntries(entries)
+			if err != nil {
+				return nil, nil, fmt.Errorf("[qa] 批量获取分块失败: %w", err)
+			}
+			filesByID, err := m.filesForChunks(chunksByID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("[qa] 批量获取文件失败: %w", err)
+			}
 			type scored struct {
 				chunk *contract.Chunk
 				file  *contract.FileInfo
@@ -487,12 +608,12 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 			// 且维度不匹配时余弦全为 0 会被阈值清空导致"检索为空"。全部候选交给重排精排决定。
 			var scoredChunks []scored
 			for _, e := range entries {
-				chunk, err := m.storage.ChunksGet(e.ChunkID)
-				if err != nil || chunk == nil {
+				chunk := chunksByID[e.ChunkID]
+				if chunk == nil {
 					continue
 				}
-				file, err := m.storage.FilesGet(chunk.FileID)
-				if err != nil || file == nil {
+				file := filesByID[chunk.FileID]
+				if file == nil {
 					continue
 				}
 				scoredChunks = append(scoredChunks, scored{chunk: chunk, file: file, score: e.Score})
@@ -509,18 +630,11 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 					}
 				}
 			}
-			sort.Slice(scoredChunks, func(i, j int) bool {
-				return scoredChunks[i].score > scoredChunks[j].score
-			})
-			// 最多取 8 块最相关的
-			maxBlocks := 8
-			if len(scoredChunks) < maxBlocks {
-				maxBlocks = len(scoredChunks)
-			}
+			// bounded top-8：固定容量小顶堆只保留最高分 8 个，替代全量 sort.Slice
+			scoredChunks = topKByScore(scoredChunks, 8, func(s scored) float64 { return s.score })
 			// 按 maxContextChars 累计裁剪，防止上下文超限拖慢首 token
 			usedRunes := 0
-			for i := 0; i < maxBlocks; i++ {
-				c := scoredChunks[i]
+			for _, c := range scoredChunks {
 				block := fmt.Sprintf("[文件=%s, 段落=%d]\n%s", c.file.RelPath, c.chunk.Seq, c.chunk.Text)
 				usedRunes += utf8.RuneCountInString(block)
 				if usedRunes > m.maxContextChars {

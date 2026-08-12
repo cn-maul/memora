@@ -25,6 +25,8 @@ type StorageAPI interface {
 	FilesRecent(sinceMs int64, limit int) ([]*contract.FileInfo, error)
 	// VectorCount 查询存量向量总数（用于判断维度变更后是否需要自动重建索引）
 	VectorCount() (int, error)
+	// Ping 探测数据库可用性（/ready、/diagnostics 使用）。
+	Ping() error
 }
 
 // GitAPI git 模块接口

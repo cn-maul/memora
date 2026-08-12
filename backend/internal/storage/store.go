@@ -18,6 +18,21 @@ type vectorEntry struct {
 	Score   float64
 }
 
+// dedupeIDs 过滤非法（<=0）并去重 ID，返回供 WHERE id IN (...) 使用的参数切片
+// （保持首个出现顺序）。供 FilesByIDs / ChunksByIDs 批量查询复用。
+func dedupeIDs(ids []int64) []interface{} {
+	seen := make(map[int64]bool, len(ids))
+	args := make([]interface{}, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		args = append(args, id)
+	}
+	return args
+}
+
 // Module 存储模块
 type Module struct {
 	db      *sql.DB
@@ -68,4 +83,9 @@ func New(dataDir string, dim int) (*Module, error) {
 // Close 关闭数据库连接
 func (m *Module) Close() error {
 	return m.db.Close()
+}
+
+// Ping 探测数据库连接可用性（/ready、/diagnostics 使用）。
+func (m *Module) Ping() error {
+	return m.db.Ping()
 }

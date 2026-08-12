@@ -48,6 +48,14 @@ type APIHandler struct {
 
 	// TaskQueue 任务队列（暂停/恢复/状态,修复 B-03）
 	TaskQueue TaskQueueAPI
+
+	// GenerationFunc 返回当前工作区代标识（如 "w1"），由装配层注入
+	// （assembler.RuntimeManager.Generation()）。为 nil 时 /ready 跳过 generation
+	// 检查并标注（generationChecked=false），/diagnostics 的 generation 置空。
+	GenerationFunc func() string
+
+	// Version 构建/发布版本标识，供诊断输出（/diagnostics）。为空时按 "dev" 处理。
+	Version string
 }
 
 // TaskQueueAPI 任务队列接口
@@ -67,6 +75,9 @@ type Module struct {
 	addr    string
 	webDir  string
 	webFS   fs.FS
+
+	// startedAt 模块启动时刻，供 /diagnostics 计算 uptimeSec。
+	startedAt time.Time
 
 	// maxBodyBytes 请求体大小上限（字节）。默认 32MB,可通过注入的 Module 覆写,
 	// 但不对外提供 setter（避免扩大改动面）。
@@ -100,6 +111,7 @@ func New(h *APIHandler, events EventBus) *Module {
 		mux:          http.NewServeMux(),
 		handler:      h,
 		events:       events,
+		startedAt:    time.Now(),
 		maxBodyBytes: 32 << 20, // 默认 32MB 请求体上限
 		sseConns:     make(map[chan string]struct{}),
 	}
@@ -192,6 +204,11 @@ func findAvailablePort() (string, error) {
 
 // registerRoutes 注册所有 API 路由
 func (m *Module) registerRoutes() {
+	// 可观测性（Phase 5）：存活 / 就绪 / 诊断摘要
+	m.mux.HandleFunc("/health", m.handleHealth)
+	m.mux.HandleFunc("/ready", m.handleReady)
+	m.mux.HandleFunc("/diagnostics", m.handleDiagnostics)
+
 	// 工作区
 	m.mux.HandleFunc("/api/workspace/info", m.handleWorkspaceInfo)
 	m.mux.HandleFunc("/api/workspace/init", m.handleWorkspaceInit)

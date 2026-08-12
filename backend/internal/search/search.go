@@ -21,7 +21,9 @@ type ILLM interface {
 // IStorage search 模块所需的 storage 接口
 type IStorage interface {
 	ChunksGet(id int64) (*contract.Chunk, error)
+	ChunksByIDs(ids []int64) (map[int64]*contract.Chunk, error)
 	FilesGet(id int64) (*contract.FileInfo, error)
+	FilesByIDs(ids []int64) (map[int64]*contract.FileInfo, error)
 	FilesList(status, tag string, page, pageSize int, sortOrder string) ([]*contract.FileInfo, int, error)
 	TagsList() ([]*contract.TagInfo, error)
 	FileTagsListByFile(fileID int64) ([]contract.FileTag, error)
@@ -100,9 +102,27 @@ func (m *Module) Query(q string, tagFilter []string, page int) ([]*contract.Sear
 	fileMap := make(map[int64]*fileResult)
 	var fileOrder []int64
 
+	// 批量拉取：一次性取回候选分块与文件，替代逐条 ChunksGet/FilesGet（消除 N+1）
+	chunkIDs := make([]int64, 0, len(entries))
 	for _, entry := range entries {
-		chunk, err := m.storage.ChunksGet(entry.ChunkID)
-		if err != nil || chunk == nil {
+		chunkIDs = append(chunkIDs, entry.ChunkID)
+	}
+	chunksByID, err := m.storage.ChunksByIDs(chunkIDs)
+	if err != nil {
+		return nil, 0, fmt.Errorf("[search] 批量获取分块失败: %w", err)
+	}
+	fileIDs := make([]int64, 0, len(chunksByID))
+	for _, c := range chunksByID {
+		fileIDs = append(fileIDs, c.FileID)
+	}
+	filesByID, err := m.storage.FilesByIDs(fileIDs)
+	if err != nil {
+		return nil, 0, fmt.Errorf("[search] 批量获取文件失败: %w", err)
+	}
+
+	for _, entry := range entries {
+		chunk := chunksByID[entry.ChunkID]
+		if chunk == nil {
 			continue
 		}
 
@@ -113,8 +133,8 @@ func (m *Module) Query(q string, tagFilter []string, page int) ([]*contract.Sear
 				existing.bestChunk = chunk
 			}
 		} else {
-			file, err := m.storage.FilesGet(chunk.FileID)
-			if err != nil || file == nil {
+			file := filesByID[chunk.FileID]
+			if file == nil {
 				continue
 			}
 			fileMap[chunk.FileID] = &fileResult{

@@ -578,7 +578,10 @@ export async function resumeQueue(): Promise<void> {
 
 // ──────── SSE ────────
 
-export function createSSEConnection(onEvent: (topic: string, data: any) => void): () => void {
+export function createSSEConnection(
+  onEvent: (topic: string, data: any) => void,
+  opts?: { onOpen?: () => void; onClose?: (hadError: boolean) => void },
+): () => void {
   let eventSource: EventSource | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let closed = false
@@ -587,6 +590,11 @@ export function createSSEConnection(onEvent: (topic: string, data: any) => void)
     if (closed) return
 
     eventSource = new EventSource('/api/events')
+
+    // 连接建立成功（含重连成功）：通知调用方做全量对账
+    eventSource.onopen = () => {
+      opts?.onOpen?.()
+    }
 
     eventSource.onmessage = (e) => {
       try {
@@ -599,9 +607,12 @@ export function createSSEConnection(onEvent: (topic: string, data: any) => void)
       }
     }
 
+    // 连接中断（网络抖动 / 服务端断开 / 首连失败）：通知调用方（hadError=true），
+    // 3 秒后自动重连；显式 close()（返回的关闭函数）不触发 onerror，因此不会回调 onClose。
     eventSource.onerror = () => {
       eventSource?.close()
       if (!closed) {
+        opts?.onClose?.(true)
         reconnectTimer = setTimeout(connect, 3000)
       }
     }

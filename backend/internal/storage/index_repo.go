@@ -1,11 +1,12 @@
 package storage
 
 import (
+	"container/heap"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"math"
-	"sort"
+	"strings"
 
 	"memora/internal/contract"
 	"memora/internal/logx"
@@ -201,6 +202,37 @@ func (m *Module) ChunksGet(id int64) (*contract.Chunk, error) {
 	return c, nil
 }
 
+// ChunksByIDs 按 ID 集合批量获取分块（单条 WHERE id IN (...) 查询）。
+// 返回 map[id]*Chunk；未命中的 ID 不出现在 map 中。替代逐条 ChunksGet（消除 N+1）。
+func (m *Module) ChunksByIDs(ids []int64) (map[int64]*contract.Chunk, error) {
+	args := dedupeIDs(ids)
+	if len(args) == 0 {
+		return map[int64]*contract.Chunk{}, nil
+	}
+	placeholders := strings.Repeat("?,", len(args))
+	placeholders = placeholders[:len(placeholders)-1]
+	rows, err := m.db.Query(
+		`SELECT id, file_id, seq, token_est, text FROM chunks WHERE id IN (`+placeholders+`)`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("[storage] 批量获取分块失败: %w", err)
+	}
+	defer rows.Close()
+
+	chunks := make(map[int64]*contract.Chunk, len(args))
+	for rows.Next() {
+		c := &contract.Chunk{}
+		if err := rows.Scan(&c.ID, &c.FileID, &c.Seq, &c.TokenEst, &c.Text); err != nil {
+			return nil, fmt.Errorf("[storage] 扫描批量分块行失败: %w", err)
+		}
+		chunks[c.ID] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("[storage] 遍历批量分块失败: %w", err)
+	}
+	return chunks, nil
+}
+
 // ──────────────────── 向量操作 ────────────────────
 
 // vecToBlob float32 切片 → 小端字节 BLOB
@@ -332,9 +364,67 @@ func cosineSimilarity(a, b []float32) float64 {
 	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
-// VectorsSearch 在内存索引中做余弦相似度线性扫描，返回 top-K
-// 先整体排序再取前 K，替代逐趟挑选的 O(n·K) 实现：
-// K 接近 n（如单文件问答按 chunk 数放大 topK）时旧实现退化为 O(n²)，大索引下明显卡顿（review 发现）。
+// scoreMinHeap 固定容量小顶堆：堆顶是候选集里"最差"的条目
+// （分数最低；分数并列时 ChunkID 最大）。用于 VectorsSearch 的 bounded top-K。
+type scoreMinHeap struct {
+	items []vectorEntry
+}
+
+func (h *scoreMinHeap) Len() int           { return len(h.items) }
+func (h *scoreMinHeap) Less(i, j int) bool { return worseScore(h.items[i], h.items[j]) }
+func (h *scoreMinHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *scoreMinHeap) Push(x interface{}) { h.items = append(h.items, x.(vectorEntry)) }
+func (h *scoreMinHeap) Pop() interface{} {
+	old := h.items
+	n := len(old)
+	e := old[n-1]
+	h.items = old[:n-1]
+	return e
+}
+
+// worseScore a 是否应排在 b 之后（分数更低；分数并列时 ChunkID 更大的排后面，
+// 保证并列结果确定：升序取 ChunkID 较小的）。
+func worseScore(a, b vectorEntry) bool {
+	if a.Score != b.Score {
+		return a.Score < b.Score
+	}
+	return a.ChunkID > b.ChunkID
+}
+
+// topKVectors 用固定容量小顶堆选出分数最高的 topK 个向量（bounded top-K，复杂度 O(N log K)，
+// 不做全量排序）。返回按分数从高到低；分数并列时按 ChunkID 升序，与"全量排序取前 K"的结果一致。
+func topKVectors(candidates []vectorEntry, topK int) []vectorEntry {
+	if topK <= 0 || len(candidates) == 0 {
+		return []vectorEntry{}
+	}
+	if topK > len(candidates) {
+		topK = len(candidates)
+	}
+	h := &scoreMinHeap{}
+	for _, c := range candidates {
+		if h.Len() < topK {
+			heap.Push(h, c)
+		} else if worseScore(h.items[0], c) {
+			// 新条目优于堆顶（当前最差条目）：弹出最差，压入新条目
+			heap.Pop(h)
+			heap.Push(h, c)
+		}
+	}
+	// 依次弹出得到"最差→最好"，反转得到"最好→最差"
+	out := make([]vectorEntry, 0, h.Len())
+	for h.Len() > 0 {
+		out = append(out, heap.Pop(h).(vectorEntry))
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// VectorsSearch 在内存索引中做余弦相似度线性扫描，返回 top-K。
+// 采用固定容量小顶堆（container/heap）只保留最高分 topK 个，不做全量排序：
+// 复杂度 O(N log K)，N=50k 时远快于全量 sort.Slice 的 O(N log N)，
+// 也避免逐趟挑选在 K 接近 n 时退化为 O(n²)。
 func (m *Module) VectorsSearch(queryVec []float32, topK int) ([]contract.VectorEntry, error) {
 	if topK <= 0 {
 		return []contract.VectorEntry{}, nil
@@ -345,23 +435,20 @@ func (m *Module) VectorsSearch(queryVec []float32, topK int) ([]contract.VectorE
 	copy(index, m.vectorIndex)
 	m.mu.RUnlock()
 
-	// 计算所有相似度
+	// 计算所有相似度（一次线性扫描）
 	for i := range index {
 		index[i].Score = cosineSimilarity(queryVec, index[i].Vec)
 	}
 
-	// 按相似度降序排序，截取前 topK
-	sort.Slice(index, func(i, j int) bool { return index[i].Score > index[j].Score })
-	if topK > len(index) {
-		topK = len(index)
-	}
+	// bounded top-K：小顶堆只保留最高分的 topK 个（并列按 ChunkID 升序保证确定性）
+	top := topKVectors(index, topK)
 
-	result := make([]contract.VectorEntry, 0, topK)
-	for i := 0; i < topK; i++ {
+	result := make([]contract.VectorEntry, 0, len(top))
+	for i := range top {
 		result = append(result, contract.VectorEntry{
-			ChunkID: index[i].ChunkID,
-			Vec:     index[i].Vec,
-			Score:   index[i].Score,
+			ChunkID: top[i].ChunkID,
+			Vec:     top[i].Vec,
+			Score:   top[i].Score,
 		})
 	}
 	return result, nil

@@ -7,9 +7,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,13 +23,33 @@ import (
 	"memora/internal/logx"
 )
 
+const (
+	// cacheVersionPrefix 缓存 key 版本前缀。缓存内容/格式发生变化时递增版本，
+	// 使旧版本缓存自动失效（格式：v1-<sha256>.md）。
+	cacheVersionPrefix = "v1"
+	// defaultCacheQuota 缓存大小配额默认值：512MB。
+	defaultCacheQuota = 512 * 1024 * 1024
+)
+
 // Module 文本提取模块
 type Module struct {
-	cacheDir      string // text_cache 目录
-	pythonPath    string // Python 解释器路径
-	command       string // MarkItDown 命令模板
-	markitdownCmd string // markitdown 直接可执行路径（优先）
-	workspaceRoot string // 工作区根；由 SetWorkspaceRoot 注入，非空时 ExtractFile 做路径 containment 校验
+	cacheDir        string // text_cache 目录
+	cacheQuotaBytes int64  // 缓存大小配额；超过时按 mtime 最旧优先清理（<=0 表示不限制）
+	pythonPath      string // Python 解释器路径
+	command         string // MarkItDown 命令模板
+	markitdownCmd   string // markitdown 直接可执行路径（优先）
+	workspaceRoot   string // 工作区根；由 SetWorkspaceRoot 注入，非空时 ExtractFile 做路径 containment 校验
+}
+
+// cacheKeyFor 由内容 SHA256 生成版本化缓存 key（v1-<hash>）。
+func cacheKeyFor(sum [32]byte) string {
+	return fmt.Sprintf("%s-%x", cacheVersionPrefix, sum)
+}
+
+// isCacheFileName 判断文件名是否为版本化缓存项（v1-*.md）。
+// 临时输出文件（mkd_*.md）不属于缓存项，不参与配额/统计/TTL 管理。
+func isCacheFileName(name string) bool {
+	return strings.HasPrefix(name, cacheVersionPrefix+"-") && strings.HasSuffix(name, ".md")
 }
 
 // normalizeToUTF8 将子进程输出规范化到 UTF-8。
@@ -132,7 +154,12 @@ func New(dataDir string, pythonPath string, command string, markitdownCmd string
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return nil, fmt.Errorf("[extract] 创建缓存目录失败: %w", err)
 	}
-	return &Module{cacheDir: cacheDir, pythonPath: pythonPath, command: command, markitdownCmd: markitdownCmd}, nil
+	return &Module{cacheDir: cacheDir, cacheQuotaBytes: defaultCacheQuota, pythonPath: pythonPath, command: command, markitdownCmd: markitdownCmd}, nil
+}
+
+// SetCacheQuota 调整缓存大小配额（字节）。传入 <=0 表示不限制。
+func (m *Module) SetCacheQuota(bytes int64) {
+	m.cacheQuotaBytes = bytes
 }
 
 // SetWorkspaceRoot 注入工作区根。注入后 ExtractFile 在读取文件前做最终路径 containment 校验，
@@ -203,7 +230,7 @@ func (m *Module) Probe(pythonPath, command string) (ok bool, message string) {
 }
 
 // ExtractFile 提取文件文本
-// 返回提取的 Markdown 文本和缓存键（SHA256）
+// 返回提取的 Markdown 文本和缓存键（版本化 SHA256，格式 v1-<hash>）
 func (m *Module) ExtractFile(filePath string) (text string, cacheKey string, err error) {
 	// 最终路径 containment：若已注入工作区根，读取前校验解析后的真实路径仍位于工作区内
 	if m.workspaceRoot != "" {
@@ -211,15 +238,21 @@ func (m *Module) ExtractFile(filePath string) (text string, cacheKey string, err
 			return "", "", fmt.Errorf("[extract] 路径校验失败: %w", cerr)
 		}
 	}
-	// 计算文件 SHA256
-	data, err := os.ReadFile(filePath)
+	// 流式计算文件 SHA256：逐块读取，避免大文件整读导致内存翻倍
+	file, err := os.Open(filePath)
 	if err != nil {
-		return "", "", fmt.Errorf("[extract] 读取文件失败: %w", err)
+		return "", "", fmt.Errorf("[extract] 打开文件失败: %w", err)
 	}
-	hash := sha256.Sum256(data)
-	cacheKey = fmt.Sprintf("%x", hash)
-
-	// 检查缓存（旧版本可能缓存了 GBK 内容，读取时统一规范化）
+	hashW := sha256.New()
+	if _, cerr := io.Copy(hashW, file); cerr != nil {
+		file.Close()
+		return "", "", fmt.Errorf("[extract] 计算内容哈希失败: %w", cerr)
+	}
+	file.Close()
+	var h [sha256.Size]byte
+	copy(h[:], hashW.Sum(nil))
+	cacheKey = cacheKeyFor(h)
+	// 旧版本缓存可能存有 GBK 内容，读取时统一规范化
 	cacheFile := filepath.Join(m.cacheDir, cacheKey+".md")
 	if cachedData, err := os.ReadFile(cacheFile); err == nil {
 		return normalizeToUTF8(cachedData), cacheKey, nil
@@ -251,12 +284,94 @@ func (m *Module) ExtractFile(filePath string) (text string, cacheKey string, err
 	// 写入缓存
 	if err := os.WriteFile(cacheFile, []byte(text), 0644); err != nil {
 		logx.Warn("extract", "写入缓存失败", "err", err.Error())
+	} else {
+		// 新缓存写入成功后检查配额：超限时按 mtime 最旧优先清理（LRU 式）
+		m.enforceCacheQuota()
 	}
 
 	return text, cacheKey, nil
 }
 
-// Cleanup 清理缓存
+// cacheEntry 描述一个缓存项（仅版本化缓存文件 v1-*.md，不含 mkd_* 临时文件）
+type cacheEntry struct {
+	path  string
+	mtime time.Time
+	size  int64
+}
+
+// cacheEntries 列出缓存目录中全部缓存项。
+func (m *Module) cacheEntries() []cacheEntry {
+	entries, err := os.ReadDir(m.cacheDir)
+	if err != nil {
+		return nil
+	}
+	var out []cacheEntry
+	for _, e := range entries {
+		if e.IsDir() || !isCacheFileName(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, cacheEntry{path: filepath.Join(m.cacheDir, e.Name()), mtime: info.ModTime(), size: info.Size()})
+	}
+	return out
+}
+
+// enforceCacheQuota 缓存总大小超过配额时，按 mtime 最旧优先删除缓存项（LRU 式），
+// 直到总大小低于配额；始终保留最新写入的一个缓存项。
+func (m *Module) enforceCacheQuota() {
+	if m.cacheQuotaBytes <= 0 {
+		return
+	}
+	entries := m.cacheEntries()
+	var total int64
+	for _, e := range entries {
+		total += e.size
+	}
+	if total <= m.cacheQuotaBytes {
+		return
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].mtime.Before(entries[j].mtime) })
+	for i := 0; i < len(entries)-1 && total > m.cacheQuotaBytes; i++ {
+		if err := os.Remove(entries[i].path); err != nil {
+			logx.Warn("extract", "配额清理删除缓存失败", "path", entries[i].path, "err", err.Error())
+			continue
+		}
+		total -= entries[i].size
+	}
+}
+
+// CacheStats 统计缓存项数量与总字节数（仅供诊断/Phase 5 摘要使用）。
+func (m *Module) CacheStats() (files int, bytes int64, err error) {
+	for _, e := range m.cacheEntries() {
+		files++
+		bytes += e.size
+	}
+	return files, bytes, nil
+}
+
+// CleanupExpired 删除 mtime 超过 maxAge 的缓存文件（TTL 清理），返回删除数量。
+func (m *Module) CleanupExpired(maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for _, e := range m.cacheEntries() {
+		if !e.mtime.Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(e.path); err != nil {
+			return removed, fmt.Errorf("[extract] TTL 清理删除缓存失败: %w", err)
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+// Cleanup 清理缓存（整体清空缓存目录）
 func (m *Module) Cleanup() error {
 	return os.RemoveAll(m.cacheDir)
 }
