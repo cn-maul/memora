@@ -1,0 +1,154 @@
+# Windows CI gate (Phase 6 engineering governance)
+# Runs the full frontend + backend verification on a clean checkout:
+#   frontend: npm ci -> vue-tsc typecheck -> lint -> tests -> build
+#   backend : go vet -> gofmt drift check -> go build -> go test -count=1
+#   smoke    : build.bat (produces bin/memora.exe) -> exe exists/non-empty ->
+#              starts and stays alive for 3s (clean exit with code 0 also passes)
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'phase*'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows build + test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Go version is read from backend/go.mod (go 1.22.x).
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+
+      # Node 22: vite 8 / @vitejs/plugin-vue require ^20.19.0 || >=22.12.0,
+      # so a bare node-version 18 would break `npm ci`/`npm run build`.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend install (npm ci)
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend typecheck (vue-tsc --noEmit)
+        working-directory: frontend
+        run: npx vue-tsc --noEmit
+
+      # lint script is optional: use `npm run lint` when declared, otherwise
+      # fall back to a bare typecheck.
+      - name: Frontend lint
+        working-directory: frontend
+        run: |
+          if (Select-String -Path package.json -Pattern '"lint"' -Quiet) {
+            npm run lint
+          } else {
+            Write-Host "No lint script found - running npx vue-tsc --noEmit instead"
+            npx vue-tsc --noEmit
+          }
+
+      # test script is optional (T6-A adds vitest); skip cleanly when absent.
+      - name: Frontend tests
+        working-directory: frontend
+        run: |
+          if (Select-String -Path package.json -Pattern '"test"' -Quiet) {
+            npm run test
+          } else {
+            Write-Host "No test script found - skipping frontend tests"
+          }
+
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+
+      # backend/internal/web/dist is a git-ignored build artifact (go:embed).
+      # It must exist before any `go` command runs on a clean checkout, and it
+      # must contain at least one file or `//go:embed all:dist` fails to compile.
+      # build.bat repeats this same copy, so this step is idempotent with it.
+      - name: Sync frontend dist into backend embed dir
+        run: |
+          $dst = 'backend/internal/web/dist'
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          New-Item -ItemType Directory -Path $dst | Out-Null
+          Copy-Item -Path 'frontend/dist/*' -Destination $dst -Recurse -Force
+          $count = (Get-ChildItem -Path $dst -Recurse -File).Count
+          Write-Host "Synced embed dir: $count files"
+
+      - name: Backend vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: gofmt drift check
+        working-directory: backend
+        run: |
+          $drift = @(gofmt -l .)
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::gofmt failed to run"
+            exit $LASTEXITCODE
+          }
+          if ($drift.Count -gt 0) {
+            Write-Host "::error::gofmt drift found - run gofmt -w on:"
+            $drift | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "gofmt OK - no drift"
+
+      - name: Backend build
+        working-directory: backend
+        run: go build ./...
+
+      - name: Backend tests
+        working-directory: backend
+        run: go test -count=1 ./...
+
+      # Reproduces the full release packaging path (frontend build -> embed ->
+      # go build) and produces bin/memora.exe.
+      - name: Package via build.bat
+        shell: cmd
+        run: call build.bat
+
+      - name: Verify bin/memora.exe exists and non-empty
+        run: |
+          if (-not (Test-Path 'bin/memora.exe')) {
+            Write-Host '::error::bin/memora.exe is missing'
+            exit 1
+          }
+          $exe = Get-Item 'bin/memora.exe'
+          if ($exe.Length -eq 0) {
+            Write-Host '::error::bin/memora.exe is empty (0 bytes)'
+            exit 1
+          }
+          Write-Host "OK bin/memora.exe present, $($exe.Length) bytes"
+
+      # Smoke: start the binary and require it to stay alive for 3s (or exit
+      # cleanly with code 0). An immediate crash (non-zero exit) is the only
+      # failure mode, so a missing LLM/network config does not fail the gate.
+      - name: Smoke run - memora.exe starts and stays alive
+        run: |
+          $p = Start-Process -FilePath 'bin/memora.exe' -PassThru
+          Start-Sleep -Seconds 3
+          if ($p.HasExited) {
+            if ($p.ExitCode -eq 0) {
+              Write-Host "OK memora.exe exited cleanly (code 0) within 3s"
+            } else {
+              Write-Host "::error::memora.exe exited immediately with code $($p.ExitCode)"
+              exit 1
+            }
+          } else {
+            Write-Host "OK memora.exe stayed alive for 3s (PID $($p.Id))"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped memora.exe (PID $($p.Id))"
+          }

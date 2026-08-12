@@ -8,6 +8,7 @@ $RECYCLE.BIN/
 
 # Build outputs
 bin/
+dist-release/
 backend/*.exe
 backend/*.test
 backend/coverage.out

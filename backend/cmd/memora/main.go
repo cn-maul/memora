@@ -17,6 +17,9 @@ func main() {
 	configPath := flag.String("config", "", "配置文件路径（可选，默认由装配器探测）")
 	flag.Parse()
 
+	// 版本信息：由 build.bat / release.bat 经 ldflags 注入（本地构建为默认值 "dev"）
+	logx.Info("app", "启动", "version", assembler.BuildVersion, "commit", assembler.BuildCommit, "buildTime", assembler.BuildTime)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

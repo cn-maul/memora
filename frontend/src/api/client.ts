@@ -341,6 +341,7 @@ export async function askQuestionStream(
     const decoder = new TextDecoder()
     let buffer = ''
     let eventType = '' // 当前事件类型
+    let settled = false // 是否已收到 done/error 终态（P1-06：防止异常 EOF 时 Promise 永久悬挂）
 
     while (true) {
       const { done, value } = await reader.read()
@@ -368,6 +369,7 @@ export async function askQuestionStream(
         const payload = dataLines.join('\n')
 
         if (eventType === 'done') {
+          settled = true
           try {
             const parsed = JSON.parse(payload)
             onDone({ sessionId: parsed.sessionId || 0, sources: parsed.sources || [] })
@@ -378,6 +380,7 @@ export async function askQuestionStream(
           }
           eventType = ''
         } else if (eventType === 'error') {
+          settled = true
           // error 数据为 JSON 字符串编码（后端 2025 版起统一）；解析失败视为协议错误
           let errMsg = payload
           try {
@@ -402,6 +405,12 @@ export async function askQuestionStream(
           onChunk(text)
         }
       }
+    }
+
+    // 流正常结束（EOF）但未收到 done/error 终态：视为连接中断而非静默成功
+    // （P1-06：此前 Promise 永不结束，前端"发送中"卡死）
+    if (!settled) {
+      onError(SSE_PROTOCOL_ERROR)
     }
   } catch (e: any) {
     if (e.name === 'AbortError' || e?.code === 'ERR_CANCELED') {

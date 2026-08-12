@@ -497,7 +497,7 @@ func (a *App) createTransport(evt *events.Module) *transport.Module {
 	handler.TriggerReindex = a.TriggerReindex
 	// 注入诊断信息（Phase 5）：/ready 与 /diagnostics 需要当前代标识与版本
 	handler.GenerationFunc = func() string { return a.runtime.Generation() }
-	handler.Version = "dev" // TODO(Phase 6): 发布时注入 buildVersion/commit
+	handler.Version = BuildVersion
 
 	tr := transport.New(handler, evt)
 

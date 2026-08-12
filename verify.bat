@@ -2,16 +2,18 @@
 REM Memora verify gate (Windows / cmd)
 REM Usage: run verify.bat in the project root.
 REM Checks:
-REM   1. frontend typecheck + build (npm run build)
-REM   2. backend go vet ./...
-REM   3. backend go test -count=1 ./...
-REM   4. gofmt -l backend drift check (must be empty)
+REM   1. frontend typecheck (vue-tsc)
+REM   2. frontend unit tests (vitest, if present)
+REM   3. frontend build
+REM   4. backend go vet ./...
+REM   5. backend go test -count=1 ./...
+REM   6. gofmt -l backend drift check (must be empty)
 REM Any failure exits with a non-zero code; full pass prints "verify OK".
 setlocal
 set ROOT=%~dp0
 set FAILED=0
 
-echo === [1/4] Frontend typecheck + build ===
+echo === [1/6] Frontend typecheck (vue-tsc) ===
 pushd "%ROOT%frontend"
 if not exist "node_modules" (
     echo    node_modules missing, running npm install ...
@@ -22,14 +24,37 @@ if not exist "node_modules" (
         exit /b 1
     )
 )
-call npm run build
+call npx vue-tsc --noEmit -p tsconfig.app.json
 if errorlevel 1 (
-    echo [ERROR] frontend typecheck/build failed
+    echo [ERROR] frontend typecheck failed
     set FAILED=1
 )
 popd
 
-echo === [2/4] go vet ./... ===
+echo === [2/6] Frontend unit tests (vitest) ===
+pushd "%ROOT%frontend"
+findstr /R /C:"\"test\"" package.json >nul 2>&1
+if not errorlevel 1 (
+    call npm run test
+    if errorlevel 1 (
+        echo [ERROR] frontend tests failed
+        set FAILED=1
+    )
+) else (
+    echo    no test script found, skipping
+)
+popd
+
+echo === [3/6] Frontend build ===
+pushd "%ROOT%frontend"
+call npm run build
+if errorlevel 1 (
+    echo [ERROR] frontend build failed
+    set FAILED=1
+)
+popd
+
+echo === [4/6] go vet ./... ===
 pushd "%ROOT%backend"
 go vet ./...
 if errorlevel 1 (
@@ -38,7 +63,7 @@ if errorlevel 1 (
 )
 popd
 
-echo === [3/4] go test -count=1 ./... ===
+echo === [5/6] go test -count=1 ./... ===
 pushd "%ROOT%backend"
 go test -count=1 ./...
 if errorlevel 1 (
@@ -47,7 +72,7 @@ if errorlevel 1 (
 )
 popd
 
-echo === [4/4] gofmt drift check ===
+echo === [6/6] gofmt drift check ===
 set DRIFT_LIST=%TEMP%\memora_gofmt_drift.txt
 gofmt -l "%ROOT%backend" > "%DRIFT_LIST%" 2>&1
 if errorlevel 1 (
