@@ -18,6 +18,13 @@ export const useFilesStore = defineStore('files', () => {
   const sortField = ref<SortField>('time')
   const sortDir = ref<'asc' | 'desc'>('desc')
 
+  // 视图查询隔离（P2-19）：latest-request-wins + AbortController。
+  // 同一 items 列表被 QA 文件选择、索引页表格、筛选/排序和 SSE 刷新共同驱动，
+  // 并发请求下旧请求若晚于新请求返回会覆盖新结果（竞态）。
+  // reqSeq 只允许"最新一次请求"写入结果；新请求发出时同时 abort 旧请求。
+  let reqSeq = 0
+  let activeCtrl: AbortController | null = null
+
   function cycleSort(field: SortField) {
     if (sortField.value === field) {
       if (sortDir.value === 'desc') sortDir.value = 'asc'
@@ -53,24 +60,39 @@ export const useFilesStore = defineStore('files', () => {
   }
 
   async function fetch(params?: { status?: string; tag?: string; page?: number; pageSize?: number; sort?: string }) {
+    const seq = ++reqSeq
+    // 新请求取代旧请求：先中止旧请求，避免其残留响应继续占用连接/干扰状态
+    activeCtrl?.abort()
+    const ctrl = new AbortController()
+    activeCtrl = ctrl
     loading.value = true
     error.value = ''
     try {
-      const res = await listFiles({
-        status: params?.status ?? statusFilter.value,
-        tag: params?.tag ?? tagFilter.value,
-        page: params?.page ?? page.value,
-        pageSize: params?.pageSize ?? pageSize.value,
-        sort: params?.sort ?? sortParam(),
-      })
+      const res = await listFiles(
+        {
+          status: params?.status ?? statusFilter.value,
+          tag: params?.tag ?? tagFilter.value,
+          page: params?.page ?? page.value,
+          pageSize: params?.pageSize ?? pageSize.value,
+          sort: params?.sort ?? sortParam(),
+        },
+        { signal: ctrl.signal },
+      )
+      if (seq !== reqSeq) return // 已有更新的请求：丢弃本次结果（latest-request-wins）
       items.value = res.items ?? []
       total.value = res.total ?? 0
       page.value = res.page ?? 0
     } catch (e: any) {
+      if (seq !== reqSeq) return // 过期请求的错误同样丢弃，避免旧错误污染新请求状态
+      if (e?.code === 'canceled' || e?.code === 'ERR_CANCELED') return // 被新请求取消，非真实失败
       // 加载失败：记录错误供页面区分"无数据"与"加载失败"，避免误导为空列表
       error.value = e?.message || '加载文件列表失败'
     } finally {
-      loading.value = false
+      // 仅最新请求负责收尾：旧请求不得覆盖新请求的 loading 状态
+      if (seq === reqSeq) {
+        activeCtrl = null
+        loading.value = false
+      }
     }
   }
 

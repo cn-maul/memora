@@ -158,14 +158,17 @@ export async function initWorkspace(req: InitRequest): Promise<void> {
 
 // ──────── 文件 ────────
 
-export async function listFiles(params: {
-  status?: string
-  tag?: string
-  page?: number
-  pageSize?: number
-  sort?: string
-}): Promise<PaginatedData<FileItem>> {
-  const { data } = await http.get<ApiResponse<PaginatedData<FileItem>>>('/files', { params })
+export async function listFiles(
+  params: {
+    status?: string
+    tag?: string
+    page?: number
+    pageSize?: number
+    sort?: string
+  },
+  opts?: { signal?: AbortSignal },
+): Promise<PaginatedData<FileItem>> {
+  const { data } = await http.get<ApiResponse<PaginatedData<FileItem>>>('/files', { params, signal: opts?.signal })
   return unwrapData<PaginatedData<FileItem>>(data)
 }
 
@@ -296,6 +299,10 @@ export async function getQAMessages(sessionId: number): Promise<QAMessage[]> {
   return unwrapData<{ messages: QAMessage[] }>(data).messages
 }
 
+// SSE 协议错误提示：后端（2025 版起）统一以 JSON 编码发送流式 data 载荷，
+// 解析失败即协议异常（连接中断/流格式错乱），不再按"旧版明文"静默使用。
+const SSE_PROTOCOL_ERROR = '连接中断，请重试'
+
 export async function askQuestionStream(
   params: { question: string; mode: string; fileId?: number; sessionId?: number },
   onChunk: (chunk: string) => void,
@@ -365,28 +372,32 @@ export async function askQuestionStream(
             const parsed = JSON.parse(payload)
             onDone({ sessionId: parsed.sessionId || 0, sources: parsed.sources || [] })
           } catch {
-            onDone({ sessionId: 0, sources: [] })
+            // 后端统一 JSON 编码；解析失败视为协议错误，中断流，避免静默当作空结果
+            onError(SSE_PROTOCOL_ERROR)
+            return
           }
           eventType = ''
         } else if (eventType === 'error') {
-          // error 数据可能是 JSON 编码的（后端 2025 版起），也可能是明文（旧版）
+          // error 数据为 JSON 字符串编码（后端 2025 版起统一）；解析失败视为协议错误
           let errMsg = payload
           try {
             const parsed = JSON.parse(payload)
             if (typeof parsed === 'string') errMsg = parsed
           } catch {
-            // 明文，原样使用
+            errMsg = SSE_PROTOCOL_ERROR
           }
           onError(errMsg)
           eventType = ''
         } else if (payload) {
-          // 流式增量：后端以 JSON 字符串编码（含换行的 chunk 安全传输），解码还原；兼容旧版明文
+          // 流式增量：后端以 JSON 字符串编码（含换行的 chunk 安全传输），解码还原
           let text = payload
           try {
             const parsed = JSON.parse(payload)
             if (typeof parsed === 'string') text = parsed
           } catch {
-            // 明文，原样使用
+            // 后端统一 JSON 编码；解析失败说明协议错乱，中断流，避免明文误当正文
+            onError(SSE_PROTOCOL_ERROR)
+            return
           }
           onChunk(text)
         }
@@ -460,8 +471,8 @@ export async function manualCommit(message: string): Promise<string> {
   return unwrapData<{ hash: string; skipped?: boolean }>(data).hash
 }
 
-export async function getCommitList(withFiles?: boolean): Promise<CommitItem[]> {
-  const { data } = await http.get<ApiResponse<{ commits: CommitItem[] }>>('/commits/list', { params: withFiles ? { withFiles: 'true' } : undefined })
+export async function getCommitList(): Promise<CommitItem[]> {
+  const { data } = await http.get<ApiResponse<{ commits: CommitItem[] }>>('/commits/list')
   return unwrapData<{ commits: CommitItem[] }>(data)?.commits || []
 }
 

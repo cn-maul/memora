@@ -1,11 +1,13 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
-import RecentFilesPage from '@/views/RecentFilesPage.vue'
-import WorkspacePage from '@/views/WorkspacePage.vue'
-import IndexPage from '@/views/IndexPage.vue'
-import TimelinePage from '@/views/TimelinePage.vue'
-import QAPage from '@/views/QAPage.vue'
-import StatsPage from '@/views/StatsPage.vue'
-import SettingsPage from '@/views/SettingsPage.vue'
+
+// 路由懒加载（P2-18）：页面按需加载，缩小首屏 bundle
+const RecentFilesPage = () => import('@/views/RecentFilesPage.vue')
+const WorkspacePage = () => import('@/views/WorkspacePage.vue')
+const IndexPage = () => import('@/views/IndexPage.vue')
+const TimelinePage = () => import('@/views/TimelinePage.vue')
+const QAPage = () => import('@/views/QAPage.vue')
+const StatsPage = () => import('@/views/StatsPage.vue')
+const SettingsPage = () => import('@/views/SettingsPage.vue')
 
 const routes = [
   { path: '/', redirect: '/files' },

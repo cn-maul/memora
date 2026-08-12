@@ -4,16 +4,13 @@ import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useTagsStore } from '@/stores/tags'
 import { useQAStore } from '@/stores/qa'
-import { useFilesStore } from '@/stores/files'
 import {
-  createSSEConnection,
-  getQueueStatus,
   getCommitStatus,
   suggestCommitMessage,
   manualCommit,
-  type QueueStatus,
   type CommitFileStatus,
 } from '@/api/client'
+import { useEventSync } from '@/composables/useEventSync'
 import ChatSurface from '@/components/ChatSurface.vue'
 import Icon, { type IconName } from '@/components/Icon.vue'
 
@@ -22,7 +19,6 @@ const route = useRoute()
 const ws = useWorkspaceStore()
 const tags = useTagsStore()
 const qa = useQAStore()
-const filesStore = useFilesStore()
 
 // 设置页自带完整侧边栏，隐藏全局壳的两侧面板以腾出空间
 const hideSidePanels = computed(() => route.path === '/settings')
@@ -30,18 +26,6 @@ const hideSidePanels = computed(() => route.path === '/settings')
 // 问答/统计/提交记录/索引等页面有自己的主内容区，右侧对话会让布局拥挤
 // （需求：右侧边栏对话只在主页全部文件显示）
 const hideChatPanel = computed(() => route.path !== '/files')
-
-const queueStatus = ref<QueueStatus | null>(null)
-
-async function refreshQueue() {
-  try {
-    queueStatus.value = await getQueueStatus()
-  } catch {
-    // 队列接口不可用时静默忽略（如后端未就绪）
-  }
-}
-
-let queueTimer: ReturnType<typeof setInterval> | null = null
 
 // 主导航（S2 收敛）：只放小白最常用的三个，其余收进「更多」
 const mainNavItems: { path: string; label: string; icon: IconName }[] = [
@@ -215,63 +199,19 @@ function applyTheme(t: 'dark' | 'light') {
   document.documentElement.setAttribute('data-theme', t)
 }
 
-let cleanupSSE: (() => void) | null = null
-// 重建完成提示的自动清除 timer（新重建时清理，避免竞态误清新进度）
-let reindexDoneTimer: ReturnType<typeof setTimeout> | null = null
-// 单文件索引进度刷新的节流 timer
-let incrementalRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let eventSyncCleanup: (() => void) | null = null
 
 onMounted(async () => {
   applyTheme(theme.value)
+  // SSE 事件同步（文件/标签/工作区/队列）：须在第一个 await 前同步调用，
+  // 确保 composable 内部注册的 onUnmounted 能绑定到当前组件实例
+  eventSyncCleanup = useEventSync().cleanup
   await ws.fetchInfo()
 // 自动恢复上一次 AI 对话到侧栏聊天（需求：再次打开软件显示上次会话，而不是空的新对话）
 	qa.restoreLastSession().then(() => {
 		// 侧栏聊天由 ChatSurface 渲染，恢复完成后由其内部逻辑滚动到最新对话
 	}).catch(() => {})
-  cleanupSSE = createSSEConnection((topic: string, data: any) => {
-    if (topic === 'index_progress' && data) {
-      // 仅处理 FullReindex 的事件（带 phase 字段：reset/processing/done）。
-      // 单文件索引进度事件（{done:true, fileId, relPath}）无 phase，忽略以免产生幽灵进度卡片。
-      if (data.phase === 'reset' || data.phase === 'processing' || data.phase === 'done') {
-        filesStore.setReindexProgress({
-          phase: data.phase,
-          done: data.done,
-          total: data.total,
-          current: data.current,
-        })
-        // 新重建开始或完成时清理旧的自动清除 timer，避免竞态误清新进度
-        if (data.phase === 'reset' || data.phase === 'done') {
-          if (reindexDoneTimer) clearTimeout(reindexDoneTimer)
-          reindexDoneTimer = null
-        }
-        if (data.phase === 'reset' || data.phase === 'done') {
-          filesStore.fetch()
-        }
-        // done 后 2 秒自动清除进度卡片
-        if (data.phase === 'done') {
-          reindexDoneTimer = setTimeout(() => filesStore.setReindexProgress(null), 2000)
-        }
-      } else if (data.done && data.fileId) {
-        // 单文件索引进度（增量/重试完成）：节流刷新列表，让 IndexPage 状态列实时更新（修复 M-4）
-        if (incrementalRefreshTimer) clearTimeout(incrementalRefreshTimer)
-        incrementalRefreshTimer = setTimeout(() => filesStore.fetch(), 500)
-      }
-    }
-    if (topic === 'index_progress' || topic === 'files_changed' || topic === 'tag_done') {
-      tags.fetchTags()
-    }
-    if (topic === 'files_changed' || topic === 'commit_done' || topic === 'task_queue') {
-      ws.fetchInfo()
-      refreshQueue()
-    }
-    if (topic === 'task_queue') {
-      refreshQueue()
-    }
-  })
-
   tags.fetchTags()
-  refreshQueue()
-  queueTimer = setInterval(refreshQueue, 5000)
 
   // 首次进入且已有版本记录：一次性提示「自动记录版本」的心智模型
   if (ws.initialized && ws.info?.head?.hasCommits) {
@@ -293,10 +233,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  cleanupSSE?.()
-  if (queueTimer) clearInterval(queueTimer)
-  if (reindexDoneTimer) clearTimeout(reindexDoneTimer)
-  if (incrementalRefreshTimer) clearTimeout(incrementalRefreshTimer)
+  eventSyncCleanup?.()
 })
 </script>
 
@@ -529,24 +466,6 @@ onUnmounted(() => {
 }
 
 /* ── 路由主区 ── */
-.queue-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 14px;
-  font-size: 12px;
-  color: var(--c-warning);
-  background: var(--c-warning-soft);
-  border-bottom: 1px solid var(--c-border);
-  flex-shrink: 0;
-}
-
-.queue-banner__text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .app-main {
   flex: 1;
   min-width: 0;
