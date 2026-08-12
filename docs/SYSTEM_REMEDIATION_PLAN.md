@@ -1,402 +1,306 @@
-# Memora 系统审计与整改计划
+# Memora 系统二次审计与后续整改计划
 
-> 审计基线：`main` / `c9fe01d`  
-> 审计日期：2026-08-12  
-> 审计范围：Go 后端、Vue 前端、REST/SSE 契约、SQLite/向量索引、Git、配置与密钥、任务与生命周期、构建测试、日志和发布工程  
-> 文档性质：当前源码整改主计划。历史审计快照已随整改完成归档删除，不再作为现状依据。
-
-## 实施进度（截至 2026-08-12）
-
-| Phase | 主题 | 状态 | Commit |
-|---|---|---|---|
-| Phase 0 | 发布止血与工程门禁 | 完成 | `6605744` |
-| Phase 1 | 生命周期与持久化一致性 | 完成 | `fc4f83e` |
-| Phase 2 | 契约、错误和日志统一 | 完成 | `031c3ab` |
-| Phase 3 | 收敛业务主链 | 完成 | `4645d21` |
-| Phase 4 | 模块拆分与前端状态治理 | 完成 | `47c1ad7` |
-| Phase 5 | 性能与可观测性 | 完成 | `991c2f4` |
-| Phase 6 | 发布工程与文档 | 进行中 | — |
-
-> 注：台账中的行号随代码演进可能偏移；本计划仍为整改总纲，实施中新增问题先归入对应 ID/Phase。
+> 审计基线：`phase3-converge` / `da5666e`
+> 审计日期：2026-08-12
+> 审计范围：Go 后端、Vue 前端、REST/SSE 契约、SQLite/内存向量索引、工作区生命周期、任务队列、性能、可观测性、本地构建与发布
+> 文档性质：当前源码整改的唯一总纲。旧版计划及其中已失真的完成状态已删除，本文件以二次源码审查和实测结果为准。
+> 工程门禁：项目只维护本地 `verify.bat`。
 
 ## 1. 执行结论
 
-Memora 的产品主链已经具备，但多轮快速修改后，当前实现没有形成稳定的单一架构。主要矛盾不是代码风格，而是以下五类系统性问题：
+Memora 已完成一轮较大范围的重构，生产构建、现有测试、模块拆分和主要业务链收敛均有实质进展，但系统尚未达到“整改完成”状态。
 
-1. **运行时一致性不足**：工作区切换、全量重建、HTTP 请求、后台任务和关闭流程没有统一生命周期；旧 SQLite 可能在使用中被关闭，多个重建也可能并发写同一索引。
-2. **关键写入不原子**：配置覆盖、数据库升级、chunks/vectors 发布、问答双消息写入均可能部分成功；空文件重建还会保留旧索引。
-3. **新旧业务链并存**：同步/流式问答、侧栏/独立问答、新旧版本浏览、旧 `index.Query`/新 `search` 编排、三套文件详情逻辑长期共存。
-4. **边界与契约失真**：中央 `contract`、模块局部接口、设计文档和真实调用链不一致；前端大量 `any`、静默 catch 和直接 `data!` 使契约漂移延迟到运行时。
-5. **缺少工程安全网**：当前前端生产构建失败；没有前端测试、lint、CI、数据库迁移、可复现发布和统一错误/日志规范。
+按旧计划任务条目估算，当前总体实现约为 **55%-60%**；若严格按验收标准和完成定义计算，约为 **45%-50%**。主要差距不是文件数量或代码风格，而是部分关键能力只完成了接口、测试替身或文件拆分，没有贯通生产调用链。
 
-整改不能从大规模拆文件开始。正确顺序是：**先阻断数据与密钥风险，建立可重复验证；再统一生命周期和写入契约；随后收敛重复业务链；最后做性能、可观测性和发布治理。**
+当前最重要的五类问题是：
 
-## 2. 审计基线
+1. **工作区生命周期仍不安全**：没有 runtime lease 或 HTTP 请求排水，模块引用逐字段替换，旧 SQLite 可能在请求或任务仍使用时被关闭。
+2. **关键写入没有真正原子化**：生产索引未调用现有 `ReplaceFileIndex`；工作区初始化仍逐项写配置，失败不能恢复原状态。
+3. **前端状态与异步竞态仍未收敛**：问答切换会话可永久卡在发送中，多页面仍共享一份文件查询结果，部分慢响应可覆盖用户的新选择。
+4. **性能和可观测性只有局部实现**：heap、batch、低频 reconcile 已落地，但仍有标签查询/刷新放大；日志关联、最近错误和真实生产基准未闭环。
+5. **本地发布工程不够可靠**：发布脚本不强制执行完整门禁，会丢弃本地修改，失败的校验和或 SBOM 不能阻断发布，也没有制品级自动冒烟。
 
-### 2.1 技术和规模
+因此，当前应停止继续扩大模块拆分范围，优先修复数据一致性、生命周期和用户可见卡死问题，再补齐性能与本地发布门禁。
 
-- 后端：Go 1.22，`net/http`、go-git、fsnotify、modernc SQLite，约 12.5k 行。
-- 前端：Vue 3.5、TypeScript 6、Vite 8、Pinia 3、Axios、Marked，约 12.4k 行。
-- 运行形态：Windows 本地单进程，Go 内嵌 SPA，REST + SSE，工作区内 `.memora` 保存配置、数据库和文本缓存。
-- 数据规模目标：500-5000 文件、数万 chunks，当前向量检索为内存线性扫描。
+## 2. 当前验证基线
 
-### 2.2 当前验证结果
+### 2.1 已执行验证
 
-| 检查 | 当前结果 | 说明 |
+| 检查 | 结果 | 说明 |
 |---|---|---|
-| `go test -count=1 ./...` | 通过 | 25 个测试；6 个包有测试，15 个包无测试 |
-| `go vet ./...` | 通过 | 0 个问题 |
-| 后端编译 | 通过 | 主程序可编译 |
-| `gofmt -l backend` | 未达标 | `config.go`、`index.go`、`stats.go`、`transport.go` |
-| Vue 类型检查/生产构建 | **失败** | `TimelinePage.vue:176` 对模板 ref 再访问 `.value` |
-| Vite 内存构建 | 通过 | 131 个模块；不能替代类型检查 |
-| 前端 test/lint | 不存在 | `package.json` 仅有 dev/build/preview |
-| CI/CD | 不存在 | 无自动门禁和发布流水线 |
-| race 检查 | 未执行 | 当前环境缺少 CGO/gcc |
-| 依赖漏洞审计 | 未完成 | npm 镜像不支持 advisory API，`govulncheck` 未安装 |
+| `verify.bat` | 通过 | 完整执行六步本地门禁 |
+| 前端类型检查 | 通过 | `vue-tsc --noEmit` |
+| 前端测试 | 通过 | 4 个测试文件，59 个测试 |
+| 前端生产构建 | 通过 | Vite 构建 145 个模块 |
+| `go vet ./...` | 通过 | 无报告问题 |
+| `go test -count=1 ./...` | 通过 | 所有现有后端测试通过 |
+| 并发敏感包重复测试 | 通过 | assembler/taskqueue/qa/transport 连续 20 次 |
+| `gofmt -l backend` | 通过 | 无格式漂移 |
+| 前端覆盖率 | 约 62.16% lines | 页面、files store、设置、事件同步和工作区切换覆盖不足 |
+| 50k vectors 算法基准 | 通过候选阈值 | 1024 维、top-K heap p95 约 61ms |
+| race 检查 | 未执行 | 当前环境未启用 CGO，`-race` 无法运行 |
+| 制品级 E2E/升级冒烟 | 不存在 | 当前只有人工清单 |
 
-## 3. 目标架构
+### 2.2 验证结果的边界
 
-整改后的系统保持单进程和简单优先，不引入微服务或大型 DI 框架。目标是建立清晰的模块所有权和单向依赖。
+- 现有测试通过只能证明已覆盖场景，没有覆盖 runtime 切换期间的活动 HTTP、慢提取、慢 LLM、DB-after-close 和多故障点配置回滚。
+- 当前性能基准复制了候选检索算法，不调用生产 storage，不包含生产索引复制、SQLite、冷缓存或完整 search/QA 链路。
+- 前端测试集中在错误映射、SSE parser、QA store 部分路径和文件历史弹窗；多数页面交互和跨页面状态没有测试。
+- 本地 `verify.bat` 是唯一工程门禁，后续整改必须把必要检查纳入该脚本或由独立的本地冒烟脚本调用。
 
-```text
-frontend
-  app-shell        仅导航、主题、全局通知和连接状态
-  features         files / search / chat / timeline / stats / settings
-  shared           api-client / error-map / ui / formatting
-        |
-        | typed REST + typed SSE
-        v
-transport
-  server + middleware + resource handlers + DTO mapping
-        |
-        v
-application
-  runtime manager / workspace service / indexing service / chat service
-  负责用例编排、事务边界、任务提交和生命周期
-        |
-        v
-domain
-  document policy / git / extract / search / tag / timeline / stats
-        |
-        v
-infrastructure
-  config store / credential store / SQLite repositories / LLM gateway /
-  event stream / task queue
-```
+## 3. 已确认完成或基本完成的内容
 
-### 3.1 硬性边界
+以下成果已有生产代码和测试支撑，应保留并在后续修改中防止回退：
 
-1. `transport` 只解析/校验请求、调用 application use case、映射响应，不执行工作区重建、Python 探测、进程编排或数据库事务。
-2. 工作区相关模块封装为带 generation 的 `Runtime` handle；同一 generation 内依赖引用集合不可变，内部队列、watcher 等状态只能通过受控方法变化。切换时构建新实例，排水旧实例，再一次性原子交换，禁止逐字段替换。
-3. 所有索引入口只调用 `IndexingService.EnqueueRebuild/EnqueueFile`；禁止任意位置直接 `go FullReindex()`。
-4. storage 按聚合写入提供事务 API；上层不得靠多次独立 repository 调用模拟事务。
-5. 前端全局 store 只保存真正跨页面的会话/连接状态；页面查询结果按 feature 隔离，不共享一份可被任意页面覆盖的 `files.items`。
-6. REST/SSE 只保留一套 DTO 定义和错误码表；Go 接口由消费方就近定义，删除失真的全量中央接口。
-7. 文档类型、忽略目录、路径约束只由 `documentpolicy` 提供，watch/browser/index/git/轮询共同复用。
+### 3.1 基础正确性与契约
 
-## 4. 问题台账
+- 前端类型检查和生产构建已恢复。
+- 配置文件使用临时文件、`Sync` 和 rename 进行单文件原子写。
+- SQLite 已建立 `PRAGMA user_version` 迁移框架和迁移测试。
+- `SaveExchange` 已将问答双消息写入收敛为事务。
+- 请求体上限、panic recovery、HTTP 基础超时和 request ID 已加入。
+- 前端 API client 已能解析统一错误信封，SSE 异常 EOF 不再永久悬挂。
+- Markdown 渲染已统一到 `ChatSurface`，使用 DOMPurify 白名单。
 
-严重度定义：P0 为发布和数据安全阻断；P1 为核心正确性/稳定性；P2 为架构、性能和体验债务；P3 为持续治理。
+### 3.2 业务链收敛
 
-### 4.1 P0：必须先处理
+- `AllFilesPage.vue` 已删除。
+- 旧 `/api/timeline` 已下线并有 404 characterization test。
+- 旧 `index.Query` 和 `search.IIndex` 死入口已删除。
+- commits 已成为主要版本浏览模型。
+- 问答核心逻辑已合并到 `Execute` 管线，流式与非流式共享主体流程。
+- 文件历史、下载和恢复已收敛到 `FileHistoryDialog`。
+- provider/model 预设和设置状态已有共享实现。
+- 前端页面路由已改为懒加载。
 
-| ID | 问题与证据 | 影响 | 整改方向 |
+### 3.3 性能与运行治理
+
+- 生产向量检索已使用 bounded top-K heap。
+- search 和 QA 的候选 chunk/file 主查询已提供批量查询路径。
+- 原 8 秒全盘扫描已改为 watcher 主导、60-300 秒退避的 reconciliation。
+- SSE 正常时不再常驻轮询，断线后才启用 15 秒降级轮询。
+- 文本缓存已有版本化 key、流式 SHA-256、容量配额和统计方法。
+- `/health`、`/ready`、`/diagnostics` 端点及基础测试已存在。
+- 本地构建脚本已支持 version/commit/build time 注入，发布脚本已有校验和、依赖清单和变更日志的基础框架。
+
+## 4. 当前问题台账
+
+严重度定义：P0 为数据一致性、生命周期或发布阻断；P1 为核心功能正确性和用户可用性；P2 为架构、性能和可观测性缺口；P3 为持续治理。
+
+### 4.1 P0：必须优先修复
+
+| ID | 问题与当前证据 | 影响 | 整改要求 |
 |---|---|---|---|
-| P0-01 | 现有 Git 仓库打开后不确保忽略 `.memora/`，而配置含明文 API Key；`git.go:52-65`、`config.go:26` | 密钥、数据库、问答和缓存可能进入 Git 历史 | 所有仓库强制检查 ignore；提交 pathspec 二次排除；扫描工作树/index/历史并轮换已泄露 Key；实现统一 `CredentialStore`，Windows 版本使用 DPAPI 加密 |
-| P0-02 | 工作区重建直接关闭旧 storage 并无锁替换 App/handler 字段；`assembler/app.go:149-249` | data race、跨库写入、`database is closed` | 引入 RuntimeManager；停止接流量/任务、排水、原子交换；工作区切换集成测试 |
-| P0-03 | workspace init、手动重建和维度变更等入口直接 goroutine 执行 `FullReindex`，`Index.mu` 未使用；`transport.go:836,1157,2217`、`assembler/app.go:281`、`index.go:65` | 并发删除/重写 chunks/vectors，索引损坏 | 全部归一到队列；同 generation 多次触发合并为一次运行，运行中最多保留一次 follow-up；重建可取消、可观测 |
-| P0-04 | 关闭仅等待 3 秒，仍先关 DB 后停 HTTP；`app.go:613-635` | 活动请求/任务访问已关闭 DB | Shutdown 顺序改为 stop HTTP -> stop watch/poll -> cancel/drain task -> close runtime/storage |
-| P0-05 | chunks、vectors、状态/hash 分步发布；`storage.go:469`、`index.go:598-607` | 搜索可见半成品索引 | 先以单文件 SQLite 事务实现 `ReplaceFileIndex`，成功后一次提交；只有基准或跨文件快照需求证明必要时才评估 staging generation |
-| P0-06 | 配置直接覆盖写，`Migrate()` 无调用；workspace init 逐项保存，已有目标工作区还可能被当前配置覆盖；`config.go:175-246,575`、`transport.go:718` | 截断 JSON、部分配置生效、配置串库、密钥丢失 | 强类型 schema 和原子文件写；新增 `ApplyWorkspaceConfig`，先构造/探测候选配置和 Runtime，全部成功后提交配置并交换 Runtime，失败保持原状态 |
-| P0-07 | 当前前端生产构建失败；`TimelinePage.vue:176` | 无法生成正式制品 | 修复模板 `.value`，将 typecheck/build 纳入根级 verify 和 CI |
+| P0-01 | `RuntimeManager` 只保护 current 指针；`applyRuntimeModules` 逐个改写 App/APIHandler 字段；工作区切换只排水任务，不排水 HTTP，超时后仍关闭旧 storage | 混合 generation、data race、`database is closed`、跨库写入 | 实现 runtime lease/refcount；每个 HTTP/任务固定持有一代 Runtime；串行化切换；旧代引用归零后才能关闭 |
+| P0-02 | `ProcessFile` 先提交 `ChunksReplaceForFile`，再逐条 `VectorsInsert`；现有 `ReplaceFileIndex` 无生产调用 | 向量写入失败时旧索引已删除，新索引只有部分向量 | 生产路径统一调用 `ReplaceFileIndex`；chunks/vectors/hash/status 在一个明确发布边界内完成；故障注入覆盖第 N 次写入 |
+| P0-03 | 工作区初始化先逐项 `Config.Set/Relocate`，再构建 Runtime；失败分支不恢复 `wsPath`、配置路径和配置内容 | 初始化失败后旧 Runtime 与新路径混用，重启也可能指向失败目标 | 实现 `ApplyWorkspaceConfig`：读取目标已有配置、构造候选配置/凭据/Runtime、探测成功后一次提交；任一步失败保持原状态 |
+| P0-04 | `Config.Relocate` 切换到已有工作区时，把当前内存配置保存到目标 `config.json` | A 切换到 B 时覆盖 B 的模型、索引、Git 等配置，并把 A 入口改指向 B | 已有目标配置必须加载并校验，禁止用源工作区配置覆盖；增加 A→B→A 集成测试 |
+| P0-05 | `freezeQueue` 排水 5 秒超时后只告警；shutdown 忽略等待结果并关闭 storage；活动任务缺少取消 context | 慢提取、嵌入或重建仍在运行时访问已关闭 DB | 任务全链路 context；关闭时 cancel、等待明确终态；超时必须记录任务并阻止错误的正常完成语义 |
 
-### 4.2 P1：核心正确性与用户信任
+### 4.2 P1：核心正确性与用户可用性
 
-| ID | 问题与证据 | 影响 | 整改方向 |
+| ID | 问题与当前证据 | 影响 | 整改要求 |
 |---|---|---|---|
-| P1-01 | 空文件重建只标记成功，不删旧 chunks/vectors/hash；`index.go:546` | 已删除内容仍被搜索和回答 | 空内容同样执行原子 Replace，保留“内容为空”的明确状态 |
-| P1-02 | `Incremental` 忽略 `ProcessFile`/删除错误；`index.go:480-485` | 队列误报成功、无重试 | 返回根因并统一任务终态；错误分类为 retryable/skippable/fatal |
-| P1-03 | `autoCommit.enabled=false` 运行时不生效；配置定义见 `config.go:AutoCommitConfig`，执行路径见 `assembler/app.go:323,669` | 用户关闭后仍改 Git 历史 | 按现有设计保留该能力：补回 UI 开关，入队和执行时双重校验，并加配置契约测试 |
-| P1-04 | Git add 错误被忽略，提交混入预 staged 内容；`git.go:205,293-305` | 不完整或越权提交 | 明确 pathspec/独立 index；add 任一失败则中止；提交前展示/验证文件集合 |
-| P1-05 | 恢复版本可能覆盖同路径未跟踪文件；`timeline.go:393`、`git.go:814` | 用户文件丢失 | 冲突检测、备份/拒绝策略、父目录创建、恢复前后校验 |
-| P1-06 | QA EOF 无 done/error 时 Promise 永不结束；`client.ts:251`、`stores/qa.ts:142` | 永久“发送中” | stream 返回显式终态；异常 EOF 报 connection_interrupted；finally 收尾 |
-| P1-07 | 发送中可切换/删除会话，旧请求完成后覆盖新会话；`QAPage.vue:161-171`、`qa.ts:163` | 消息串会话 | cancel + request generation/session ID 校验；会话操作有明确并发策略 |
-| P1-08 | 三个文件详情异步响应无 token；`RecentFilesPage.vue:247`、`WorkspacePage.vue:294`、`AllFilesPage.vue:174` | 可能对错误文件执行恢复 | 收敛为一个 `useFileHistoryDialog`，响应按 fileId/generation 验证 |
-| P1-09 | Markdown 允许原始 HTML；自制净化器虽删除 `<style>` 标签，但仍保留 inline `style`、表单和远程媒体；`QAPage.vue:208-258,423` | 模型输出可伪造 UI、触发外部请求并扩大 sanitizer 漏洞面 | DOMPurify 严格 allowlist；禁原始 HTML、inline style、表单和远程媒体；固定 tags/attributes/URL schemes，并验证恶意样例不发起外部请求 |
-| P1-10 | 请求体无上限，HTTP server 无超时/恢复/request ID；`transport.go:289,599` | 本地资源耗尽、panic 影响服务 | MaxBytesReader、严格 decoder、timeouts、recovery、request ID |
-| P1-11 | 流式 LLM 无响应头/空闲超时；`llm.go:41-57` | goroutine 与关闭流程永久悬挂 | Dial/TLS/Header/idle timeout；context 全链路传播 |
-| P1-12 | 用户+助手消息、会话写入不成事务且忽略错误；`qa.go:138-140,313` | 空会话/单边消息/伪成功 | `SaveExchange` 事务；持久化失败不得发送成功终态 |
-| P1-13 | 错误直接返回 `err.Error()`，前端静默吞错或显示 Blob/raw body | 泄露内部细节，用户无法恢复 | typed error + 稳定 code + requestId；前端统一映射与重试建议 |
-| P1-14 | schema 只靠 `CREATE TABLE IF NOT EXISTS`，没有版本和迁移；`storage.go:73-159` | 当前尚无已复现升级事故，但正式发布后的 schema 演进不可控 | 以首提交 `a290cd9` 和当前 schema 生成版本化 fixture；建立 `PRAGMA user_version`、事务迁移、升级前备份及失败回滚测试 |
-| P1-15 | `FullReindex` 可在单文件/cleanup 失败后仍返回完成，且未校验向量数量等于 chunks 数量；`index.go:FullReindex`、`index.go:565` | 部分失败被报告成功，文件可能以缺失向量的状态标记 indexed | 校验向量基数；聚合单文件/cleanup 错误并发布 `failed/partial` 终态；故障注入覆盖第 N 批 embed、少/多向量和第 N 次写入 |
-| P1-16 | browse/open/extract/index/restore 缺少统一的最终路径 containment，词法检查不能阻止 Windows junction 越界；`browser.go:30`、`git.go:801` | 工作区内链接可能读写或打开工作区外路径 | `documentpolicy` 统一规范化和最终路径校验；默认拒绝越界 symlink/junction，覆盖绝对路径、`..`、混合分隔符和嵌套恢复测试 |
+| P1-01 | QA generation 失效时回调直接 return，不 resolve；`newSession/selectSession` 不 abort 活动请求 | 切换或新建会话后 `sending=true` 永久不复位，输入区卡死 | 会话操作先 cancel 活动请求；所有回调路径只结算一次 Promise；旧请求最终必须进入 finally；补回归测试 |
+| P1-02 | LLM 流读取异常只记日志并关闭 channel，QA 将已收到内容当完整成功 | 截断回答被持久化并显示为成功 | 流必须返回显式 success/error 终态；未收到正常完成标记或发生读错误时返回 `stream.interrupted`，不得保存成功 exchange |
+| P1-03 | 只在 `embed.dimensions` 改变时触发重建；相同维度的 model/base URL 变化不会使旧向量失效 | 新查询向量与旧文档向量不在同一向量空间，搜索/QA 召回错误 | 持久化 embedding fingerprint（provider/base/model/dim/预处理版本）；fingerprint 改变时强制重建，幂等判断同时校验 fingerprint |
+| P1-04 | `/settings/secrets` 只更新 Config；LLM 优先读取启动时创建的 CredentialStore，切工作区也不重绑 | 界面提示密钥更新成功，但模型调用仍使用旧密钥或其他工作区密钥 | 凭据写入必须直接更新当前工作区 CredentialStore；工作区切换时候选凭据与 Runtime 一起交换；端到端测试更新后立即调用 |
+| P1-05 | `qa.systemPrompt` 可保存但 QA 始终使用编译期常量 | 用户设置成功但行为完全不变 | 删除无效配置入口，或将有效 prompt 作为 QA Runtime 配置注入并测试热更新/重启语义 |
+| P1-06 | `selectSession` 自身没有请求令牌或 AbortController | 快速选择 A 再选择 B 时，A 的慢响应可能覆盖 B 的消息 | 会话消息加载采用 latest-request-wins；响应写入前校验 session ID 和请求 generation |
+| P1-07 | Workspace/RecentFiles/Index 等页面的提交选择、预览和搜索缺少 generation | 慢响应覆盖用户的新选择，可能对错误对象继续操作 | 所有用户驱动查询使用 AbortController 或 token；弹窗响应同时校验资源 ID |
+| P1-08 | `FullReindex` 在 cleanup 和聚合错误判断前发送 `phase=done` | 失败重建仍在 UI 显示完成 | 终态改为 `done/partial/failed/canceled`；所有清理和结果汇总完成后只发布一次终态 |
+| P1-09 | migration 在事务提交后单独写 `PRAGMA user_version`；备份失败只告警 | schema 已改变但版本仍旧；升级缺少可靠备份 | 在同一事务设置 user_version；备份失败默认阻断迁移；故障测试覆盖备份、Apply、commit、版本写入 |
+| P1-10 | 自动提交仍可能包含用户预先 staged 的无关内容 | 提交文件集合超出本次任务预期 | 使用独立 index 或提交前精确比对 staged 集合；任务提交文件与最终 commit tree 必须一致 |
+| P1-11 | `/ready` 只检查 generation 非空和 storage ping；空工作区启动也会创建 generation | 尚未初始化时错误报告 ready | readiness 明确检查有效 workspace、Runtime 状态、storage 和必要后台组件；未初始化返回 503 和原因 |
 
-### 4.3 P2：架构收敛与性能
+### 4.3 P2：架构、状态、性能与可观测性
 
-| ID | 问题与证据 | 整改方向 |
+| ID | 问题与当前证据 | 整改要求 |
 |---|---|---|
-| P2-01 | `transport.go` 2435 行，混合 server、SSE、所有路由、配置应用、Python 探测和进程执行 | 按资源拆 `handlers/*.go`；通用 middleware/response；编排移到 application |
-| P2-02 | `storage.go` 1094 行，表所有权和事务边界不清 | 按 files/index/chat/stats/migrations 拆 repository 文件，共享同一 DB owner |
-| P2-03 | `llm.go` 930 行，`ChatStream` 约 256 行 | 拆 client/config/retry/stream decoder/embed/rerank；共用请求和错误分类 |
-| P2-04 | `App.vue` 1718 行，负责壳、侧栏聊天、SSE、轮询、提交和 store 刷新 | App 只保留 shell；抽 `useEventSync`、commit dialog、connection status；收敛聊天入口 |
-| P2-05 | `SettingsPage.vue`、文件页面和 QA 页面含大量业务状态 | feature composable + 专用组件；页面只编排视图 |
-| P2-06 | 同步 `Ask` 与 `AskStream` 重复完整问答流程；`qa.go:90,158` | 单一 `Execute(ctx, request, sink)` 管线，stream 只是输出 sink |
-| P2-07 | App 侧栏和 QAPage 两套聊天/渲染；`App.vue:197`、`QAPage.vue:125` | 明确保留独立页为主入口；需要侧栏时复用同一 ChatSurface/store/renderer |
-| P2-08 | `search` 仍注入未使用 IIndex，旧 `index.Query` 保留；`search.go:14-39,87`、`index.go:641` | 搜索编排归 search/application；删除死注入和旧入口 |
-| P2-09 | 新 commits 浏览外仍保留无人调用 `/api/timeline` 聚合链 | 确认无外部调用后，从 client/route/contract/implementation 整体下线 |
-| P2-10 | `AllFilesPage.vue` 1043 行不可达；三页复制详情、历史、下载、恢复 | 删除死页或重新接线；只保留一个文件详情实现和共享操作组件 |
-| P2-11 | provider/model 逻辑在向导和设置页语义不一致 | 提取 provider 配置状态机，统一预设/远端模型/错误策略 |
-| P2-12 | 最近文件页前端拼接语义搜索+名称搜索，`Promise.all` 全成全败 | 后端统一 Search API，或前端 `allSettled` 明确部分成功语义 |
-| P2-13 | 中央 `contract` 与真实实现签名不一致，且模块再声明局部接口 | 以消费方最小接口为准；DTO/事件类型独立共享；删除失真全量接口 |
-| P2-14 | 文档类型/忽略目录规则散落 browser/index/watch/app | 建 `documentpolicy` 单一规则包并加表驱动测试 |
-| P2-15 | 向量检索复制全量、计算全量、排序全量；search/QA 再做 SQLite N+1 | 第一阶段 batch JOIN + bounded top-K heap；基准不达标再评估 HNSW/vec 扩展 |
-| P2-16 | 8 秒递归扫描工作区并逐文件查 DB，与 fsnotify 重复 | watcher 主导；低频 reconciliation；批量载入 path/mtime/size 后比较 |
-| P2-17 | App 每个索引事件刷新标签、重复刷新队列，另有无 UI 的 5 秒轮询 | 事件按 topic 合并/节流；SSE 正常时禁轮询，断线时降级并重同步 |
-| P2-18 | QA 每次流式更新反复 Markdown 解析整段历史；路由全同步导入 | 路由懒加载；完成消息缓存安全 HTML；仅更新当前消息和预解析 sources |
-| P2-19 | files store 被 QA、列表、筛选和 SSE 共同覆盖 | 视图查询隔离；latest-request-wins/AbortController；实体缓存和 query cache 分开 |
+| P2-01 | transport 虽已拆文件，但仍负责编排配置迁移、Runtime 重建、Python 探测和任务触发 | 增加 application service；handler 只校验 DTO、调用用例、映射响应；删除直接 goroutine/reindex fallback |
+| P2-02 | `files` store 仍是一份全局查询状态，QA/Index/SSE 互相取消和覆盖 | 按 feature 建独立 query state；实体缓存与查询结果分离；SSE 只做失效标记或定向刷新 |
+| P2-03 | `App.vue` 仍包含侧栏聊天模式决策和完整提交 dialog 业务 | App 只保留导航、主题、连接状态和全局通知；聊天入口与提交 dialog 下沉到 feature 组件/composable |
+| P2-04 | 中央 `contract` 的 IStorage/ILLM/IGit/IWatch 等大接口仍存在且无生产消费者 | 保留 DTO/错误/事件类型；删除失真中央接口；消费方继续定义最小接口 |
+| P2-05 | watch/reconciliation/git 仍复制文档扩展名和忽略目录规则 | 全部改用 `documentpolicy`；增加覆盖所有调用模块的表驱动契约测试 |
+| P2-06 | 同步 `/api/qa` 和流式 `/api/qa/stream` 仍是两个公开入口，取消语义不同 | 明确唯一公开入口；若保留同步接口，必须接收请求 context 并共享完全一致的终态/持久化规则 |
+| P2-07 | MarkItDown `ApplyConfig` 无锁写字段且不能清空旧值 | 配置快照原子替换或加锁；空值必须有明确清空语义；并发运行时用不可变配置快照 |
+| P2-08 | search 最终结果仍逐个查询 tags | 增加 FilesTagsByFileIDs 批量接口；一次查询返回当前页所有标签，查询数保持 O(1) |
+| P2-09 | 每个 `index_progress` 都立即刷新 tags | 对同 topic 合并/节流；全量重建期间标签刷新不随文件数线性增长 |
+| P2-10 | reconcile 虽默认低频，但设置允许降到 2 秒 | 后端设置合理最小值；前端约束与后端一致；旧 8 秒 fallback 默认值全部删除 |
+| P2-11 | 缓存 `CleanupExpired` 只有单元测试，无生产调用；命中不更新 mtime | 配置 TTL 并在启动/低频维护任务中执行；提供清理入口；需要 LRU 时在命中后受控 touch |
+| P2-12 | `/diagnostics.recentErrors` 永远为空，且不包含 commit/build time | 接 logx 内存环形缓冲；返回最近脱敏错误、version/commit/buildTime、活动任务和最后失败 operation |
+| P2-13 | requestId 未贯穿日志，operationId 基本未实现；缺少请求耗时、日志轮转和等级阈值 | HTTP/任务/LLM/索引统一 operation context；记录 start/end/duration/outcome；实现等级过滤、轮转、保留期和脱敏 |
+| P2-14 | ChatSurface 每次响应式渲染都重新 parse/sanitize 已完成消息 | 完成消息缓存安全 HTML，只对当前流式消息增量更新；测试缓存失效和 XSS 样例 |
+| P2-15 | FileHistoryDialog 等弹窗缺少 Escape、焦点管理和窄窗口行为 | 增加 dialog 语义、focus trap/restore、Escape、移动端布局和组件测试 |
 
-### 4.4 P3：工程与运行治理
+### 4.4 P3：本地工程与发布治理
 
-- 建立前端 Vitest + Vue Test Utils，覆盖 API unwrap、SSE 分帧/EOF、stores 竞态、聊天会话、文件恢复 dialog。
-- 建立关键后端测试：config、migrations、storage transaction、index consistency、taskqueue、watch、runtime switch、shutdown、Git ignore/restore。
-- 建立 Windows CI：`npm ci`、typecheck、lint、test、build、gofmt check、vet、test、可行环境下 race、干净目录打包冒烟。
-- 固定 Node/npm/Go toolchain；构建只使用 lockfile 严格模式；注入 version/commit/build time。
-- 发布生成 SHA-256、SBOM 和变更日志；加入升级前备份和回滚演练。
-- 增加 `/health`、`/ready` 和诊断摘要：版本、DB、runtime generation、队列深度、活动任务、缓存体积、最近错误。
-- API Key 通过统一 `CredentialStore` 管理，Windows 实现使用 DPAPI；文本缓存增加配额、TTL、清理入口和隐私说明。
-- 修正文档：根 README、开发验证、备份恢复、发布回滚、错误码、日志字段、当前架构；历史设计书已标注为 ADR 后随整改完成归档删除，架构以源码与 `docs/PROJECT_GUIDE.md` 为准。
+- `verify.bat` 在缺少依赖时必须使用 `npm ci`，不得退化为会修改 lockfile 的 `npm install`。
+- 前端测试不可选；没有 test script 应视为门禁配置错误。
+- 固定并验证 Go、Node 和 npm 版本；版本不匹配时本地门禁明确失败。
+- 新增本地 `smoke-release.bat` 或等价脚本，测试打包后的 exe，而不是只测试源码模块。
+- 发布脚本必须在仓库根执行所有 Git 命令，拒绝脏工作树，不得 `checkout --force` 或改变用户当前分支。
+- 发布前强制运行 `verify.bat`；任何校验和、依赖清单、构建或冒烟失败都必须返回非零退出码。
+- 只接受解析到 tag object 的版本参数，拒绝分支名和任意 commit。
+- 依赖清单改为标准 SPDX 或 CycloneDX 格式，并增加本地解析验证。
+- BuildTime 使用真实构建时间；诊断端点同时暴露 version、commit 和 build time。
+- 建立真实旧版本 DB/config fixture，覆盖升级成功、失败回滚和恢复备份。
+- 文档只描述真实实现，不再声明尚未存在的 operationId、TTL、最近错误或自动冒烟能力。
 
-## 5. 重复与删除清单
+## 5. 修复路线
 
-以下清理必须先用引用搜索和契约测试确认，不采用“先保留兼容层”的默认策略。
+### Phase A：数据一致性与 Runtime 生命周期
 
-| 候选 | 当前状态 | 处理决策 |
-|---|---|---|
-| `AllFilesPage.vue` | 路由不可达，复制文件详情/历史逻辑 | 迁移仍需能力后删除 |
-| `getTimeline` + `/api/timeline` + timeline 聚合 | 当前页面只用 commits list/diff | 确认无外部客户端后整链删除 |
-| `index.Query` 与 `search.IIndex` 注入 | 实际搜索直接用 LLM + storage | 删除死入口和装配依赖 |
-| `NewSesion/ClearSesion` | 拼写错误、未使用接口 | 删除；不要再加兼容别名 |
-| `getCommitList(withFiles?)` 的未使用参数 | 无调用者传 `true` | 固化按需 diff 契约后删除参数 |
-| SSE “旧版明文”解析 | 仓库历史无法证明有旧客户端 | 用当前 JSON SSE 协议测试固定后删除 |
-| `autoCommit.enabled` | 配置存在、UI 已无入口、运行时忽略 | 按设计决策 D5 保留并恢复完整能力：UI、入队、执行和测试闭环 |
-| 侧栏 QA | 与独立页双轨且渲染策略不同 | 默认收敛到独立页；若保留必须复用共享实现 |
-| 每 5 秒 queue 轮询 | 结果未渲染且与 SSE 重复 | 删除或仅作为 SSE 断线 fallback |
+目标：首先消除跨库写、DB-after-close 和半成品索引。
 
-## 6. 错误体系整改
+实施项：
 
-### 6.1 后端错误模型
-
-```go
-type AppError struct {
-    Code       ErrorCode
-    PublicMsg  string
-    Kind       ErrorKind // validation, conflict, unavailable, internal
-    Retryable  bool
-    Cause      error
-    Fields     map[string]string
-}
-```
-
-规则：
-
-- `transport` 集中映射 `ErrorCode -> HTTP status + publicMessage`，不得散落字符串 code。
-- 500 只返回 `code/message/requestId`；`Cause`、路径、SQL、远端响应只写日志。
-- 禁止靠 `strings.Contains(err.Error(), "401")` 判断重试；LLM gateway 返回 typed upstream error。
-- 保存/恢复/重建等操作返回可执行建议，例如“检查模型配置后重试”，而不是原始技术文本。
-- “无数据”和“请求失败”是不同状态；前端不得在 catch 中清空数据伪装成功。
-
-建议初始错误码域：
-
-- `validation.*`：非法参数、缺少文件、配置范围错误。
-- `workspace.*`：未初始化、切换中、冲突、不可访问。
-- `index.*`：提取失败、嵌入失败、维度不匹配、重建中。
-- `git.*`：仓库错误、提交冲突、恢复冲突。
-- `ai.*`：未配置、认证失败、限流、超时、协议错误。
-- `storage.*`：迁移失败、不可用、事务失败。
-- `stream.*`：连接中断、取消、协议错误。
-- `internal.unexpected`：未分类错误。
-
-### 6.2 前端呈现
-
-- API client 只接受 `unknown`，集中 `unwrapResponse` 和错误解析；删除广泛 `any`/`data!`。
-- store 标准状态：`idle | loading | ready | refreshing | error`，保留上次成功数据。
-- 全局 toast 只承载操作结果；页面级加载失败在内容区显示错误、request ID 和重试。
-- 下载 Blob 根据 content-type 解析 JSON 错误；聊天气泡禁止展示完整 HTTP body。
-- 设置、恢复、提交等写操作只有后端确认成功后才展示成功提示。
-
-## 7. 日志与控制台整改
-
-当前 Go 日志已是 JSON，前端没有 `console.log/error/debugger` 污染；问题是字段不统一、缺少等级过滤/关联/脱敏，部分 catch 又完全无诊断。
-
-### 7.1 后端日志字段
-
-必备字段：
-
-```text
-ts level component event requestId operationId workspaceGeneration
-fileId taskId sessionId durationMs outcome errorCode retryable
-```
-
-约束：
-
-- 控制台开发模式使用紧凑、对齐、带颜色的人类可读格式；文件/诊断导出使用 JSON Lines。
-- 默认 INFO；DEBUG 由配置显式开启；不在 INFO 输出完整问题、文档正文、模型响应或 API Key。
-- 路径默认记录相对路径或 hash；远端响应只记录 status、provider、request ID 和截断后的脱敏摘要。
-- HTTP、任务、LLM、索引都记录开始/结束和耗时；同一操作贯穿一个 `operationId`。
-- 加入大小/日期轮转和保留期；诊断包生成前再次脱敏。
-
-### 7.2 前端诊断
-
-- 建立小型 `logger`，生产默认只记录 warn/error 到内存环形缓冲，不直接污染 DevTools。
-- 捕获未处理 Promise、Vue error handler、SSE parse/reconnect 状态，统一附 requestId/topic。
-- 对预期取消和网络离线降级日志等级，避免错误风暴。
-- 提供“复制诊断信息”入口，包含版本、连接状态和 request ID，不包含用户问题/密钥。
-
-## 8. 分阶段实施路线
-
-### Phase 0：冻结基线与发布止血（1-2 天）
-
-范围：只做小改动和门禁，不做模块搬迁。
-
-- 修复 `TimelinePage.vue` 构建阻断和四个 gofmt 漂移。
-- 增加根级 `verify` 脚本；建立最小 Windows CI。
-- 给当前 REST/SSE、工作区初始化、重建和文件恢复补 characterization tests。
-- 强制 `.memora/` ignore 和提交排除；检查工作树、Git index 和可用历史是否已含敏感文件；发现泄露时停止使用并轮换对应 Key，历史清理作为单独、需确认的操作。
-- 修复空文件旧索引、增量吞错、FullReindex 伪成功/向量基数校验、autoCommit 完整开关和 Git add 错误。
+1. 为 RuntimeManager 增加 `Acquire/Release` lease，Runtime 包含 closing 状态和引用计数。
+2. HTTP middleware 在路由前获取 runtime lease，并通过 request context 传递；任务提交时固定 generation，执行时获取对应 lease。
+3. 串行化工作区切换；停止旧代接收新工作，取消后台操作，等待引用排空后再关闭。
+4. 实现 `ApplyWorkspaceConfig` 候选流程，支持已有工作区配置加载和所有失败点回滚。
+5. 生产索引改用 `ReplaceFileIndex`，将文件索引发布变为单事务。
+6. 修正 migration 的备份和 user_version 事务边界。
+7. 让关闭流程的任务、提取、嵌入、LLM 和索引全部响应 context 取消。
 
 验收：
 
-- clean checkout 一条命令完成 typecheck/build/test/vet/format check。
-- `.memora/**` 无法被 Memora 提交；工作树/index/历史检查有记录；发现的 Key 已轮换。
-- 空文件不会被搜到旧内容；少/多向量、单文件失败和 cleanup 失败均不会被报告为完整成功。
+- 活动文件查询、QA 流、慢提取和慢嵌入期间切换工作区，不出现 data race、跨库写或 DB-after-close。
+- A→已有 B→A 切换后，两边配置、凭据、数据库和索引均保持各自内容。
+- 任一索引写入故障后，搜索只能看见完整旧版本或完整新版本。
+- 工作区应用每个故障点失败时，当前 workspace、配置入口、目标配置和 Runtime 均不变化。
+- 关闭超时有明确 canceled/failed 终态，不再以正常完成继续运行。
 
-### Phase 1：生命周期与持久化一致性（4-7 天）
+### Phase B：问答、配置和前端竞态修复
 
-- 实现 Runtime/RuntimeManager 和 generation；HTTP/任务持有 runtime lease；watcher、reconciliation poller 和队列都归 Runtime 生命周期所有。
-- 所有 FullReindex 归一到队列；同 generation 的触发合并，运行中最多保留一次 follow-up；支持取消、状态和排水。
-- 将 context 贯穿 HTTP、任务、提取和 LLM；实现 `http.Server.Shutdown`、流式响应头/空闲超时及 poller 停止机制，再加入慢提取、慢 LLM、活动 HTTP 的故障测试。
-- 建立数据库迁移框架和配置原子存储/迁移；实现 `ApplyWorkspaceConfig` 的候选验证、一次提交和失败回滚。
-- 实现 `ReplaceFileIndex`、`SaveExchange` 等事务 API。
-- 增加 `CredentialStore` 抽象，Windows 使用 DPAPI；启动时迁移旧明文 Key，迁移失败可回滚且不得清空原凭据。
-- 恢复历史加入未跟踪文件冲突保护；为 browse/open/extract/index/restore 统一最终路径 containment。
+目标：消除用户可见卡死、截断成功和跨页面状态污染。
 
-验收：
+实施项：
 
-- 同 generation 的 N 次并发触发最大并发数为 1、实际完整执行最多 2 次（当前运行 + 一次 follow-up）；不同 generation 不互相合并；工作区切换期间请求不会跨 generation 写入。
-- 任意索引步骤失败后，查询只能看到完整旧版本或完整新版本。
-- shutdown 故障测试覆盖活动 HTTP、poller、提取和流式 LLM；到期后日志列出 operationId/taskId，且测试无 DB-after-close。
-- 首提交和当前 schema/config fixture 均可升级；每个迁移故障点可回滚，损坏文件可从备份恢复。
-- 明文 Key 迁移后重启仍可用，`config.json`、日志和诊断包均不含 Key；迁移失败保留原可用状态。
-- `ApplyWorkspaceConfig` 在每个配置写入、探测、Runtime 构建和交换故障点失败时，当前工作区、入口指针和目标已有配置均不变化。
-
-### Phase 2：契约、错误和日志统一（3-5 天）
-
-- 定义 typed AppError、错误码常量和集中 HTTP 映射。
-- API response/SSE payload 全类型化；前端以 `unknown` 校验和 unwrap。
-- 增加 requestId/operationId；落实日志字段、级别、脱敏和人类可读控制台格式。
-- 修复前端静默 catch、Blob/raw body 错误、加载失败伪装空数据。
-- HTTP 请求体限制和严格 decoder 在本阶段补齐；连接、响应头、空闲超时及 context 传播已作为生命周期依赖前移到 Phase 1。
+1. 重写 QA store 的一次性 settle/cancel 逻辑；会话切换、新建和删除采用明确并发策略。
+2. LLM stream 返回显式终态，异常 EOF/读错误不保存成功 exchange。
+3. 增加 embedding fingerprint，并统一模型配置变化后的重建策略。
+4. 修复 CredentialStore 更新和工作区重绑定。
+5. 决定 `qa.systemPrompt` 是真正生效还是删除，禁止保留假设置。
+6. 分离 files 实体缓存与 Index/QA 查询状态。
+7. 为会话、搜索、commit、preview 和文件详情增加 latest-request-wins。
+8. 将重建终态改为 done/partial/failed/canceled。
 
 验收：
 
-- 契约测试覆盖所有公开路由、错误响应和 SSE topic。
-- UI 不出现 SQL、Go error、完整 HTTP body 或 `[object Blob]`。
-- 从任一 UI 错误 requestId 能定位一条完整后端操作链。
+- 任意会话操作后旧发送 Promise 都能结束，`sending` 必定恢复。
+- 流式连接中断不会产生成功消息或成功 SSE done。
+- 相同维度模型切换后旧向量不会继续使用。
+- QA 文件下拉、索引页列表和 SSE 刷新互不覆盖查询结果。
+- 慢响应不能覆盖新会话、新查询、新 commit 或新预览。
 
-### Phase 3：收敛业务主链（5-8 天）
+### Phase C：边界、性能和可观测性闭环
 
-- 合并 Ask/AskStream 为单一执行管线。
-- 收敛侧栏/独立问答，统一 ChatSurface、Markdown sanitizer 和会话并发控制。
-- 收敛文件详情/历史/下载/恢复；删除不可达 `AllFilesPage`。
-- 明确 commits 为唯一版本浏览模型，下线旧 timeline API/实现。
-- 明确 search 为唯一查询编排层，删除旧 `index.Query`/IIndex 死依赖。
-- 统一 provider/model 状态机、文档策略和搜索聚合契约。
+目标：让已拆分模块形成真实所有权边界，并用生产链路证明性能和诊断能力。
 
-验收：
+实施项：
 
-- 每项核心业务只有一个 application entry point。
-- 删除清单完成后无死路由、死参数、假兼容注释和拼写错误接口。
-- 同一回答在所有入口使用同一渲染、安全和会话规则。
-
-### Phase 4：模块拆分与前端状态治理（5-8 天）
-
-- 按资源拆 transport；按 repository/transaction 拆 storage；按协议职责拆 llm。
-- `App.vue` 只保留壳；SSE 同步逻辑进入 `useEventSync`。
-- store 区分实体缓存和查询缓存；引入 AbortController/latest-generation。
-- 页面业务抽成 feature composable 和共享组件；补键盘/modal/窄窗口行为。
-- 路由懒加载，安全 HTML 缓存，移除重复格式化工具。
+1. 新建 application use case 层，迁出 transport 中的工作区、设置和进程编排。
+2. 删除中央死接口和重复 document policy。
+3. 批量加载结果标签，节流 index_progress 触发的刷新。
+4. 将 benchmark 改为调用生产 storage/search/QA 检索路径，记录冷热缓存和 SQL 查询数。
+5. 接入 operation context、请求/任务耗时、错误环形缓冲和日志等级/轮转。
+6. 将缓存 TTL 接到低频维护流程，并补清理入口。
+7. 缓存已完成聊天消息的安全 HTML，完善弹窗可访问性和窄窗口行为。
 
 验收：
 
-- transport handler 不直接创建 goroutine、不重建 runtime、不执行数据库事务。
-- App 不包含聊天业务和轮询细节；文件恢复仅一份实现。
-- 故障注入下慢请求不能覆盖新查询或新会话。
+- transport handler 不直接创建 goroutine、执行进程探测、切换 Runtime 或编排多模块事务。
+- search/QA 候选及标签元数据 SQL 查询数为 O(1)。
+- 5000 文件/50000 chunks 的生产候选检索 p95 在固化阈值内，并保留真实结果记录。
+- 全量索引期间同类前端刷新按时间窗口合并，不随文件数量线性增长。
+- 从 UI requestId 能定位 HTTP→任务→LLM/索引的完整 operation 链。
+- diagnostics 返回真实最近错误、活动任务、版本、commit 和 build time。
 
-### Phase 5：性能和可观测性（3-6 天）
+### Phase D：本地发布工程
 
-- 建立 500/5000 文件、10k/50k chunks 基准数据和 p50/p95 记录。
-- 候选元数据批量 JOIN，消除 search/QA N+1。
-- top-K 使用 bounded heap，避免全量排序；用 benchmark 决定是否引入 ANN。
-- 8 秒全盘扫描改低频 reconciliation + 批量比较。
-- SSE 刷新合并/节流；仅断线时轮询并在重连后全量对账。
-- 文本缓存加入版本化 key、配额、TTL 和 cleanup；大文件流式 hash。
-- 增加 health/ready/诊断摘要。
+目标：使本地发布可重复、可验证、不会破坏开发工作区。
 
-初始性能候选目标如下。Phase 5 开始时先把基准机 CPU/内存/磁盘、Go/Node 版本、向量维度、数据生成 seed、预热次数、正式运行次数（不少于 30 次）和冷热缓存条件写入 `benchmarks/README.md`；基线测量后再在同一 PR 固化阈值：
+实施项：
 
-- 5k 文件/50k chunks 本地向量候选检索候选阈值 p95 < 300ms，不含远端 rerank。
-- search/QA 每次候选元数据 SQL 查询数为 O(1)，不随 topK 线性增长。
-- 空闲状态不进行 8 秒递归全盘扫描；SSE 正常时无 5 秒 queue 轮询。
-- 全量索引期间前端同类刷新请求按秒级合并，不随 progress 事件数线性增长。
+1. 固定本地工具链版本并纳入 `verify.bat` 检查。
+2. `verify.bat` 全程使用 lockfile 严格安装模式，固定执行 typecheck/test/build/vet/test/format。
+3. 重写 `release.bat`：拒绝脏树、不切换分支、不丢弃修改、强制验证 tag、先运行门禁。
+4. 校验和、标准 SBOM、版本信息和变更日志任一步失败都阻断发布。
+5. 增加制品级本地冒烟：首次启动、旧库升级、初始化、索引、搜索、QA、提交、恢复和重启。
+6. 建立版本化 DB/config fixture 及升级/回滚测试。
+7. 更新发布、备份和故障排查文档，使其与脚本真实行为一致。
 
-### Phase 6：发布工程与文档（2-4 天）
+验收：
 
-- 固定工具链，`npm ci`，版本/commit/build time 注入。
-- tag 驱动 Windows 制品，生成 SHA-256、SBOM、变更日志和签名策略。
-- 制品冒烟：首次启动、升级旧 DB/config、初始化、索引、搜索、问答、提交、恢复、重启。
-- 更新 README、架构、错误码、日志、备份恢复和发布回滚文档。
-- 将旧审计报告保留为历史记录，并标注对应 commit 和已失效结论。
+- 干净 checkout 在固定工具链下，一条本地命令完成验证和制品构建。
+- 发布命令不会改变当前分支、HEAD 或工作树内容。
+- 非 tag、脏工作树、门禁失败、校验和失败、SBOM 失败和冒烟失败均返回非零退出码且不宣告发布成功。
+- 制品中的 version/commit/build time 可追溯到源码和真实构建时间。
+- 真实旧版本 fixture 可升级；故障后可恢复备份并由旧版重新打开。
 
-## 9. 测试矩阵
+## 6. 测试矩阵
 
 | 层级 | 必测内容 |
 |---|---|
-| 单元 | 配置校验/原子写、迁移、错误映射、SSE parser、top-K、文档规则、Markdown sanitizer |
-| repository | chunks/vectors 原子替换、空内容、QA exchange、rows.Err、迁移升级/回滚 |
-| 并发 | 重建去重、runtime switch、event subscribe/cancel、shutdown drain、请求竞态 |
-| 契约 | 每条 REST 方法/路径/DTO/error；每个 SSE topic payload 和异常 EOF |
-| 前端组件 | loading/error/empty 区分、会话切换、恢复 modal token、设置回填/保存 |
-| E2E | 临时工作区初始化 -> 索引 -> 搜索 -> QA -> commit -> diff -> restore -> restart |
-| 安全 | `.memora` 排除、Markdown 恶意输入、请求体限制、路径/junction、日志脱敏 |
-| 性能 | 500/5000 文件、10k/50k chunks；索引、搜索、QA context、timeline diff |
-| 发布 | clean checkout build、旧版本升级、制品版本信息、校验和、回滚 |
+| Runtime | lease 获取/释放、切换串行化、活动 HTTP、慢任务、旧代排空、超时取消、关闭顺序 |
+| Workspace | 新工作区、已有工作区、A→B→A、配置/凭据隔离、每个候选构建和提交故障点回滚 |
+| Repository | ReplaceFileIndex 原子性、空内容、SaveExchange、rows.Err、migration 备份/Apply/commit/version 故障 |
+| Index | 第 N 批 embed、第 N 次 vector 写入、少/多向量、cleanup 失败、embedding fingerprint 变化 |
+| QA/LLM | 正常 done、异常 EOF、读错误、取消、空流重试、持久化失败、会话切换/新建/删除 |
+| 前端 Store | query 隔离、latest-request-wins、AbortController、loading/error/empty/refreshing、旧响应丢弃 |
+| 前端组件 | 文件恢复 token、聊天 settle、弹窗 Escape/焦点、窄窗口、Markdown 缓存和恶意样例 |
+| 性能 | 500/5000 文件、10k/50k chunks；生产 storage/search/QA；冷热缓存；SQL 查询数；刷新请求数 |
+| 可观测性 | requestId/operationId 关联、duration/outcome、脱敏、日志轮转、最近错误和 diagnostics |
+| 本地发布 | 固定工具链、严格 lockfile、脏树拒绝、tag 验证、制品元数据、校验和、SBOM、升级和回滚冒烟 |
 
-## 10. 实施规则
+## 7. 本地门禁
 
-1. 每个 Phase 单独分支/PR，禁止把生命周期重构、UI 改版和性能优化混在一个提交。
-2. 先写 characterization test，再删除旧链；未证明无调用的公开 API 不直接删除。
-3. 每项整改必须记录：问题 ID、行为变化、数据迁移、回滚方法，以及可复现的 `命令 / fixture / 故障点 / 观测值 / 阈值`；涉及热点时再附性能前后对比。
-4. 不以“拆成更多文件”作为低耦合验收；以依赖方向、数据所有权、事务边界和替换测试为准。
-5. 不先引入 HNSW、消息总线、微服务或通用 DI；现有规模先通过 batch、heap、事务和清晰边界解决。
-6. 新兼容层必须有真实消费者、移除日期和测试；无法证明的“旧版兼容”直接清理。
-7. 文档引用以 commit 固定；模块移动后同步更新架构和 ADR，不继续维护过期行号说明书。
+根目录 `verify.bat` 是唯一持续工程门禁，目标步骤固定为：
 
-## 11. 完成定义
+1. 校验 Go、Node 和 npm 版本。
+2. 使用 `npm ci` 安装或校验前端依赖。
+3. 前端类型检查。
+4. 前端测试，测试脚本缺失视为失败。
+5. 前端生产构建。
+6. `go vet ./...`。
+7. `go test -count=1 ./...`。
+8. `gofmt -l backend` 漂移检查。
+9. 可用环境下执行 race 检查；不可用时输出明确的未执行原因，不伪装为通过。
 
-系统达到“重新凝聚”的标准，不是大文件全部消失，而是满足以下可验证条件：
+制品发布必须额外执行本地制品冒烟，不以源码测试代替打包后的 exe 验证。
 
-- 工作区、索引、问答、版本四条主链各只有一个明确 application entry point。
-- runtime 切换、重建和关闭具有统一生命周期，测试无法制造跨库写和 DB-after-close。
-- 数据库、配置、索引和问答写入具有明确原子性；失败后状态可恢复、可解释。
-- API Key 不再以明文出现在配置、日志或诊断包中；旧配置迁移和泄露轮换有验证记录。
-- transport、application、domain、infrastructure 依赖单向，死 contract 和双轨实现被删除。
-- 前端每类查询有独立状态与竞态控制；错误、空数据、加载和刷新状态明确区分。
-- `verify` 和 CI 全绿；生产构建、迁移、E2E、关键并发和安全测试成为发布门禁。
-- 日志可读、可关联、可脱敏；用户错误信息稳定且包含可执行建议，不泄露内部细节。
-- 在 5000 文件/50000 chunks 基准下达到固化的 p95 指标，空闲状态无无效高频扫描/轮询。
-- 发布制品可从版本追溯到源码和工具链，升级前有备份，失败有回滚路径。
+## 8. 实施规则
+
+1. 修复顺序固定为 Phase A→B→C→D；P0 未完成前不继续做大范围 UI 改版或抽象重构。
+2. 每个行为修复先增加可复现失败测试，再修改生产调用链；只测试未被调用的 helper 不算完成。
+3. 工作区、索引、问答和迁移必须做故障注入，不能只验证 happy path。
+4. 模块拆文件不作为低耦合验收；以依赖方向、Runtime 所有权、事务边界和替换测试为准。
+5. 新配置项必须有真实读取者、应用时机和测试；无法生效的设置直接删除。
+6. 新兼容入口必须有真实消费者、移除条件和契约测试；无消费者的旧接口不默认保留。
+7. 所有异步前端操作都要定义取消、迟到响应和组件卸载语义。
+8. 性能整改必须测生产路径并记录环境、seed、冷热缓存、次数、p50/p95 和源码 commit。
+9. 文档只能声明已实现并验证的能力；计划目标必须明确标为目标，不能写成当前事实。
+10. 发布脚本不得执行破坏性 Git 操作，不得丢弃、覆盖或隐藏用户未提交修改。
+
+## 9. 完成定义
+
+只有同时满足以下条件，系统才达到本轮“重新凝聚”标准：
+
+- 每个 HTTP 请求和后台任务固定持有一个 Runtime generation，工作区切换和关闭测试无法制造跨库写或 DB-after-close。
+- 工作区配置、凭据、Runtime 交换和已有目标配置具有原子提交/失败回滚语义。
+- 文件 chunks、vectors、hash 和状态以明确事务边界发布，故障后查询只看到完整旧版本或完整新版本。
+- QA 任意终态都可结束；会话操作不会卡住发送状态；异常流不会保存截断成功回答。
+- embedding 模型身份被持久化验证，相同维度模型切换也不会复用不兼容向量。
+- 各 feature 查询状态隔离，慢响应无法覆盖用户的新会话、新查询、新提交或新文件。
+- transport 只负责协议适配，工作区/设置/任务编排由 application use case 负责。
+- 文档类型和忽略规则由 documentpolicy 单一提供，中央死接口和无消费者入口已清理。
+- 生产检索链达到固化性能阈值，SQL 和前端刷新次数不随候选/事件数线性放大。
+- 日志具有真实 requestId/operationId、耗时、结果、等级、轮转和脱敏；diagnostics 返回真实最近错误和构建信息。
+- `verify.bat` 在干净 checkout 可重复通过；race 不可用时有明确记录。
+- 本地发布不修改工作树或分支，门禁、校验和、标准 SBOM 和制品冒烟任一步失败都会阻断发布。
+- 真实旧版本 DB/config 可升级、备份和回滚，发布文档与脚本行为一致。
 
 ---
 
-本计划是当前整改的唯一总纲。实施过程中若发现新问题，应先归入对应 ID/Phase 并补证据和验收标准，而不是继续以页面或函数为单位追加孤立补丁。
+本文件替代此前所有完成状态和旧整改路线。后续发现的新问题必须先归入对应 ID/Phase，补充触发条件、影响、生产证据和可复现验收标准，再进入实现。
