@@ -118,7 +118,7 @@ func defaultConfig() *Config {
 	c.Index.ChunkSize = 2000
 	c.Index.ChunkOverlap = 256
 	c.Index.ScanIntervalSec = 8
-	c.Recent.WindowHours = 24 // 最近文件默认展示"最近 24 小时"内修改的文件
+	c.Recent.WindowHours = 24                      // 最近文件默认展示"最近 24 小时"内修改的文件
 	c.Rerank.Model = "Pro/BAAI/bge-reranker-v2-m3" // 重排模型默认值（SiliconFlow）
 	c.QA.MaxContextChars = 30000
 	c.Stats.Enabled = true
@@ -422,11 +422,15 @@ func (m *Module) setByPath(key string, value interface{}) error {
 		}
 		m.cfg.AutoCommit.Enabled = v
 	case "autoCommit.debounceSec":
-		vFloat, ok := value.(float64)
-		if !ok {
+		// 兼容 int（Go 直接调用）与 float64（HTTP/JSON）两种数字类型
+		switch v := value.(type) {
+		case int:
+			m.cfg.AutoCommit.DebounceSec = v
+		case float64:
+			m.cfg.AutoCommit.DebounceSec = int(v)
+		default:
 			return fmt.Errorf("[config] autoCommit.debounceSec 需要数字类型")
 		}
-		m.cfg.AutoCommit.DebounceSec = int(vFloat)
 	case "index.chunkSize":
 		vFloat, ok := value.(float64)
 		if !ok {

@@ -3,6 +3,7 @@
 package index
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -331,6 +332,8 @@ func (m *Module) FullReindex() error {
 		"total": total,
 	})
 
+	var errs []error
+
 	for i, relPath := range files {
 		// 检查文档类型
 		docType := detectDocType(relPath)
@@ -358,14 +361,14 @@ func (m *Module) FullReindex() error {
 		// 写入文件元数据
 		id, err := m.storage.FilesUpsert(fileInfo)
 		if err != nil {
-			logx.Warn("index", "写入文件元数据失败", "relPath", relPath, "err", err.Error())
+			errs = append(errs, fmt.Errorf("[index] 写入文件元数据失败 %s: %w", relPath, err))
 			continue
 		}
 		fileInfo.ID = id
 
-		// 处理单个文件
+		// 处理单个文件（P1-15：错误收集而非仅 logx.Warn）
 		if err := m.ProcessFile(fileInfo); err != nil {
-			logx.Warn("index", "处理文件失败", "relPath", relPath, "err", err.Error())
+			errs = append(errs, fmt.Errorf("[index] 处理文件失败 %s: %w", relPath, err))
 		}
 
 		// 广播进度
@@ -386,7 +389,12 @@ func (m *Module) FullReindex() error {
 	// 清理幽灵索引：磁盘上已不存在的文件，从索引中移除其 chunks/vectors
 	// （修复审计发现：FullReindex 仅 upsert 现有文件，若 watch 漏删则旧向量仍参与检索）
 	if err := m.cleanupMissingFiles(files); err != nil {
-		logx.Warn("index", "清理已删除文件索引警告", "err", err.Error())
+		errs = append(errs, fmt.Errorf("[index] 清理已删除文件索引失败: %w", err))
+	}
+
+	if len(errs) > 0 {
+		logx.Warn("index", "全量重建索引存在失败项", "count", len(errs))
+		return errors.Join(errs...)
 	}
 
 	logx.Info("index", "全量重建索引完成")
@@ -406,6 +414,7 @@ func (m *Module) cleanupMissingFiles(onDisk []string) error {
 		return err
 	}
 
+	var errs []error
 	removed := 0
 	for _, f := range dbFiles {
 		// ignored（含已标记删除的文件）无需处理
@@ -415,8 +424,9 @@ func (m *Module) cleanupMissingFiles(onDisk []string) error {
 		if onDiskSet[f.RelPath] {
 			continue
 		}
+		// P1-15：收集清理失败而非仅 logx.Warn，避免伪成功
 		if err := m.DeleteFile(f.RelPath); err != nil {
-			logx.Warn("index", "清理幽灵文件失败", "relPath", f.RelPath, "err", err.Error())
+			errs = append(errs, fmt.Errorf("[index] 清理幽灵文件失败 %s: %w", f.RelPath, err))
 			continue
 		}
 		removed++
@@ -424,11 +434,15 @@ func (m *Module) cleanupMissingFiles(onDisk []string) error {
 	if removed > 0 {
 		logx.Info("index", "已清理已删除文件的索引", "count", removed)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Incremental 增量索引
+// P1-02 修复：不再忽略 ProcessFile/DeleteFile 的返回错误。推进所有文件后汇总错误，
+// 若有任何失败返回聚合错误（errors.Join），单个文件失败不中断其余文件的处理。
 func (m *Module) Incremental(changed, removed []string) error {
+	var errs []error
+
 	// 处理变更的文件
 	for _, relPath := range changed {
 		// 防御校验：跳过目录、未知类型及 ignored 类型（修复 H-04）
@@ -440,6 +454,7 @@ func (m *Module) Incremental(changed, removed []string) error {
 		fullPath := filepath.Join(m.workspace, relPath)
 		stat, err := os.Stat(fullPath)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("[index] 增量索引文件 %s 状态检查失败: %w", relPath, err))
 			continue
 		}
 		if stat.IsDir() {
@@ -448,7 +463,7 @@ func (m *Module) Incremental(changed, removed []string) error {
 
 		fileInfo, err := m.storage.FilesFindByRelPath(relPath)
 		if err != nil {
-			logx.Warn("index", "查找文件失败", "relPath", relPath, "err", err.Error())
+			errs = append(errs, fmt.Errorf("[index] 增量索引文件 %s 查找失败: %w", relPath, err))
 			continue
 		}
 
@@ -463,7 +478,7 @@ func (m *Module) Incremental(changed, removed []string) error {
 			}
 			id, err := m.storage.FilesUpsert(fileInfo)
 			if err != nil {
-				logx.Warn("index", "插入新文件失败", "relPath", relPath, "err", err.Error())
+				errs = append(errs, fmt.Errorf("[index] 增量索引新文件 %s 插入失败: %w", relPath, err))
 				continue
 			}
 			fileInfo.ID = id
@@ -472,21 +487,25 @@ func (m *Module) Incremental(changed, removed []string) error {
 			fileInfo.Mtime = stat.ModTime().UnixMilli()
 			id, err := m.storage.FilesUpsert(fileInfo)
 			if err != nil {
-				logx.Warn("index", "更新文件元数据失败", "relPath", relPath, "err", err.Error())
+				errs = append(errs, fmt.Errorf("[index] 增量索引文件 %s 元数据更新失败: %w", relPath, err))
 				continue
 			}
 			fileInfo.ID = id
 		}
 
-		m.ProcessFile(fileInfo)
+		if err := m.ProcessFile(fileInfo); err != nil {
+			errs = append(errs, fmt.Errorf("[index] 增量索引文件 %s 处理失败: %w", relPath, err))
+		}
 	}
 
 	// 处理删除的文件
 	for _, relPath := range removed {
-		m.DeleteFile(relPath)
+		if err := m.DeleteFile(relPath); err != nil {
+			errs = append(errs, fmt.Errorf("[index] 增量索引文件 %s 删除失败: %w", relPath, err))
+		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // ProcessFile 处理单个文件（核心流程，§4.8 内部流程）
@@ -517,11 +536,11 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 		skip := false
 		if existingChunks, cerr := m.storage.ChunksByFile(file.ID); cerr == nil && len(existingChunks) > 0 {
 			dim, hasVec, derr := m.storage.FileVectorDim(file.ID)
-		if derr == nil && hasVec && int(dim) == int(m.embedDimGet()) {
-			skip = true
-		} else {
-			logx.Info("index", "幂等跳过失效（维度变化），重新索引", "relPath", file.RelPath, "storedDim", dim, "expectDim", int(m.embedDimGet()), "hasVec", hasVec)
-		}
+			if derr == nil && hasVec && int(dim) == int(m.embedDimGet()) {
+				skip = true
+			} else {
+				logx.Info("index", "幂等跳过失效（维度变化），重新索引", "relPath", file.RelPath, "storedDim", dim, "expectDim", int(m.embedDimGet()), "hasVec", hasVec)
+			}
 		} else {
 			// hash 相同但无分块：上次索引未完成，继续走完整流程以自愈
 			logx.Info("index", "幂等跳过失效，重新索引", "relPath", file.RelPath)
@@ -544,7 +563,24 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 		})
 	}
 
+	// 内容为空：清除该文件的旧索引（chunks/vectors），保持"已索引但为空"的明确状态。
+	// P1-01 修复：此前只标记 indexed 直接返回，若文件内容被清空，旧 chunks/vectors 仍
+	// 残留于库中参与检索，导致已删除/清空的内容仍被搜索到。
 	if len(chunks) == 0 {
+		if err := m.storage.ChunksReplaceForFile(file.ID, nil); err != nil {
+			errMsg := fmt.Sprintf("清空分块失败: %v", err)
+			m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
+			return fmt.Errorf("[index] %s: %w", errMsg, err)
+		}
+		// 空内容也视为已索引状态：写回 content_hash，避免下次重复全量处理
+		now := time.Now().UnixMilli()
+		file.ContentHash = cacheKey
+		file.LastIndexedAt = now
+		if _, err := m.storage.FilesUpsert(file); err != nil {
+			errMsg := fmt.Sprintf("写回文件元数据失败: %v", err)
+			m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
+			return fmt.Errorf("[index] %s: %w", errMsg, err)
+		}
 		m.storage.FilesMarkStatus(file.ID, "indexed", "")
 		return nil
 	}
@@ -570,17 +606,17 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 		allVectors = append(allVectors, vecs...)
 	}
 
-		// 校验向量维度
-		wantDim := int(m.embedDimGet())
-		for i, vec := range allVectors {
-			if len(vec) != wantDim {
-				errMsg := fmt.Sprintf("向量维度不匹配: 期望 %d, 实际 %d (第 %d 块)", wantDim, len(vec), i+1)
-				m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
-				// 控制台同步输出：排查"找不到文件"的关键日志（sources=[] 时查文件是否 failed）
-				logx.Error("index", "向量维度不匹配，文件标记失败", "relPath", file.RelPath, "expect", wantDim, "actual", len(vec))
-				return fmt.Errorf("[index] %s", errMsg)
-			}
+	// 校验向量维度
+	wantDim := int(m.embedDimGet())
+	for i, vec := range allVectors {
+		if len(vec) != wantDim {
+			errMsg := fmt.Sprintf("向量维度不匹配: 期望 %d, 实际 %d (第 %d 块)", wantDim, len(vec), i+1)
+			m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
+			// 控制台同步输出：排查"找不到文件"的关键日志（sources=[] 时查文件是否 failed）
+			logx.Error("index", "向量维度不匹配，文件标记失败", "relPath", file.RelPath, "expect", wantDim, "actual", len(vec))
+			return fmt.Errorf("[index] %s", errMsg)
 		}
+	}
 
 	// Step 5: 事务写入分块和向量
 	if err := m.storage.ChunksReplaceForFile(file.ID, chunks); err != nil {
@@ -595,12 +631,20 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 		return fmt.Errorf("[index] 查询分块失败: %w", err)
 	}
 
+	// 向量基数校验：向量数量必须与分块数量严格一致（P1-15 修复）。
+	// 此前 `if i < len(allVectors)` 会静默跳过多出的 dbChunk / 缺失的向量，
+	// 导致部分分块无向量、检索漏命中而查询方无从感知。
+	if len(allVectors) != len(dbChunks) {
+		errMsg := fmt.Sprintf("向量基数不匹配: 分块 %d 个, 向量 %d 个", len(dbChunks), len(allVectors))
+		m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
+		logx.Error("index", "向量基数不匹配，文件标记失败", "relPath", file.RelPath, "chunks", len(dbChunks), "vectors", len(allVectors))
+		return fmt.Errorf("[index] %s", errMsg)
+	}
+
 	for i, dbChunk := range dbChunks {
-		if i < len(allVectors) {
-			if err := m.storage.VectorsInsert(dbChunk.ID, allVectors[i], int(m.embedDimGet())); err != nil {
-				m.storage.FilesMarkStatus(file.ID, "failed", fmt.Sprintf("写入向量失败: %v", err))
-				return fmt.Errorf("[index] 写入向量失败: %w", err)
-			}
+		if err := m.storage.VectorsInsert(dbChunk.ID, allVectors[i], int(m.embedDimGet())); err != nil {
+			m.storage.FilesMarkStatus(file.ID, "failed", fmt.Sprintf("写入向量失败: %v", err))
+			return fmt.Errorf("[index] 写入向量失败: %w", err)
 		}
 	}
 

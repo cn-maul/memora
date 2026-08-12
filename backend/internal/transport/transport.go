@@ -2119,45 +2119,45 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-			// 热更新收集（修复 H-09：明确区分热更新项与需重启项）
-			var newPythonPath, newCommand, newMarkitdownCmd string
-			hasMarkitdown := false
-			restartKeys := make(map[string]bool)
-			// embed.dimensions 变更检测：若新值与旧值不同,标记需自动重建索引。
-			dimChanged := false
-			newDim := int64(0)
+		// 热更新收集（修复 H-09：明确区分热更新项与需重启项）
+		var newPythonPath, newCommand, newMarkitdownCmd string
+		hasMarkitdown := false
+		restartKeys := make(map[string]bool)
+		// embed.dimensions 变更检测：若新值与旧值不同,标记需自动重建索引。
+		dimChanged := false
+		newDim := int64(0)
 
-			for key, value := range req {
-				// embed.dimensions 变更：先读旧值,变更则刷新索引模块维度并触发自动重建。
-				// 维度变更后若仍用旧 dim 查询,cosine 全 0、检索恒为空,必须重建索引。
-				if key == "embed.dimensions" {
-					oldVal, _ := m.handler.Config.Get("embed.dimensions")
-					var oldDim int64
-					switch v := oldVal.(type) {
-					case int:
-						oldDim = int64(v)
-					case int64:
-						oldDim = v
-					}
-					var newDimVal int64
-					switch v := value.(type) {
-					case int:
-						newDimVal = int64(v)
-					case int64:
-						newDimVal = v
-					case float64:
-						newDimVal = int64(v)
-					}
-					if oldDim != 0 && oldDim != newDimVal {
-						dimChanged = true
-						newDim = newDimVal
-					}
+		for key, value := range req {
+			// embed.dimensions 变更：先读旧值,变更则刷新索引模块维度并触发自动重建。
+			// 维度变更后若仍用旧 dim 查询,cosine 全 0、检索恒为空,必须重建索引。
+			if key == "embed.dimensions" {
+				oldVal, _ := m.handler.Config.Get("embed.dimensions")
+				var oldDim int64
+				switch v := oldVal.(type) {
+				case int:
+					oldDim = int64(v)
+				case int64:
+					oldDim = v
 				}
+				var newDimVal int64
+				switch v := value.(type) {
+				case int:
+					newDimVal = int64(v)
+				case int64:
+					newDimVal = v
+				case float64:
+					newDimVal = int64(v)
+				}
+				if oldDim != 0 && oldDim != newDimVal {
+					dimChanged = true
+					newDim = newDimVal
+				}
+			}
 
-				if err := m.handler.Config.Set(key, value); err != nil {
-					writeError(w, "bad_request", err.Error(), http.StatusBadRequest)
-					return
-				}
+			if err := m.handler.Config.Set(key, value); err != nil {
+				writeError(w, "bad_request", err.Error(), http.StatusBadRequest)
+				return
+			}
 			// 同步 stats.enabled 到 stats 模块（运行时开关）
 			if key == "stats.enabled" {
 				if b, ok := value.(bool); ok {
@@ -2198,40 +2198,40 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-			// 热更新 Extract（MarkItDown）运行参数
-			if hasMarkitdown && m.handler.Extract != nil {
-				m.handler.Extract.ApplyConfig(newPythonPath, newCommand, newMarkitdownCmd)
-			}
+		// 热更新 Extract（MarkItDown）运行参数
+		if hasMarkitdown && m.handler.Extract != nil {
+			m.handler.Extract.ApplyConfig(newPythonPath, newCommand, newMarkitdownCmd)
+		}
 
-			// embed.dimensions 变更：刷新索引模块运行期维度,并在确有存量向量时
-			// 异步触发全量重建索引（沿用 handleIndexReindex 的 fire & forget 模式）。
-			reindexRequired := false
-			if dimChanged && m.handler.Index != nil {
-				m.handler.Index.SetEmbedDim(newDim)
-				if m.handler.Storage != nil {
-					if cnt, err := m.handler.Storage.VectorCount(); err == nil && cnt > 0 {
-						reindexRequired = true
-						logx.Info("transport", "检测到向量维度变更,后台自动重建索引",
-							"oldDim", "见上一步", "newDim", newDim, "vectorCount", cnt)
-						go func() {
-							if err := m.handler.Index.FullReindex(); err != nil {
-								logx.Error("transport", "自动重建索引失败", "err", err.Error())
-							}
-						}()
-					}
+		// embed.dimensions 变更：刷新索引模块运行期维度,并在确有存量向量时
+		// 异步触发全量重建索引（沿用 handleIndexReindex 的 fire & forget 模式）。
+		reindexRequired := false
+		if dimChanged && m.handler.Index != nil {
+			m.handler.Index.SetEmbedDim(newDim)
+			if m.handler.Storage != nil {
+				if cnt, err := m.handler.Storage.VectorCount(); err == nil && cnt > 0 {
+					reindexRequired = true
+					logx.Info("transport", "检测到向量维度变更,后台自动重建索引",
+						"oldDim", "见上一步", "newDim", newDim, "vectorCount", cnt)
+					go func() {
+						if err := m.handler.Index.FullReindex(); err != nil {
+							logx.Error("transport", "自动重建索引失败", "err", err.Error())
+						}
+					}()
 				}
 			}
+		}
 
-			// 返回需重启生效的配置项提示,避免"假成功"
-			restartList := make([]string, 0, len(restartKeys))
-			for k := range restartKeys {
-				restartList = append(restartList, k)
-			}
-			writeOK(w, map[string]interface{}{
-				"ok":              true,
-				"restartRequired": restartList,
-				"reindexRequired": reindexRequired,
-			})
+		// 返回需重启生效的配置项提示,避免"假成功"
+		restartList := make([]string, 0, len(restartKeys))
+		for k := range restartKeys {
+			restartList = append(restartList, k)
+		}
+		writeOK(w, map[string]interface{}{
+			"ok":              true,
+			"restartRequired": restartList,
+			"reindexRequired": reindexRequired,
+		})
 	default:
 		writeError(w, "bad_request", "不支持的请求方法", http.StatusBadRequest)
 	}

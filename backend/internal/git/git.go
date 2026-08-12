@@ -51,35 +51,147 @@ func (m *Module) EnsureRepo(path string) error {
 
 	// 先探测是否存在
 	repo, err := gogit.PlainOpen(path)
-	if err == nil {
-		m.repo = repo
-		return nil
-	}
-
-	// 不存在则初始化
-	repo, err = gogit.PlainInit(path, false)
 	if err != nil {
-		return fmt.Errorf("[git] 初始化仓库失败: %w", err)
-	}
-
-	// 创建 .gitignore 并添加 .memora/
-	gitignorePath := filepath.Join(path, ".gitignore")
-	data, err := os.ReadFile(gitignorePath)
-	if err != nil || !strings.Contains(string(data), ".memora") {
-		f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			f.WriteString("\n# Memora 软件数据目录\n.memora/\n")
-			f.Close()
+		// 不存在则初始化
+		repo, err = gogit.PlainInit(path, false)
+		if err != nil {
+			return fmt.Errorf("[git] 初始化仓库失败: %w", err)
 		}
 	}
 
 	m.repo = repo
 
+	// 无论新建还是复用已有仓库，都确保 .gitignore 拒绝 .memora/，
+	// 避免 API Key（.memora/config.json）、数据库、问答缓存进入 Git 历史。
+	// （修复：原实现 PlainOpen 分支直接返回，漏掉对已有仓库的检查）
+	if err := ensureMemoraIgnored(path); err != nil {
+		logx.Warn("git", "写入 .gitignore 失败", "err", err.Error())
+	}
+
 	// 首次初始化：空仓库（无任何提交）时立即把工作区全部文件提交为「初始版本」。
 	// 让 Timeline 从第一天就有基线版本，"找回"有起点（修复：此前直到首次文件变更才有提交）。
+	// 已有提交的仓库会被幂等跳过。
 	m.commitInitialLocked()
 
+	// 泄漏扫描：工作树 + index 中是否存在 .memora 路径（仅检测与记录，不执行密钥轮换）。
+	// 泄露 = 已 tracked 且路径含 .memora：即使补上 ignore 也救不回历史，需人工处理。
+	leaks, scanErr := ScanForMemoraLeaks(path)
+	switch {
+	case scanErr != nil:
+		logx.Warn("git", "泄漏扫描失败", "err", scanErr.Error())
+	case len(leaks) > 0:
+		logx.Error("git", "检测到 .memora 敏感数据已被 Git 跟踪（泄露）",
+			"files", strings.Join(leaks, ","),
+			"hint", "从 index 移除：git rm -r --cached .memora 并提交；若已推送需清理远端历史并轮换密钥")
+	}
+
 	return nil
+}
+
+// memoraIgnoreRule .gitignore 中拒绝 .memora 数据目录的规则文本
+const memoraIgnoreRule = "\n# Memora 软件数据目录\n.memora/\n"
+
+// ensureMemoraIgnored 确保 .gitignore 包含拒绝 .memora/ 的规则；缺失则追加。
+func ensureMemoraIgnored(path string) error {
+	gitignorePath := filepath.Join(path, ".gitignore")
+	data, err := os.ReadFile(gitignorePath)
+	if err == nil && strings.Contains(string(data), ".memora") {
+		return nil // 已含规则
+	}
+	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("[git] 打开 .gitignore 失败: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(memoraIgnoreRule); err != nil {
+		return fmt.Errorf("[git] 写入 .gitignore 失败: %w", err)
+	}
+	return nil
+}
+
+// isMemoraPath 判断路径是否为 .memora 目录内（或 .memora 自身）。
+// go-git 的 index/status 路径恒用正斜杠，按路径段匹配，避免误伤 "notemora.txt" 之类文件名。
+func isMemoraPath(p string) bool {
+	return p == ".memora" || strings.HasPrefix(p, ".memora/") || strings.Contains(p, "/.memora/")
+}
+
+// ScanForMemoraLeaks 扫描工作树与 Git index 中是否存在 .memora 路径
+// （.memora/config.json 含明文 API Key、数据库、问答缓存，绝不能进入 Git 历史）。
+// 泄露 = 已 tracked（进入 index）且路径含 .memora：这类文件会被提交/推送，需人工处理。
+// 本函数只检测并返回泄露路径清单，不轮换密钥（轮换需人工确认）；绝不读取/打印文件内容。
+func ScanForMemoraLeaks(path string) ([]string, error) {
+	repo, err := gogit.PlainOpen(path)
+	if err != nil {
+		return nil, fmt.Errorf("[git] 打开仓库失败: %w", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		return nil, fmt.Errorf("[git] 获取工作区失败: %w", err)
+	}
+	status, err := wt.Status()
+	if err != nil {
+		return nil, fmt.Errorf("[git] 获取状态失败: %w", err)
+	}
+
+	// 工作树 status 中出现未跟踪的 .memora 路径 = ignore 未生效，add 全部时会被带进提交
+	for f, s := range status {
+		if isMemoraPath(f) && s.Worktree == '?' {
+			logx.Warn("git", "检测到 .memora 路径未被忽略（add 时会进入提交）", "file", f)
+		}
+	}
+
+	// index 中已 tracked 的 .memora 文件：真正泄露
+	idx, err := repo.Storer.Index()
+	if err != nil {
+		return nil, fmt.Errorf("[git] 读取 index 失败: %w", err)
+	}
+	var leaks []string
+	for _, e := range idx.Entries {
+		if isMemoraPath(e.Name) {
+			leaks = append(leaks, e.Name)
+		}
+	}
+	return leaks, nil
+}
+
+// ScanHistoryForMemoraLeaks 扫描 Git 历史中所有提交的树，返回曾进入任何提交的 .memora 路径。
+// 即使当前 index/工作树已清理，已写入历史的敏感文件（明文 API Key 等）仍是泄露，
+// 需人工决策是否改写历史；本函数只检测与返回，绝不读取/打印文件内容。
+func ScanHistoryForMemoraLeaks(path string) ([]string, error) {
+	repo, err := gogit.PlainOpen(path)
+	if err != nil {
+		return nil, fmt.Errorf("[git] 打开仓库失败: %w", err)
+	}
+
+	found := make(map[string]bool)
+	iter, err := repo.Log(&gogit.LogOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("[git] 遍历提交历史失败: %w", err)
+	}
+	defer iter.Close()
+
+	err = iter.ForEach(func(c *object.Commit) error {
+		tree, err := c.Tree()
+		if err != nil {
+			logx.Warn("git", "读取提交树失败", "commit", c.Hash.String(), "err", err.Error())
+			return nil
+		}
+		return tree.Files().ForEach(func(f *object.File) error {
+			if isMemoraPath(f.Name) {
+				found[f.Name] = true
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("[git] 扫描历史失败: %w", err)
+	}
+
+	var leaks []string
+	for p := range found {
+		leaks = append(leaks, p)
+	}
+	return leaks, nil
 }
 
 // commitInitialLocked 空仓库快照提交（调用方需持有 m.mu）。
@@ -121,7 +233,9 @@ func (m *Module) commitInitialLocked() {
 		for f, s := range status {
 			if s.Worktree == '?' {
 				if _, aerr := wt.Add(f); aerr != nil {
-					logx.Warn("git", "初始版本 add 失败", "file", f, "err", aerr.Error())
+					// 任一 add 失败即终止本次提交，避免不完整快照混入（首次自动提交会兜底）
+					logx.Warn("git", "初始版本 add 失败，放弃本次提交", "file", f, "err", aerr.Error())
+					return
 				}
 			}
 		}
@@ -202,20 +316,21 @@ func (m *Module) CommitAuto(files []string) (string, bool, error) {
 		return "", true, nil
 	}
 
-	// 逐个 add
+	// 逐个 add；任一 add 失败必须中止提交（修复：此前 logx.Warn 后继续，
+	// 会混入预 staged 内容或产生不完整提交）
 	if len(files) == 0 {
 		// 未指定文件列表则 stage 全部变更（含删除）
 		for f, s := range status {
 			if s.Worktree != ' ' && s.Worktree != 0 {
 				if _, err := wt.Add(f); err != nil {
-					logx.Warn("git", "add 失败", "file", f, "err", err.Error())
+					return "", false, fmt.Errorf("[git] add 失败 %s: %w", f, err)
 				}
 			}
 		}
 	} else {
 		for _, f := range files {
 			if _, err := wt.Add(f); err != nil {
-				logx.Warn("git", "add 失败", "file", f, "err", err.Error())
+				return "", false, fmt.Errorf("[git] add 失败 %s: %w", f, err)
 			}
 		}
 	}
@@ -297,7 +412,9 @@ func (m *Module) CommitManual(message string) (string, error) {
 	}
 	for f, s := range status {
 		if s.Worktree != ' ' && s.Worktree != 0 {
-			wt.Add(f)
+			if _, err := wt.Add(f); err != nil {
+				return "", fmt.Errorf("[git] add 失败 %s: %w", f, err)
+			}
 		}
 	}
 

@@ -173,7 +173,7 @@ function statusSign(s: string) {
           </button>
 
           <div v-if="expanded[c.hash]" class="tl-files">
-            <div v-if="loadingFiles.value.has(c.hash)" class="tl-files-empty">加载文件明细中…</div>
+            <div v-if="loadingFiles.has(c.hash)" class="tl-files-empty">加载文件明细中…</div>
             <template v-else>
               <div v-if="filesOf(c.hash).length === 0" class="tl-files-empty">该提交没有文件改动</div>
               <div v-for="f in filesOf(c.hash)" :key="f.status + f.path" class="tl-file">

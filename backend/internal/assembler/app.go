@@ -290,6 +290,14 @@ func (a *App) RebuildWorkspace(workspace string) error {
 }
 func (a *App) createTaskHandler() taskqueue.TaskHandler {
 	return func(task *taskqueue.Task) error {
+		// 双重复核：auto_commit 任务入口再次检查开关，防止通过其他入口绕过，
+		// 确保 autoCommit.enabled=false 时即使任务已入队也不执行提交（审计 P1-03）。
+		if task.Type == "auto_commit" {
+			enabled, _ := a.Config.GetAutoCommitConfig()
+			if !enabled {
+				return nil // 开关关闭：不执行提交、不广播 commit_done
+			}
+		}
 		switch task.Type {
 		case "extract":
 			if payload, ok := task.Payload.(map[string]interface{}); ok {
@@ -667,13 +675,15 @@ func (a *App) consumeWatchChanges() {
 				Payload: f,
 			})
 		}
-		// 触发自动提交
+		// 触发自动提交：仅当 autoCommit.enabled 为 true 时才入队，否则只索引、不自动提交（审计 P1-03）
 		if len(change.Modified) > 0 || len(change.Removed) > 0 {
 			allFiles := append(change.Modified, change.Removed...)
-			a.TaskQueue.Submit(&taskqueue.Task{
-				Type:    "auto_commit",
-				Payload: map[string]interface{}{"files": allFiles},
-			})
+			if enabled, _ := a.Config.GetAutoCommitConfig(); enabled {
+				a.TaskQueue.Submit(&taskqueue.Task{
+					Type:    "auto_commit",
+					Payload: map[string]interface{}{"files": allFiles},
+				})
+			}
 		}
 
 		// 广播文件变更事件

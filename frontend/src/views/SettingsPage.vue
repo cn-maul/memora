@@ -125,6 +125,9 @@ const workspacePath = ref('')
 const scanIntervalSec = ref(8)
 const recentWindowHours = ref(24)
 
+const autoCommitEnabled = ref(true)
+const autoCommitDebounceSec = ref(90)
+
 const testing = ref('')
 const testChatResult = ref('')
 const testEmbedResult = ref('')
@@ -263,6 +266,8 @@ function loadFromSettings() {
   markitdownCmd.value = s.markitdown?.markitdownCmd || ''
   scanIntervalSec.value = s.index?.scanIntervalSec ?? 8
   recentWindowHours.value = s.recent?.windowHours ?? 24
+  autoCommitEnabled.value = s.autoCommit?.enabled ?? true
+  autoCommitDebounceSec.value = s.autoCommit?.debounceSec ?? 90
   workspacePath.value = s.workspace?.path || s.workspacePath || ws.info?.workspacePath || ''
   // 按当前地址反推命中的服务商预设（未命中显示"自定义"）
   llmProviderId.value = providerForUrl(llmBaseUrl.value, 'chat')
@@ -327,6 +332,8 @@ async function handleSaveSettings() {
       'markitdown.markitdownCmd': markitdownCmd.value,
       'index.scanIntervalSec': scanIntervalSec.value,
       'recent.windowHours': recentWindowHours.value,
+      'autoCommit.enabled': autoCommitEnabled.value,
+      'autoCommit.debounceSec': autoCommitDebounceSec.value,
       'workspace.path': workspacePath.value ?? undefined,
     })
     // 顺带保存表单里填写的密钥（非空才覆盖，保持"留空不修改"语义）。
@@ -788,9 +795,36 @@ async function handleTest(type: string) {
                   </select>
                 </div>
               </div>
+              <div class="settings-row">
+                <div class="settings-row__text">
+                  <div class="settings-row__title">自动保存版本</div>
+                  <div class="settings-row__desc">文件变更时自动提交 Git 历史，方便随时找回旧版本</div>
+                </div>
+                <div class="settings-row__control settings-row__control--narrow">
+                  <label class="switch">
+                    <input v-model="autoCommitEnabled" type="checkbox" />
+                    <span class="switch__slider"></span>
+                  </label>
+                </div>
+              </div>
               <details class="settings-advanced">
                 <summary>高级选项（一般无需修改）</summary>
                 <div class="settings-advanced__body">
+                  <div class="settings-row">
+                    <div class="settings-row__text">
+                      <div class="settings-row__title">自动保存间隔（秒）</div>
+                      <div class="settings-row__desc">批量改动合并成一次提交的等待时间</div>
+                    </div>
+                    <div class="settings-row__control settings-row__control--narrow">
+                      <input
+                        v-model.number="autoCommitDebounceSec"
+                        class="input"
+                        type="number"
+                        min="1"
+                        max="3600"
+                      />
+                    </div>
+                  </div>
                   <div class="settings-row">
                     <div class="settings-row__text">
                       <div class="settings-row__title">扫描间隔（秒）</div>
@@ -1522,6 +1556,50 @@ async function handleTest(type: string) {
 }
 .settings-row__control--action {
   flex: 0 0 auto;
+}
+
+/* 自动保存开关 */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  cursor: pointer;
+}
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  cursor: pointer;
+}
+.switch__slider {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--r-full);
+  background: var(--c-bg-hover);
+  border: 1px solid var(--c-border-strong);
+  transition: background 0.15s, border-color 0.15s;
+}
+.switch__slider::before {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--c-text-secondary);
+  transition: transform 0.15s, background 0.15s;
+}
+.switch input:checked + .switch__slider {
+  background: var(--c-brand);
+  border-color: var(--c-brand);
+}
+.switch input:checked + .switch__slider::before {
+  transform: translateX(18px);
+  background: #fff;
 }
 
 .settings-row__error {
