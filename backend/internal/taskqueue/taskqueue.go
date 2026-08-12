@@ -28,6 +28,7 @@ type Module struct {
 	paused  bool
 	cond    *sync.Cond // 暂停/恢复唤醒（修复暂停竞态：Resume 不再依赖非阻塞通道发送）
 	running int32      // 1=正在运行
+	active  int32      // 实际在执行 handler 的任务数（0/1）；暂停阻塞在 cond 上时不计数
 	stopCh  chan struct{}
 
 	handler TaskHandler
@@ -39,6 +40,13 @@ type Module struct {
 	failedTypes map[string]bool
 	// 封禁时间戳（该类型最近一次被封禁的时刻），用于定时自动解封
 	failedSince map[string]time.Time
+
+	// reindex 合并状态（P0-03）：同 generation 的触发在排队期间只保留一次；
+	// 运行中最多保留一次 follow-up，运行结束后自动再跑一轮
+	reindexGen      string // 最近一次提交的 generation（排队中/运行中的代际）
+	reindexQueued   bool   // 队列中是否已有 reindex 任务
+	reindexRunning  bool   // 当前是否有 reindex 任务在运行
+	reindexFollowup bool   // 运行期间又有新触发，需要再跑一轮
 }
 
 // typeBanCooldown 类型被封禁后的冷却时间：冷却期结束后自动解封并允许该类型任务重试，
@@ -88,6 +96,68 @@ func (m *Module) Submit(task *Task) error {
 	}
 
 	return nil
+}
+
+// TriggerReindex 提交一次全量重建请求（同 generation 合并）。
+// generation 用于区分不同工作区代际；同 generation 在排队期间只保留一次；
+// 若正在运行则只记录一次 follow-up，运行结束后自动再跑一次。
+// 返回 error 仅为保持调用方一致性，当前恒为 nil（无同步执行、无网络等可失败路径）。
+func (m *Module) TriggerReindex(generation string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 正在运行：记录最新代际与一次 follow-up，不排队（运行结束后自动再跑一轮）
+	if m.reindexRunning {
+		m.reindexGen = generation
+		m.reindexFollowup = true
+		logx.Info("taskqueue", "reindex 运行中，记录 follow-up", "generation", generation)
+		return nil
+	}
+
+	// 未运行：同代际且已有 reindex 在队列 → 合并（不重复排队）
+	if m.reindexQueued && m.reindexGen == generation {
+		logx.Info("taskqueue", "reindex 已在队列，合并触发", "generation", generation)
+		return nil
+	}
+
+	// 否则入队：不同代际（工作区切换）不合并，直接再排一个
+	m.reindexGen = generation
+	m.reindexQueued = true
+	m.queue = append(m.queue, &Task{Type: "reindex"})
+	logx.Info("taskqueue", "reindex 已入队", "generation", generation)
+
+	// 如果未在运行，启动处理器
+	if atomic.CompareAndSwapInt32(&m.running, 0, 1) {
+		go m.processLoop()
+	}
+
+	return nil
+}
+
+// ReindexState 返回 reindex 状态（供状态端点展示）。
+func (m *Module) ReindexState() (generation string, running bool, followup bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.reindexGen, m.reindexRunning, m.reindexFollowup
+}
+
+// WaitReindex 等待 reindex 结束（供关闭流程）：等待已排队及运行中的 reindex
+// （含 follow-up 轮次）全部执行完毕；在超时内返回 true，否则返回 false。
+func (m *Module) WaitReindex(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		m.mu.Lock()
+		running := m.reindexRunning
+		queued := m.reindexQueued
+		m.mu.Unlock()
+		if !running && !queued {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // taskKey 提取任务的去重键
@@ -140,6 +210,10 @@ func (m *Module) processLoop() {
 				if key := taskKey(task); key != "" {
 					delete(m.pending, key)
 				}
+				if task.Type == "reindex" {
+					// 被封禁跳过的 reindex 不会运行：仅清理排队标记，不进入运行状态
+					m.reindexQueued = false
+				}
 				m.mu.Unlock()
 				continue
 			}
@@ -147,6 +221,11 @@ func (m *Module) processLoop() {
 
 		m.queue = m.queue[1:]
 		key := taskKey(task)
+		if task.Type == "reindex" {
+			// 标记 reindex 运行边界：出队即视为开始运行（供 TriggerReindex 合并判定）
+			m.reindexQueued = false
+			m.reindexRunning = true
+		}
 		m.mu.Unlock()
 
 		// 通知队列状态
@@ -154,7 +233,9 @@ func (m *Module) processLoop() {
 
 		// 执行：handler 可能 panic，用 recover 防止 processLoop goroutine 被杀
 		// 导致 running 卡在 1、队列永久停摆、Wait 永远超时（修复 review 发现）
+		atomic.AddInt32(&m.active, 1)
 		err := m.safeHandle(task)
+		atomic.AddInt32(&m.active, -1)
 		if err != nil {
 			logx.Error("taskqueue", "任务失败", "type", task.Type, "err", err.Error())
 			m.mu.Lock()
@@ -180,6 +261,8 @@ func (m *Module) processLoop() {
 						"failedType": task.Type,
 					})
 				}
+				// reindex 运行结束（失败封禁路径）：处理 follow-up，避免运行状态残留
+				m.reindexDone()
 				continue
 			}
 			m.mu.Unlock()
@@ -197,6 +280,9 @@ func (m *Module) processLoop() {
 			delete(m.pending, key)
 			m.mu.Unlock()
 		}
+
+		// reindex 运行结束：若运行期间有新触发（follow-up）则再排一轮同类任务
+		m.reindexDone()
 
 		// 通知状态
 		m.notifyStatus()
@@ -222,6 +308,23 @@ func (m *Module) notifyStatus() {
 		"pending": pending,
 		"paused":  paused,
 	})
+}
+
+// reindexDone 处理 reindex 运行边界：将运行标记置回空闲；若运行期间有新的触发
+// （follow-up），则再排一轮同类任务（保留下一次运行机会），代际以运行期间最新提交为准。
+// 在 processLoop 的 reindex 任务执行完成后调用（含失败封禁路径），防止运行状态残留。
+func (m *Module) reindexDone() {
+	m.mu.Lock()
+	if m.reindexRunning {
+		m.reindexRunning = false
+		if m.reindexFollowup {
+			m.reindexFollowup = false
+			m.queue = append(m.queue, &Task{Type: "reindex"})
+			m.reindexQueued = true
+			logx.Info("taskqueue", "reindex follow-up 已重新入队", "generation", m.reindexGen)
+		}
+	}
+	m.mu.Unlock()
 }
 
 // safeHandle 执行任务 handler 并捕获 panic（修复 review 发现：
@@ -281,6 +384,10 @@ func (m *Module) CancelAll() error {
 	m.consecutiveFails = make(map[string]int)
 	m.failedTypes = make(map[string]bool)
 	m.failedSince = make(map[string]time.Time)
+	// 清空 reindex 合并状态：follow-up 一并清除（运行中的 reindex 由 processLoop 自然结束）
+	m.reindexGen = ""
+	m.reindexQueued = false
+	m.reindexFollowup = false
 	// 若处于暂停状态则复位，否则 processLoop 可能在暂停中永久等待，
 	// 关闭时 Wait 排水必然超时（修复 review 发现：暂停中 Shutdown 每次打超时警告）
 	m.paused = false
@@ -295,6 +402,20 @@ func (m *Module) CancelAll() error {
 func (m *Module) Wait(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for atomic.LoadInt32(&m.running) == 1 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
+}
+
+// WaitActive 等待正在执行 handler 的任务结束，不关心暂停/排队状态。
+// 暂停时 processLoop 可能阻塞在 cond.Wait 上（running 恒为 1），此时并没有任务在跑，
+// 只有真正在执行的任务才计入 active；供工作区切换排水使用（P0-02）。
+func (m *Module) WaitActive(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for atomic.LoadInt32(&m.active) != 0 {
 		if time.Now().After(deadline) {
 			return false
 		}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -71,8 +72,29 @@ func New(dataDir string, dim int) (*Module, error) {
 	return m, nil
 }
 
-// initSchema 创建表结构
-func (m *Module) initSchema() error {
+// Migration 数据库迁移步骤：Version 唯一标识 schema 版本，Apply 在单事务内执行该版本变更。
+type Migration struct {
+	Version int
+	Apply   func(tx *sql.Tx) error
+}
+
+// migrations 版本化迁移表，按版本号升序排列（P1-14）。
+// 新增 schema 变更时向末尾追加 {Version: n+1, Apply: ...}。
+var migrations = []Migration{
+	{Version: 1, Apply: migrateV1},
+}
+
+// latestVersion 返回当前最新 schema 版本号
+func latestVersion() int {
+	if len(migrations) == 0 {
+		return 0
+	}
+	return migrations[len(migrations)-1].Version
+}
+
+// migrateV1 初始 schema（v1）。
+// 全部使用 IF NOT EXISTS，保证老库（user_version=0）升级时幂等不炸。
+func migrateV1(tx *sql.Tx) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS files (
 		  id            INTEGER PRIMARY KEY,
@@ -153,10 +175,95 @@ func (m *Module) initSchema() error {
 	}
 
 	for _, stmt := range statements {
-		if _, err := m.db.Exec(stmt); err != nil {
-			return fmt.Errorf("[storage] 建表失败: %w\nSQL: %s", err, stmt)
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("建表失败: %w\nSQL: %s", err, stmt)
 		}
 	}
+	return nil
+}
+
+// schemaVersion 读取当前 schema 版本（PRAGMA user_version）
+func (m *Module) schemaVersion() (int, error) {
+	var v int
+	if err := m.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		return 0, fmt.Errorf("[storage] 读取 schema 版本失败: %w", err)
+	}
+	return v, nil
+}
+
+// backupDB 迁移前将当前 DB 文件复制为 meta.db.bak-<timestamp>（同 dataDir）。
+// 先 WAL checkpoint 合并 WAL，保证备份为一致快照。
+func (m *Module) backupDB() error {
+	// 尽力合并 WAL；失败也不阻断，后续文件复制仍可执行
+	_, _ = m.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+
+	src := filepath.Join(m.dataDir, "meta.db")
+	dst := filepath.Join(m.dataDir, fmt.Sprintf("meta.db.bak-%d", time.Now().UnixMilli()))
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+// initSchema 版本化迁移（P1-14）：
+// 读 user_version → 备份当前 DB → 单事务依次执行 version > user_version 的迁移
+// → 提交后写入最新版本号。迁移失败则整体回滚，DB 保持不变。
+func (m *Module) initSchema() error {
+	current, err := m.schemaVersion()
+	if err != nil {
+		return err
+	}
+
+	var pending []Migration
+	for _, mig := range migrations {
+		if mig.Version > current {
+			pending = append(pending, mig)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	// 升级前备份当前 DB 文件；备份失败仅告警，不阻断迁移
+	if err := m.backupDB(); err != nil {
+		logx.Warn("storage", "迁移前备份数据库失败", "err", err.Error())
+	}
+
+	tx, err := m.db.Begin()
+	if err != nil {
+		return fmt.Errorf("[storage] 迁移事务开始失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, mig := range pending {
+		if err := mig.Apply(tx); err != nil {
+			return fmt.Errorf("[storage] 迁移到 v%d 失败: %w", mig.Version, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("[storage] 迁移事务提交失败: %w", err)
+	}
+
+	// 提交后写入最新版本号（迁移语句幂等，重复执行无副作用）
+	if _, err := m.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", latestVersion())); err != nil {
+		return fmt.Errorf("[storage] 写入 schema 版本失败: %w", err)
+	}
+
+	logx.Info("storage", "数据库 schema 迁移完成", "from", current, "to", latestVersion())
 	return nil
 }
 
@@ -520,6 +627,100 @@ func (m *Module) ChunksReplaceForFile(fileID int64, chuns []*contract.Chunk) err
 		m.vectorIndex = newIndex
 		m.mu.Unlock()
 	}
+
+	return nil
+}
+
+// ReplaceFileIndex 单事务原子替换某文件的全部分块与向量（P0-05）。
+// 删除旧 chunks（级联删向量）→ 插入新 chunks → 写入全部向量 → 一次提交。
+// 事务内完成，搜索方要么看到完整旧版本要么看到完整新版本。
+func (m *Module) ReplaceFileIndex(fileID int64, chunks []*contract.Chunk, vectors [][]float32, dim int) error {
+	if len(chunks) != len(vectors) {
+		return fmt.Errorf("[storage] 分块与向量数量不一致: chunks=%d vectors=%d", len(chunks), len(vectors))
+	}
+	if dim <= 0 {
+		return fmt.Errorf("[storage] 向量维度非法: %d", dim)
+	}
+	for _, v := range vectors {
+		if len(v) != dim {
+			return fmt.Errorf("[storage] 向量维度不一致: 期望 %d 实际 %d", dim, len(v))
+		}
+	}
+
+	tx, err := m.db.Begin()
+	if err != nil {
+		return fmt.Errorf("[storage] 开始事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 先收集旧 chunkID，供事务提交后清理内存索引
+	oldChunkIDs := make(map[int64]bool)
+	oldRows, err := tx.Query("SELECT id FROM chunks WHERE file_id=?", fileID)
+	if err != nil {
+		return fmt.Errorf("[storage] 查询旧分块失败: %w", err)
+	}
+	for oldRows.Next() {
+		var id int64
+		if err := oldRows.Scan(&id); err != nil {
+			oldRows.Close()
+			return fmt.Errorf("[storage] 扫描旧分块失败: %w", err)
+		}
+		oldChunkIDs[id] = true
+	}
+	if err := oldRows.Err(); err != nil {
+		oldRows.Close()
+		return fmt.Errorf("[storage] 遍历旧分块失败: %w", err)
+	}
+	oldRows.Close()
+
+	// 删旧块（外键级联删除 chunk_vectors）
+	if _, err := tx.Exec("DELETE FROM chunks WHERE file_id=?", fileID); err != nil {
+		return fmt.Errorf("[storage] 删除旧分块失败: %w", err)
+	}
+
+	// 插入新块并写入向量（chunk 新 ID 来自 LastInsertId）
+	newChunkIDs := make([]int64, 0, len(chunks))
+	for i, ch := range chunks {
+		res, err := tx.Exec(
+			`INSERT INTO chunks(file_id, seq, token_est, text) VALUES(?, ?, ?, ?)`,
+			fileID, ch.Seq, ch.TokenEst, ch.Text,
+		)
+		if err != nil {
+			return fmt.Errorf("[storage] 插入分块失败: %w", err)
+		}
+		chunkID, err := res.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("[storage] 获取分块 ID 失败: %w", err)
+		}
+		newChunkIDs = append(newChunkIDs, chunkID)
+
+		if _, err := tx.Exec(
+			`INSERT INTO chunk_vectors(chunk_id, vec, dim) VALUES(?, ?, ?)`,
+			chunkID, vecToBlob(vectors[i]), dim,
+		); err != nil {
+			return fmt.Errorf("[storage] 写入向量失败: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("[storage] 提交事务失败: %w", err)
+	}
+
+	// 同步内存向量索引：移除该文件旧条目，追加新条目（结构同 ChunksReplaceForFile）
+	m.mu.Lock()
+	if len(oldChunkIDs) > 0 {
+		var newIndex []vectorEntry
+		for _, e := range m.vectorIndex {
+			if !oldChunkIDs[e.ChunkID] {
+				newIndex = append(newIndex, e)
+			}
+		}
+		m.vectorIndex = newIndex
+	}
+	for i, id := range newChunkIDs {
+		m.vectorIndex = append(m.vectorIndex, vectorEntry{ChunkID: id, Vec: vectors[i]})
+	}
+	m.mu.Unlock()
 
 	return nil
 }
@@ -1004,6 +1205,66 @@ func (m *Module) QASessionsCreate(mode string, fileID int64) (int64, error) {
 		return 0, fmt.Errorf("[storage] 创建问答会话失败: %w", err)
 	}
 	return result.LastInsertId()
+}
+
+// SaveExchange 单事务保存一次问答回合：创建/复用会话并追加用户+助手两条消息。
+// sessionID 为 0 时事务内新建会话；非 0 时校验会话存在（不存在则报错）。
+// 全部成功才提交；任一失败整体回滚，绝不出现单边消息（P1-12）。
+// 返回 sessionID 与消息总数。
+func (m *Module) SaveExchange(sessionID int64, mode string, fileID int64, userMsg, assistantMsg, sources string, createdAt int64) (int64, int, error) {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return 0, 0, fmt.Errorf("[storage] 开始事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	if sessionID == 0 {
+		// 新建会话
+		res, err := tx.Exec(
+			`INSERT INTO qa_sessions(created_at, mode, file_id) VALUES(?, ?, ?)`,
+			createdAt, mode, fileID,
+		)
+		if err != nil {
+			return 0, 0, fmt.Errorf("[storage] 创建问答会话失败: %w", err)
+		}
+		sessionID, err = res.LastInsertId()
+		if err != nil {
+			return 0, 0, fmt.Errorf("[storage] 获取会话 ID 失败: %w", err)
+		}
+	} else {
+		// 校验会话存在（不存在的会话让后续 FK 失败，这里提前给出明确错误）
+		var exists int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM qa_sessions WHERE id=?", sessionID).Scan(&exists); err != nil {
+			return 0, 0, fmt.Errorf("[storage] 校验会话存在性失败: %w", err)
+		}
+		if exists == 0 {
+			return 0, 0, fmt.Errorf("[storage] 会话不存在: %d", sessionID)
+		}
+	}
+
+	// 事务内追加用户 + 助手两条消息（user 在前，assistant 在后）
+	messages := []struct {
+		role    string
+		content string
+		sources string
+	}{
+		{"user", userMsg, ""},
+		{"assistant", assistantMsg, sources},
+	}
+	for _, msg := range messages {
+		if _, err := tx.Exec(
+			`INSERT INTO qa_messages(session_id, role, content, sources, created_at) VALUES(?, ?, ?, ?, ?)`,
+			sessionID, msg.role, msg.content, msg.sources, createdAt,
+		); err != nil {
+			return 0, 0, fmt.Errorf("[storage] 追加问答消息失败: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("[storage] 提交事务失败: %w", err)
+	}
+
+	return sessionID, len(messages), nil
 }
 
 // QASessionsList 列出所有会话

@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"memora/internal/contract"
+	"memora/internal/documentpolicy"
 	"memora/internal/logx"
 )
 
@@ -336,7 +337,7 @@ func (m *Module) FullReindex() error {
 
 	for i, relPath := range files {
 		// 检查文档类型
-		docType := detectDocType(relPath)
+		docType := documentpolicy.DetectDocType(relPath)
 		if docType == "" || docType == "ignored" {
 			continue
 		}
@@ -446,7 +447,7 @@ func (m *Module) Incremental(changed, removed []string) error {
 	// 处理变更的文件
 	for _, relPath := range changed {
 		// 防御校验：跳过目录、未知类型及 ignored 类型（修复 H-04）
-		docType := detectDocType(relPath)
+		docType := documentpolicy.DetectDocType(relPath)
 		if docType == "" || docType == "ignored" {
 			continue
 		}
@@ -513,7 +514,17 @@ func (m *Module) ProcessFile(file *contract.FileInfo) error {
 	// Step 1: 置 extracting
 	m.storage.FilesMarkStatus(file.ID, "extracting", "")
 
-	fullPath := filepath.Join(m.workspace, file.RelPath)
+	// 最终路径 containment：跟随 symlink/junction 解析，拒绝越出工作区的路径（P1-16）
+	fullPath, err := documentpolicy.FinalPath(m.workspace, file.RelPath)
+	if err != nil {
+		errMsg := err.Error()
+		m.storage.FilesMarkStatus(file.ID, "failed", errMsg)
+		m.events.Notify("extract_failed", map[string]interface{}{
+			"relPath": file.RelPath,
+			"error":   errMsg,
+		})
+		return fmt.Errorf("[index] 提取失败: %w", err)
+	}
 
 	// Step 2: 提取文本
 	text, cacheKey, err := m.extract.ExtractFile(fullPath)
@@ -730,15 +741,15 @@ func (m *Module) scanWorkspaceFiles() ([]string, error) {
 			return nil
 		}
 		if info.IsDir() {
-			// 忽略隐藏目录、.git/.memora 及重型/非文档目录（与 pollPendingFiles 一致）
-			if strings.HasPrefix(info.Name(), ".") || isHeavyDirName(info.Name()) {
+			// 忽略隐藏目录、.git/.memora 及重型/非文档目录（统一 documentpolicy 规则）
+			if documentpolicy.IsIgnoredDir(info.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
 		relPath, _ := filepath.Rel(m.workspace, path)
-		docType := detectDocType(relPath)
+		docType := documentpolicy.DetectDocType(relPath)
 		if docType != "" && docType != "ignored" {
 			files = append(files, relPath)
 		}
@@ -747,38 +758,8 @@ func (m *Module) scanWorkspaceFiles() ([]string, error) {
 	return files, err
 }
 
-// isHeavyDirName 判断是否为应跳过的重型/非文档目录（避免全量扫描 node_modules 等）
-func isHeavyDirName(name string) bool {
-	switch name {
-	case "node_modules", "bin", "obj", "dist", "build", "out", "target", "vendor",
-		"__pycache__", ".venv", "venv", ".idea", ".vscode", ".mvn", ".gradle":
-		return true
-	}
-	return false
-}
-
-// detectDocType 检测文档类型
-func detectDocType(relPath string) string {
-	ext := strings.ToLower(filepath.Ext(relPath))
-	switch ext {
-	case ".pdf":
-		return "pdf"
-	case ".docx":
-		return "docx"
-	case ".pptx":
-		return "pptx"
-	case ".xlsx":
-		return "xlsx"
-	case ".txt":
-		return "txt"
-	case ".md":
-		return "md"
-	case ".doc":
-		return "ignored" // D39：不支持 doc，提示另存 docx
-	default:
-		return ""
-	}
-}
+// isHeavyDirName / detectDocType 已统一迁移到 documentpolicy 包：
+// IsIgnoredDir / DetectDocType。避免各模块重复维护一份规则（P2-14）。
 
 // truncateText 截断文本（按 rune）
 func truncateText(text string, maxRunes int) string {

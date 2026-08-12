@@ -25,7 +25,7 @@ type IStorage interface {
 	QASessionsCreate(mode string, fileID int64) (int64, error)
 	QASessionsList() ([]*contract.QASession, error)
 	QASessionsDelete(id int64) error
-	QAMessagesAppend(sessionID int64, role, content, sources string, createdAt int64) (int64, error)
+	SaveExchange(sessionID int64, mode string, fileID int64, userMsg, assistantMsg, sources string, createdAt int64) (int64, int, error)
 	QAMessagesBySession(sessionID int64) ([]*contract.QAMessage, error)
 }
 
@@ -111,8 +111,12 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 	// 避免用空上下文调用 LLM 浪费一次请求与等待
 	if len(contextBlocks) == 0 {
 		notFound := "根据现有文档，未找到相关信息。"
-		m.storage.QAMessagesAppend(sessionID, "user", req.Question, "", time.Now().UnixMilli())
-		m.storage.QAMessagesAppend(sessionID, "assistant", notFound, "[]", time.Now().UnixMilli())
+		if _, _, err := m.storage.SaveExchange(sessionID, req.Mode, req.FileID, req.Question, notFound, "[]", time.Now().UnixMilli()); err != nil {
+			if newSession {
+				_ = m.storage.QASessionsDelete(sessionID)
+			}
+			return nil, fmt.Errorf("[qa] 保存问答失败: %w", err)
+		}
 		m.events.Notify("qa_ready", map[string]interface{}{"sessionId": sessionID})
 		return &contract.QAResponse{Answer: notFound, SessionID: sessionID}, nil
 	}
@@ -136,12 +140,16 @@ func (m *Module) Ask(req *contract.QARequest) (*contract.QAResponse, error) {
 	// 把回答里的文件路径（含反引号/裸路径）规整为 [文件=path] 标记，保证前端可点击（修复：检索到文件却没超链接）
 	answer = linkifySourceRefs(answer, sources)
 
-	// 模型成功后，一次性写入用户与助手消息（避免孤立消息）
-	m.storage.QAMessagesAppend(sessionID, "user", req.Question, "", time.Now().UnixMilli())
-
-	// 保存助手消息
+	// 模型成功后，单事务原子写入用户与助手消息（P1-12：失败不得返回成功）
 	sourcesJSON := marshalSources(sources)
-	m.storage.QAMessagesAppend(sessionID, "assistant", answer, sourcesJSON, time.Now().UnixMilli())
+	sid, _, err := m.storage.SaveExchange(sessionID, req.Mode, req.FileID, req.Question, answer, sourcesJSON, time.Now().UnixMilli())
+	if err != nil {
+		if newSession {
+			_ = m.storage.QASessionsDelete(sessionID)
+		}
+		return nil, fmt.Errorf("[qa] 保存问答失败: %w", err)
+	}
+	sessionID = sid
 
 	// 广播 qa_ready
 	m.events.Notify("qa_ready", map[string]interface{}{
@@ -196,8 +204,13 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 		// 空上下文短路：不调用 LLM，直接输出"未找到"
 		if len(contextBlocks) == 0 {
 			notFound := "根据现有文档，未找到相关信息。"
-			m.storage.QAMessagesAppend(sessionID, "user", req.Question, "", time.Now().UnixMilli())
-			m.storage.QAMessagesAppend(sessionID, "assistant", notFound, "[]", time.Now().UnixMilli())
+			if _, _, err := m.storage.SaveExchange(sessionID, req.Mode, req.FileID, req.Question, notFound, "[]", time.Now().UnixMilli()); err != nil {
+				if newSession {
+					_ = m.storage.QASessionsDelete(sessionID)
+				}
+				done <- &contract.QAResponse{Error: fmt.Sprintf("保存问答失败: %v", err)}
+				return
+			}
 			m.events.Notify("qa_ready", map[string]interface{}{"sessionId": sessionID})
 			select {
 			case ch <- notFound:
@@ -310,10 +323,17 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 		// 把回答里的文件路径（含反引号/裸路径）规整为 [文件=path] 标记，保证前端可点击（修复：检索到文件却没超链接）
 		answer = linkifySourceRefs(answer, sources)
 
-		// 保存消息（用户 + 助手）
-		m.storage.QAMessagesAppend(sessionID, "user", req.Question, "", time.Now().UnixMilli())
+		// 保存消息（用户 + 助手），单事务原子写入（P1-12：失败不得发送成功终态）
 		sourcesJSON := marshalSources(sources)
-		m.storage.QAMessagesAppend(sessionID, "assistant", answer, sourcesJSON, time.Now().UnixMilli())
+		sid, _, err := m.storage.SaveExchange(sessionID, req.Mode, req.FileID, req.Question, answer, sourcesJSON, time.Now().UnixMilli())
+		if err != nil {
+			if newSession {
+				_ = m.storage.QASessionsDelete(sessionID)
+			}
+			done <- &contract.QAResponse{Error: fmt.Sprintf("保存问答失败: %v", err)}
+			return
+		}
+		sessionID = sid
 
 		m.events.Notify("qa_ready", map[string]interface{}{"sessionId": sessionID})
 

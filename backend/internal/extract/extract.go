@@ -17,6 +17,7 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 
+	"memora/internal/documentpolicy"
 	"memora/internal/logx"
 )
 
@@ -26,6 +27,7 @@ type Module struct {
 	pythonPath    string // Python 解释器路径
 	command       string // MarkItDown 命令模板
 	markitdownCmd string // markitdown 直接可执行路径（优先）
+	workspaceRoot string // 工作区根；由 SetWorkspaceRoot 注入，非空时 ExtractFile 做路径 containment 校验
 }
 
 // normalizeToUTF8 将子进程输出规范化到 UTF-8。
@@ -133,6 +135,12 @@ func New(dataDir string, pythonPath string, command string, markitdownCmd string
 	return &Module{cacheDir: cacheDir, pythonPath: pythonPath, command: command, markitdownCmd: markitdownCmd}, nil
 }
 
+// SetWorkspaceRoot 注入工作区根。注入后 ExtractFile 在读取文件前做最终路径 containment 校验，
+// 阻止越界（含 junction/symlink 指向工作区外）路径被提取。
+func (m *Module) SetWorkspaceRoot(root string) {
+	m.workspaceRoot = root
+}
+
 // ApplyConfig 热更新 MarkItDown 运行参数（修复 H-09）
 func (m *Module) ApplyConfig(pythonPath, command, markitdownCmd string) {
 	if pythonPath != "" {
@@ -197,6 +205,12 @@ func (m *Module) Probe(pythonPath, command string) (ok bool, message string) {
 // ExtractFile 提取文件文本
 // 返回提取的 Markdown 文本和缓存键（SHA256）
 func (m *Module) ExtractFile(filePath string) (text string, cacheKey string, err error) {
+	// 最终路径 containment：若已注入工作区根，读取前校验解析后的真实路径仍位于工作区内
+	if m.workspaceRoot != "" {
+		if cerr := documentpolicy.EnsureWithin(m.workspaceRoot, filePath); cerr != nil {
+			return "", "", fmt.Errorf("[extract] 路径校验失败: %w", cerr)
+		}
+	}
 	// 计算文件 SHA256
 	data, err := os.ReadFile(filePath)
 	if err != nil {

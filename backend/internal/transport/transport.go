@@ -4,7 +4,10 @@
 package transport
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -53,6 +56,11 @@ type APIHandler struct {
 	// RebuildWorkspace 工作区初始化后由处理器回调,用于原地重建工作区相关模块（修复 B-01）。
 	// 由装配层注入。
 	RebuildWorkspace func(workspace string) error
+
+	// TriggerReindex 触发全量重建索引的回调,由装配层注入（P0-03）：
+	// 经任务队列合并执行,避免 transport 各处独立 goroutine 并发 FullReindex 破坏索引。
+	// 为空时退化直连 Index.FullReindex（测试/独立装配场景）。
+	TriggerReindex func() error
 
 	// TaskQueue 任务队列（暂停/恢复/状态,修复 B-03）
 	TaskQueue TaskQueueAPI
@@ -200,8 +208,66 @@ type Module struct {
 	webDir  string
 	webFS   fs.FS
 
+	// maxBodyBytes 请求体大小上限（字节）。默认 32MB,可通过注入的 Module 覆写,
+	// 但不对外提供 setter（避免扩大改动面）。
+	maxBodyBytes int64
+
 	mu       sync.Mutex
 	sseConns map[chan string]struct{}
+}
+
+// ctxKey context 键类型,避免与其他包的值冲突
+type ctxKey int
+
+const (
+	// ctxKeyRequestID 请求 ID 在 context 中的键
+	ctxKeyRequestID ctxKey = iota
+)
+
+// RequestIDFrom 从请求 context 读取 request ID（由 withProtection 注入）。
+// 未注入时返回空串。
+func RequestIDFrom(r *http.Request) string {
+	if id, ok := r.Context().Value(ctxKeyRequestID).(string); ok {
+		return id
+	}
+	return ""
+}
+
+// newRequestID 生成 request ID：base64(时间戳纳秒),无需外部依赖,单调且碰撞概率极低
+func newRequestID() string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
+}
+
+// withProtection HTTP 安全中间件：链式执行
+//  1. request ID：取客户端传入或生成,回写响应头并存入 context（供 handler/recovery 读取）
+//  2. recovery：捕获下游（CORS/路由/处理器）panic → 500,不向客户端回吐 panic 细节
+//  3. body 限制：对每个请求套 MaxBytesReader,超限读时触发 MaxBytesError
+//
+// recovery 为最外层,保证 CORS 与各处理器内的 panic 都能被兜底。
+func (m *Module) withProtection(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1) request ID
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			id = newRequestID()
+		}
+		w.Header().Set("X-Request-ID", id)
+		ctx := context.WithValue(r.Context(), ctxKeyRequestID, id)
+		r = r.WithContext(ctx)
+
+		// 2) recovery
+		defer func() {
+			if rec := recover(); rec != nil {
+				logx.Error("transport", "handler panic", "requestID", id, "path", r.URL.Path, "panic", fmt.Sprintf("%v", rec))
+				writeError(w, "internal", "服务器内部错误", http.StatusInternalServerError)
+			}
+		}()
+
+		// 3) body 大小限制
+		r.Body = http.MaxBytesReader(w, r.Body, m.maxBodyBytes)
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // SetWebDir 设置前端静态资源磁盘目录（如 MEMORA_WEB）。为空则不托管磁盘静态资源。
@@ -230,10 +296,11 @@ type Response struct {
 // New 创建传输模块
 func New(h *APIHandler, events EventBus) *Module {
 	m := &Module{
-		mux:      http.NewServeMux(),
-		handler:  h,
-		events:   events,
-		sseConns: make(map[chan string]struct{}),
+		mux:          http.NewServeMux(),
+		handler:      h,
+		events:       events,
+		maxBodyBytes: 32 << 20, // 默认 32MB 请求体上限
+		sseConns:     make(map[chan string]struct{}),
 	}
 
 	// 订阅 events,桥接到 SSE
@@ -287,9 +354,16 @@ func (m *Module) Handle(routes map[string]interface{}) error {
 	}
 	m.addr = addr
 
+	// http.Server 安全默认值（P1-10）：
+	//   ReadHeaderTimeout/ReadTimeout 限制慢速/慢烤请求；IdleTimeout 回收空闲 keep-alive 连接。
+	//   不设 WriteTimeout：流式问答（handleQAStream）与 SSE 需长时间写出,
+	//   由 handler 内 http.NewResponseController(w).SetWriteDeadline 做空闲写超时。
 	m.server = &http.Server{
-		Addr:    addr,
-		Handler: withCORS(m.mux),
+		Addr:              addr,
+		Handler:           m.withProtection(withCORS(m.mux)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		IdleTimeout:       90 * time.Second,
 	}
 
 	go func() {
@@ -502,6 +576,29 @@ func serveEmbedded(w http.ResponseWriter, r *http.Request, webFS fs.FS, name str
 
 // ──────────────────── SSE ────────────────────
 
+// SSE/流式写空闲超时与心跳间隔。包级变量便于测试注入较短值验证超时断开。
+var (
+	// sseWriteIdleTimeout SSE 事件帧之间的空闲写超时：超时后下一帧写出将以 deadline exceeded 失败并断开
+	sseWriteIdleTimeout = 30 * time.Second
+	// sseHeartbeatInterval SSE 心跳间隔,须小于 sseWriteIdleTimeout,否则心跳也会触发断开
+	sseHeartbeatInterval = 15 * time.Second
+	// qaStreamWriteIdleTimeout 流式问答每 chunk 之间的空闲写超时
+	qaStreamWriteIdleTimeout = 60 * time.Second
+)
+
+// writeStreamFrame 写一个 SSE 帧并刷新,随后武装空闲写超时：
+// 下一帧若在超时后才写入,写操作将以 os.ErrDeadlineExceeded 失败,由调用方断开连接。
+// 不支持的 ResponseWriter（如 httptest 记录器）忽略 SetWriteDeadline 错误。
+func writeStreamFrame(w http.ResponseWriter, flusher http.Flusher, frame string, idle time.Duration) error {
+	if _, err := io.WriteString(w, frame); err != nil {
+		return err
+	}
+	flusher.Flush()
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(idle))
+	return nil
+}
+
 // broadcastSSE 向所有 SSE 连接广播事件
 func (m *Module) broadcastSSE(topic string, data interface{}) {
 	evt := SSEEvent{Topic: topic, Data: data}
@@ -544,17 +641,16 @@ func (m *Module) handleSSE(w http.ResponseWriter, r *http.Request) {
 	m.sseConns[ch] = struct{}{}
 	m.mu.Unlock()
 
-	// 断开清理
+	// 断开/退出清理
 	notify := r.Context().Done()
-	go func() {
-		<-notify
+	defer func() {
 		m.mu.Lock()
 		delete(m.sseConns, ch)
 		m.mu.Unlock()
 	}()
 
 	// 心跳
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(sseHeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
@@ -563,11 +659,17 @@ func (m *Module) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			fmt.Fprint(w, msg)
-			flusher.Flush()
+			if err := writeStreamFrame(w, flusher, msg, sseWriteIdleTimeout); err != nil {
+				// 写失败或空闲超时（连接已死）：关闭连接退出
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					logx.Warn("transport", "SSE 空闲超时,断开连接")
+				}
+				return
+			}
 		case <-ticker.C:
-			fmt.Fprint(w, ": ping\n\n")
-			flusher.Flush()
+			if err := writeStreamFrame(w, flusher, ": ping\n\n", sseWriteIdleTimeout); err != nil {
+				return
+			}
 		case <-notify:
 			return
 		}
@@ -605,6 +707,25 @@ func readBody(r *http.Request, v interface{}) error {
 		return fmt.Errorf("读取请求体失败: %w", err)
 	}
 	return json.Unmarshal(data, v)
+}
+
+// decodeStrictBody 严格解码请求体（最大体写请求使用）：
+// 套 MaxBytesReader 限制大小,并 DisallowUnknownFields 拒绝未知字段。
+// 解析失败时直接写出 400/413 并返回 false；成功返回 true。
+func (m *Module) decodeStrictBody(w http.ResponseWriter, r *http.Request, v interface{}) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, m.maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, "request_too_large", "请求体过大", http.StatusRequestEntityTooLarge)
+		} else {
+			writeError(w, "bad_request", "请求体不合法: "+err.Error(), http.StatusBadRequest)
+		}
+		return false
+	}
+	return true
 }
 
 // getPathParam 从 URL 路径中提取参数（如 /api/files/{id}）
@@ -669,8 +790,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 			Model   string `json:"model"`
 		} `json:"rerank"`
 	}
-	if err := readBody(r, &req); err != nil {
-		writeError(w, "bad_request", "请求体解析失败", http.StatusBadRequest)
+	if !m.decodeStrictBody(w, r, &req) {
 		return
 	}
 
@@ -831,15 +951,30 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 			writeError(w, "internal", fmt.Sprintf("Git 初始化失败: %v", err), http.StatusInternalServerError)
 			return
 		}
-		// 异步触发全量重建索引
+		// 触发全量重建索引（经队列合并执行，P0-03）
+		m.triggerReindex()
+	}
+
+	writeOK(w, map[string]bool{"ok": true})
+}
+
+// triggerReindex 触发一次全量重建索引。
+// 优先走装配层注入的回调（经任务队列合并执行）；未注入时退化为直连
+// Index.FullReindex 并在独立 goroutine 中执行（保持 fire & forget 语义）。
+func (m *Module) triggerReindex() {
+	if m.handler != nil && m.handler.TriggerReindex != nil {
+		if err := m.handler.TriggerReindex(); err != nil {
+			logx.Warn("transport", "触发全量重建索引失败", "err", err.Error())
+		}
+		return
+	}
+	if m.handler != nil && m.handler.Index != nil {
 		go func() {
 			if err := m.handler.Index.FullReindex(); err != nil {
 				logx.Warn("transport", "全量重建索引警告", "err", err.Error())
 			}
 		}()
 	}
-
-	writeOK(w, map[string]bool{"ok": true})
 }
 
 // handleWorkspaceInfo GET /api/workspace/info
@@ -1153,11 +1288,8 @@ func (m *Module) handleIndexReindex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "not_configured", "工作区未初始化", http.StatusBadRequest)
 		return
 	}
-	go func() {
-		if err := m.handler.Index.FullReindex(); err != nil {
-			logx.Warn("transport", "全量重建索引警告", "err", err.Error())
-		}
-	}()
+	// 经任务队列合并执行，避免并发重建（P0-03）
+	m.triggerReindex()
 	writeOK(w, map[string]bool{"ok": true})
 }
 
@@ -1534,8 +1666,7 @@ func (m *Module) handleQASessions(w http.ResponseWriter, r *http.Request) {
 func (m *Module) handleQA(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var req contract.QARequest
-		if err := readBody(r, &req); err != nil {
-			writeError(w, "bad_request", "请求体解析失败", http.StatusBadRequest)
+		if !m.decodeStrictBody(w, r, &req) {
 			return
 		}
 		if req.Question == "" {
@@ -1567,8 +1698,7 @@ func (m *Module) handleQAStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req contract.QARequest
-	if err := readBody(r, &req); err != nil {
-		writeError(w, "bad_request", "请求体解析失败", http.StatusBadRequest)
+	if !m.decodeStrictBody(w, r, &req) {
 		return
 	}
 	if req.Question == "" {
@@ -1609,23 +1739,26 @@ func (m *Module) handleQAStream(w http.ResponseWriter, r *http.Request) {
 		// chunk 可能含真实换行（\n\n）,直接写 SSE 会破坏帧结构导致前端丢内容。
 		// 用 JSON 字符串编码传输,前端解码还原。
 		chunkJSON, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
-		flusher.Flush()
+		if err := writeStreamFrame(w, flusher, "data: "+string(chunkJSON)+"\n\n", qaStreamWriteIdleTimeout); err != nil {
+			// 写失败或空闲超时：断开连接退出
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				logx.Warn("transport", "流式问答空闲超时,断开连接")
+			}
+			return
+		}
 	}
 
 	// 等待最终结果
 	result := <-done
 	if result == nil {
 		// 防御：goroutine 异常退出时 done 可能关闭无值,避免 nil 解引用
-		fmt.Fprintf(w, "event: error\ndata: %s\n\n", `"问答中断"`)
-		flusher.Flush()
+		_ = writeStreamFrame(w, flusher, "event: error\ndata: \"问答中断\"\n\n", qaStreamWriteIdleTimeout)
 		return
 	}
 	if result.Error != "" {
 		// error 数据同样可能含换行,JSON 编码传输
 		errJSON, _ := json.Marshal(result.Error)
-		fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(errJSON))
-		flusher.Flush()
+		_ = writeStreamFrame(w, flusher, "event: error\ndata: "+string(errJSON)+"\n\n", qaStreamWriteIdleTimeout)
 		return
 	}
 
@@ -1641,8 +1774,7 @@ func (m *Module) handleQAStream(w http.ResponseWriter, r *http.Request) {
 		Sources:   result.Sources,
 	}
 	finalJSON, _ := json.Marshal(final)
-	fmt.Fprintf(w, "event: done\ndata: %s\n\n", string(finalJSON))
-	flusher.Flush()
+	_ = writeStreamFrame(w, flusher, "event: done\ndata: "+string(finalJSON)+"\n\n", qaStreamWriteIdleTimeout)
 }
 
 // handleQAByID GET/DELETE /api/qa/sessions/{id}
@@ -2100,8 +2232,7 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 				EmbedApiKey  string `json:"embedApiKey"`
 				RerankApiKey string `json:"rerankApiKey"`
 			}
-			if err := readBody(r, &req); err != nil {
-				writeError(w, "bad_request", "请求体解析失败", http.StatusBadRequest)
+			if !m.decodeStrictBody(w, r, &req) {
 				return
 			}
 			if err := m.handler.Config.UpsertSecrets(req.LLMApiKey, req.EmbedApiKey, req.RerankApiKey); err != nil {
@@ -2114,8 +2245,7 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 		// PUT /api/settings
 		var req map[string]interface{}
-		if err := readBody(r, &req); err != nil {
-			writeError(w, "bad_request", "请求体解析失败", http.StatusBadRequest)
+		if !m.decodeStrictBody(w, r, &req) {
 			return
 		}
 
@@ -2213,11 +2343,8 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 					reindexRequired = true
 					logx.Info("transport", "检测到向量维度变更,后台自动重建索引",
 						"oldDim", "见上一步", "newDim", newDim, "vectorCount", cnt)
-					go func() {
-						if err := m.handler.Index.FullReindex(); err != nil {
-							logx.Error("transport", "自动重建索引失败", "err", err.Error())
-						}
-					}()
+					// 经队列合并执行，避免并发重建（P0-03）
+					m.triggerReindex()
 				}
 			}
 		}
@@ -2426,9 +2553,15 @@ func (m *Module) Addr() string {
 	return m.addr
 }
 
-// Stop 停止服务
+// Stop 优雅停止服务（P0-04 关闭顺序第一步）：
+// 先 http.Server.Shutdown 等待活动请求自然结束（最多 5s），超时则 force Close。
 func (m *Module) Stop() error {
-	if m.server != nil {
+	if m.server == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.server.Shutdown(ctx); err != nil {
 		return m.server.Close()
 	}
 	return nil

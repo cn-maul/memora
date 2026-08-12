@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"memora/internal/credstore"
 )
 
 // Config 内存配置结构（snake_case 标签对应 JSON 键名）
@@ -104,6 +106,9 @@ func New(path string, events EventBus) (*Module, error) {
 	return m, nil
 }
 
+// latestSchemaVersion 当前支持的配置 schema 版本
+const latestSchemaVersion = 1
+
 // defaultConfig 返回默认配置
 func defaultConfig() *Config {
 	c := &Config{}
@@ -164,6 +169,13 @@ func (m *Module) loadFrom(path string) error {
 	if err := json.Unmarshal(data, m.cfg); err != nil {
 		return fmt.Errorf("[config] 解析配置失败: %w", err)
 	}
+	// P0-06：解析成功后按 schema_version 增量迁移（仅当版本需要升级时触发并落盘一次，
+	// 避免每次启动重复写盘；Migrate 内部 save 不会回调 loadFrom，无死循环风险）。
+	if m.cfg.SchemaVersion < latestSchemaVersion {
+		if err := m.Migrate(); err != nil {
+			return fmt.Errorf("[config] 迁移配置失败: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -172,13 +184,43 @@ func (m *Module) save() error {
 	return m.saveTo(m.path)
 }
 
-// saveTo 将当前配置写入指定路径
+// saveTo 将当前配置原子写入指定路径。
+// 原子写：先序列化到同目录临时文件 config.json.tmp-<rand>（0600），再 os.Rename 原子替换，
+// 避免直接覆盖写导致的截断/断电丢失配置（P0-06）。
 func (m *Module) saveTo(path string) error {
 	data, err := json.MarshalIndent(m.cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("[config] 序列化配置失败: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("[config] 创建配置目录失败: %w", err)
+	}
+
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("[config] 写入配置失败: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // 失败时清理临时文件；成功 rename 后此处删除已无文件
+
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("[config] 写入配置失败: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("[config] 写入配置失败: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("[config] 写入配置失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("[config] 写入配置失败: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("[config] 写入配置失败: %w", err)
 	}
 	return nil
@@ -570,6 +612,56 @@ func (m *Module) UpsertSecrets(llmKey, embedKey, rerankKey string) error {
 	return m.save()
 }
 
+// MigrateSecretsToCredStore 将 config 中的明文 llm/embed/rerank api_key 迁移到凭据存储，
+// 迁移成功后清空内存与磁盘明文并落盘；任一失败返回错误且不清空原明文（保留原可用状态）。
+// 仅迁移非空明文 key。本阶段仅提供实现；llm.go 等读取方改接凭据存储由后续任务（Wave 2）完成。
+func (m *Module) MigrateSecretsToCredStore(store credstore.Store) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	type secret struct {
+		service string
+		key     string
+		value   string
+	}
+	var pending []secret
+	if m.cfg.LLM.APIKey != "" {
+		pending = append(pending, secret{"llm", "api_key", m.cfg.LLM.APIKey})
+	}
+	if m.cfg.Embed.APIKey != "" {
+		pending = append(pending, secret{"embed", "api_key", m.cfg.Embed.APIKey})
+	}
+	if m.cfg.Rerank.APIKey != "" {
+		pending = append(pending, secret{"rerank", "api_key", m.cfg.Rerank.APIKey})
+	}
+
+	// 先全部写入凭据存储：任一失败即中止，原明文保持不变
+	for _, s := range pending {
+		if err := store.Set(s.service, s.key, s.value); err != nil {
+			return fmt.Errorf("[config] 迁移密钥到凭据存储失败 (%s/%s): %w", s.service, s.key, err)
+		}
+	}
+
+	// 全部成功后才清空内存明文并落盘
+	oldLLM, oldEmbed, oldRerank := m.cfg.LLM.APIKey, m.cfg.Embed.APIKey, m.cfg.Rerank.APIKey
+	m.cfg.LLM.APIKey = ""
+	m.cfg.Embed.APIKey = ""
+	m.cfg.Rerank.APIKey = ""
+	if err := m.save(); err != nil {
+		// 落盘失败：回滚内存明文，保持原可用状态
+		m.cfg.LLM.APIKey = oldLLM
+		m.cfg.Embed.APIKey = oldEmbed
+		m.cfg.Rerank.APIKey = oldRerank
+		return fmt.Errorf("[config] 迁移密钥后落盘失败，已回滚明文: %w", err)
+	}
+
+	// 标记迁移完成（供启动流程跳过重复迁移）；该步骤失败不回滚——密钥已安全存入凭据存储
+	if err := store.MarkPlaintextMigrated(); err != nil {
+		return fmt.Errorf("[config] 标记凭据迁移完成失败: %w", err)
+	}
+	return nil
+}
+
 // Workspace 返回工作目录
 func (m *Module) Workspace() string {
 	m.mu.RLock()
@@ -577,12 +669,26 @@ func (m *Module) Workspace() string {
 	return m.cfg.WorkspacePath
 }
 
-// Migrate 按 schema_version 增量迁移
+// Migrate 按 schema_version 增量迁移配置到最新版本。
+// 仅在版本低于 latestSchemaVersion 时执行迁移并落盘一次；版本已最新则直接返回，
+// 避免每次加载都重写配置文件。
 func (m *Module) Migrate() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// 当前仅 v1，无迁移逻辑
-	return m.save()
+	return m.migrateLocked()
+}
+
+// migrateLocked 在持有锁的情况下执行增量迁移，版本提升成功后落盘。
+func (m *Module) migrateLocked() error {
+	if m.cfg.SchemaVersion >= latestSchemaVersion {
+		return nil
+	}
+	// 当前最新版本为 v1，暂无字段级迁移；后续 schema_version 升级在此追加步骤。
+	m.cfg.SchemaVersion = latestSchemaVersion
+	if err := m.save(); err != nil {
+		return fmt.Errorf("[config] 迁移后落盘失败: %w", err)
+	}
+	return nil
 }
 
 // GetLLMConfig 获取 LLM 配置（供 llm 模块使用）

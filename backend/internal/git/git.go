@@ -8,11 +8,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"memora/internal/contract"
+	"memora/internal/documentpolicy"
 	"memora/internal/logx"
 
 	gogit "github.com/go-git/go-git/v5"
@@ -34,6 +36,10 @@ type Module struct {
 	repo *gogit.Repository
 	path string // 工作目录
 	cfg  ConfigProvider
+
+	// lastRestoreBackup 最近一次 RestoreFile 因冲突自动生成的备份文件路径；
+	// 供上层通过 LastRestoreBackup() 读取并提示用户「冲突已备份」（P1-05）
+	lastRestoreBackup string
 }
 
 // New 创建 git 模块（不立即初始化仓库）
@@ -592,6 +598,12 @@ func (m *Module) showFileAtLocked(relPath, hash string) (string, error) {
 		return "", fmt.Errorf("[git] 仓库未初始化")
 	}
 
+	// P1-16 入口校验：拒绝 `..` 越界与绝对路径（词法 containment），
+	// 与 RestoreFile 的最终路径校验形成双保险。
+	if _, err := documentpolicy.SafeJoin(m.path, relPath); err != nil {
+		return "", fmt.Errorf("[git] 路径越界: %w", err)
+	}
+
 	commit, err := m.repo.CommitObject(plumbing.NewHash(hash))
 	if err != nil {
 		return "", fmt.Errorf("[git] 获取提交失败: %w", err)
@@ -915,7 +927,14 @@ func (m *Module) ListTreeAt(hash string) ([]*contract.VersionFile, error) {
 	return files, nil
 }
 
-// RestoreFile 将文件恢复到指定提交时的版本（直接写盘）
+// RestoreFile 将文件恢复到指定提交时的版本（写盘）。
+// 冲突保护（P1-05）：目标已存在且内容与历史版本不同（未跟踪/已修改的新内容）时，
+// 先把现有内容备份为同目录 `fullPath.restore-bak-<毫秒时间戳>` 再覆盖，避免用户数据
+// 丢失；备份路径记录到 lastRestoreBackup，上层可经 LastRestoreBackup() 读取并提示。
+// 内容相同则幂等直接成功且不产生备份；恢复完成后读回校验内容与历史版本一致。
+// 路径 containment（P1-16）：统一走 documentpolicy.FinalPath + EnsureWithin，
+// 并额外探测链接（ensureNoLinkAncestor）——Windows 上 junction 不被 EvalSymlinks
+// 解析，必须自行拦截，保证恢复（含备份写入）永远写不到工作区外。
 func (m *Module) RestoreFile(relPath, hash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -924,15 +943,170 @@ func (m *Module) RestoreFile(relPath, hash string) error {
 		return fmt.Errorf("[git] 仓库未初始化")
 	}
 
+	// 每次恢复前清空上一次的备份记录，避免幂等/失败路径残留旧提示
+	m.lastRestoreBackup = ""
+
+	// P1-16：词法 + 最终路径 containment（跟随 symlink 解析最终位置）；越界直接拒绝
+	fullPath, err := documentpolicy.FinalPath(m.path, relPath)
+	if err != nil {
+		return fmt.Errorf("[git] 路径越界: %w", err)
+	}
+
+	// 从历史取内容（showFileAtLocked 入口侧另有词法校验）
 	content, err := m.showFileAtLocked(relPath, hash)
 	if err != nil {
 		return err
 	}
 
-	fullPath := filepath.Join(m.path, relPath)
+	// 目标自身是链接（symlink/junction）→ 拒绝恢复，避免写入链接指向处或破坏链接
+	if fi, lerr := os.Lstat(fullPath); lerr == nil && isLinkLike(fi) {
+		return fmt.Errorf("[git] 目标路径是指向链接(symlink/junction)，拒绝恢复（避免写入链接指向处或破坏链接）: %s", fullPath)
+	}
+
+	// P1-16 加固：祖先链接探测（含 junction）。必须在任何写入（含备份）之前执行，
+	// 防止备份/新建目录穿过链接落到工作区外。
+	if err := m.ensureNoLinkAncestor(fullPath); err != nil {
+		return err
+	}
+
+	// 冲突检测与备份：目标为普通文件且内容不同则先备份；不存在则创建父目录
+	if err := m.restoreConflictSafeLocked(fullPath, content); err != nil {
+		return err
+	}
+
+	// 写盘前最终 containment 校验（双保险）：目标已存在则验目标本身，
+	// 否则验已建好的父目录（FinalPath 对不存在路径的可解析祖先也已校验过，此处兜底）
+	checkPath := fullPath
+	if _, lerr := os.Lstat(fullPath); lerr != nil {
+		checkPath = filepath.Dir(fullPath)
+	}
+	if err := documentpolicy.EnsureWithin(m.path, checkPath); err != nil {
+		return fmt.Errorf("[git] 路径越界: %w", err)
+	}
+
 	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("[git] 写回文件失败: %w", err)
 	}
 
+	// 恢复后校验：读回内容必须与历史版本一致（P1-05）
+	got, err := os.ReadFile(fullPath)
+	if err != nil {
+		return fmt.Errorf("[git] 恢复后校验读取失败: %w", err)
+	}
+	if string(got) != content {
+		return fmt.Errorf("[git] 恢复后校验不一致：文件内容未回到历史版本")
+	}
+
 	return nil
+}
+
+// restoreConflictSafeLocked 恢复目标处理（调用方须持有 m.mu；任何写盘前须先过
+// ensureNoLinkAncestor）：
+//   - 目标不存在：为恢复已删除文件先创建父目录，直接交由调用方写入。
+//   - 目标为普通文件且内容与历史不同：先把现有内容备份为 `目标.restore-bak-<时间戳>`，
+//     再交由调用方覆盖恢复（P1-05 冲突保护，不覆盖未跟踪/已修改的新内容）。
+//   - 目标内容与历史一致：幂等，不产生备份。
+func (m *Module) restoreConflictSafeLocked(fullPath, want string) error {
+	fi, err := os.Lstat(fullPath)
+	switch {
+	case os.IsNotExist(err):
+		// 目标不存在（已删除或新增）：先确保父目录存在
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			return fmt.Errorf("[git] 创建目录失败: %w", err)
+		}
+		return nil
+	case err != nil:
+		return fmt.Errorf("[git] 检查目标路径失败: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("[git] 目标路径不是普通文件，拒绝恢复: %s", fullPath)
+	}
+	cur, err := os.ReadFile(fullPath)
+	if err != nil {
+		return fmt.Errorf("[git] 读取目标文件失败: %w", err)
+	}
+	if string(cur) == want {
+		return nil // 幂等：内容已是历史版本
+	}
+	// 冲突：现有内容与历史版本不同（未跟踪/已修改）→ 先备份再让调用方覆盖
+	backup := fmt.Sprintf("%s.restore-bak-%d", fullPath, time.Now().UnixMilli())
+	if err := os.WriteFile(backup, cur, 0644); err != nil {
+		return fmt.Errorf("[git] 创建恢复备份失败: %w", err)
+	}
+	m.lastRestoreBackup = backup
+	logx.Warn("git", "恢复时检测到冲突，现有内容已备份", "file", fullPath, "backup", backup)
+	return nil
+}
+
+// reparsePointAttr 即 Windows FILE_ATTRIBUTE_REPARSE_POINT（0x0400）。
+// 写成字面量而非 syscall 常量：Win32FileAttributeData 仅 Windows 存在，
+// 避免非 Windows 平台编译失败。
+const reparsePointAttr = 0x00000400
+
+// isLinkLike 判断文件信息是否为链接（symlink 或 junction 目录联接）。
+// Windows 上 Go 的 Lstat 只对 symlink 置 ModeSymlink，junction 仅带
+// FILE_ATTRIBUTE_REPARSE_POINT 属性位且 EvalSymlinks 不解析；这里通过反射读取
+// FileAttributes（Windows 特有字段），避免在非 Windows 平台编译期依赖
+// syscall.Win32FileAttributeData 类型。
+func isLinkLike(fi os.FileInfo) bool {
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return true
+	}
+	v := reflect.ValueOf(fi.Sys())
+	for v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return false
+	}
+	fa := v.FieldByName("FileAttributes")
+	if !fa.IsValid() || !fa.CanInterface() {
+		return false
+	}
+	attrs, ok := fa.Interface().(uint32)
+	if !ok {
+		return false
+	}
+	return attrs&reparsePointAttr != 0
+}
+
+// ensureNoLinkAncestor 逐组件探测 fullPath 的已存在祖先是否包含链接（symlink/junction）。
+// 背景：Windows 上 EvalSymlinks 不解析 junction，FinalPath/EnsureWithin 拦不住
+// 经 junction 越界写入工作区外，故在这里 fail-closed——任何环节出现链接即拒绝，
+// 保证恢复（含备份写入）永远不会穿过链接落到工作区外（P1-16 加固）。
+func (m *Module) ensureNoLinkAncestor(fullPath string) error {
+	root, err := filepath.Abs(m.path)
+	if err != nil {
+		return fmt.Errorf("[git] 解析工作目录失败: %w", err)
+	}
+	rel, err := filepath.Rel(root, fullPath)
+	if err != nil {
+		return fmt.Errorf("[git] 解析相对路径失败: %w", err)
+	}
+	if rel == "." {
+		return nil
+	}
+	cur := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "." || part == "" {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		fi, lerr := os.Lstat(cur)
+		if lerr != nil {
+			break // 剩余组件尚不存在，不存在的东西不可能是链接，终止探测
+		}
+		if isLinkLike(fi) {
+			return fmt.Errorf("[git] 恢复路径途经链接(symlink/junction)，拒绝恢复（防止越界写入工作区外）: %s", cur)
+		}
+	}
+	return nil
+}
+
+// LastRestoreBackup 返回最近一次 RestoreFile 因冲突自动生成的备份文件绝对路径；
+// 无冲突备份时返回空串。供上层在恢复后展示「冲突已备份」提示（P1-05）。
+func (m *Module) LastRestoreBackup() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastRestoreBackup
 }

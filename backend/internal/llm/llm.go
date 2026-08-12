@@ -10,13 +10,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"memora/internal/contract"
+	"memora/internal/credstore"
 	"memora/internal/logx"
+)
+
+// 超时配置（包级变量，测试可调小以加速验证）：
+// P1-11 前 Transport 依赖 Go 默认值——DialContext 无超时（TCP 建连可能永久挂）、
+// ResponseHeaderTimeout 无（对端只建连不响应头时挂死），流式读侧也无 idle 上限。
+var (
+	dialTimeout           = 10 * time.Second // 单次 TCP 建连上限
+	tlsHandshakeTimeout   = 10 * time.Second // TLS 握手上限（Go 默认即为 10s，显式声明）
+	responseHeaderTimeout = 30 * time.Second // 请求写出后首字节（响应头）等待上限
+	requestTimeout        = 60 * time.Second // 非流式整体超时（httpClient.Timeout + 请求 context 双保险）
+	streamReadIdleTimeout = 90 * time.Second // 流式读侧 idle：对端停止推数据后中断 Read，防永久悬挂
 )
 
 // ConfigProvider LLM 配置获取接口
@@ -31,6 +44,7 @@ type Module struct {
 	httpClient   *http.Client // 普通请求（整体 60s 超时）
 	streamClient *http.Client // 流式请求（无整体超时，仅限首字节等待，防长回答被截断）
 	config       ConfigProvider
+	credStore    credstore.Store // 凭据存储（DPAPI 加密），未注入时回退 config 明文
 
 	mu          sync.Mutex
 	lastReqTime time.Time
@@ -45,20 +59,45 @@ func New(cfg ConfigProvider) *Module {
 		MaxIdleConnsPerHost: 20,
 		MaxConnsPerHost:     20,
 		IdleConnTimeout:     90 * time.Second,
+		// P1-11 超时加固：此前以下三项依赖 Go 默认值，存在永久挂死风险
+		DialContext: (&net.Dialer{
+			// 单次 TCP 建连有上限，避免对端不响应 SYN/握手时 goroutine 永久阻塞
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: tlsHandshakeTimeout,
+		// 请求（含 body）写出后等待响应头的上限：对端只建连不响应头时按时返回而非挂死
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 	return &Module{
 		httpClient: &http.Client{
-			Timeout:   60 * time.Second,
+			Timeout:   requestTimeout, // 非流式整体超时
 			Transport: transport,
 		},
-		// 流式请求：Timeout=0 无整体超时（SSE 长回答可能超 60s），
-		// 但设 ResponseHeaderTimeout 防止连接建立后首字节迟迟不来而挂死
+		// 流式请求：Timeout=0 无整体超时（SSE 长回答可能超 60s）；
+		// 首字节等待上限由共享 Transport 的 ResponseHeaderTimeout（30s）兜底，
+		// 流式读侧 idle 上限由读取 goroutine 的 idleReadCloser 兜底（见 ChatStream）
 		streamClient: &http.Client{
 			Transport: transport,
 		},
 		config:    cfg,
 		rateLimit: 50 * time.Millisecond, // 20 rps
 	}
+}
+
+// SetCredStore 注入凭据存储（启动时由装配层调用），密钥优先从 credstore 读取。
+func (m *Module) SetCredStore(store credstore.Store) {
+	m.credStore = store
+}
+
+// credKey 解析 API 密钥：credstore 命中且非空时优先，否则回退 config 明文。
+func (m *Module) credKey(service, fallback string) string {
+	if m.credStore != nil {
+		if v, err := m.credStore.Get(service, "api_key"); err == nil && v != "" {
+			return v
+		}
+	}
+	return fallback
 }
 
 // rateLimitWait 限频等待
@@ -84,7 +123,13 @@ func (m *Module) doRequest(method, url string, body interface{}, apiKey string) 
 		}
 	}
 
-	req, err := http.NewRequest(method, url, bytes.NewReader(reqBody))
+	// P1-11：每请求绑定超时 context 兜底——httpClient.Timeout（60s）之外的
+	// 第二道防线，保证对端"只建连不响应头/只响应头不响应体"时也能按时返回，
+	// 不依赖调用方是否有取消机制（重试/嵌入/设置页探测均走此路径）
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("[llm] 创建请求失败: %w", err)
 	}
@@ -207,6 +252,7 @@ func (m *Module) Chat(system, user string, opts *contract.ChatOptions) (string, 
 	}
 
 	baseURL, apiKey, model, defTemp := m.config.GetLLMConfig()
+	apiKey = m.credKey("llm", apiKey)
 	if baseURL == "" || model == "" {
 		return "", fmt.Errorf("[llm] 聊天端点未配置（致命）")
 	}
@@ -269,6 +315,7 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 	}
 
 	baseURL, apiKey, model, defTemp := m.config.GetLLMConfig()
+	apiKey = m.credKey("llm", apiKey)
 	if baseURL == "" || model == "" {
 		return nil, fmt.Errorf("[llm] 聊天端点未配置（致命）")
 	}
@@ -380,6 +427,27 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 	go func() {
 		defer cancelReq() // 流结束时释放请求上下文（同时让上方 select goroutine 退出）
 		defer resp.Body.Close()
+
+		// P1-11：取消监视——cancel 触发时显式关闭响应体，使阻塞在 resp.Body.Read
+		// 的读循环立即解除阻塞（仅靠 context 取消在大多数情况下也能中断读，
+		// 显式 Close 是兜底保证，避免流式 goroutine 永久悬挂）。
+		// stopWatch 在本 goroutine 结束时关闭，防止监视 goroutine 泄漏。
+		stopWatch := make(chan struct{})
+		go func() {
+			select {
+			case <-cancel:
+				resp.Body.Close()
+			case <-stopWatch:
+			}
+		}()
+		defer close(stopWatch)
+
+		// P1-11：流式读侧 idle 超时——对端连接建立后停止推数据（SSE 断流但连接未关）时，
+		// ResponseHeaderTimeout 管不到 body 读。这里包装响应体（见 idleReadCloser）：
+		// 底层 Read 持续空闲超过 streamReadIdleTimeout 后关闭底层 body 使阻塞的 Read
+		// 返回错误，避免流式读永久悬挂。每次成功 Read 都重置空闲窗口，正常推流不受影响。
+		// 包装后取消监视与 defer Close 仍生效（包装体 Close 委托给底层 body）。
+		resp.Body = newIdleReadCloser(resp.Body, streamReadIdleTimeout)
 
 		if resp.StatusCode >= 400 {
 			errBody, _ := io.ReadAll(resp.Body)
@@ -573,6 +641,52 @@ func clipSample(s string) string {
 	return s
 }
 
+// idleReadCloser 包装流式响应体，提供读侧 idle 超时：
+// 底层 Read 持续空闲超过 idle 后被中断（关闭底层 body 使阻塞的 Read 返回错误），
+// 避免对端断流但连接未关（SSE 停推）时流式 goroutine 永久悬挂。
+// 每次读取都开启独立的空闲窗口，正常推流（数据持续到达）不受影响。
+type idleReadCloser struct {
+	body io.ReadCloser
+	idle time.Duration
+}
+
+func newIdleReadCloser(body io.ReadCloser, idle time.Duration) io.ReadCloser {
+	return &idleReadCloser{body: body, idle: idle}
+}
+
+func (b *idleReadCloser) Read(p []byte) (int, error) {
+	type readResult struct {
+		n   int
+		err error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		n, err := b.body.Read(p)
+		ch <- readResult{n, err}
+	}()
+
+	timer := time.NewTimer(b.idle)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.n, r.err
+	case <-timer.C:
+		// 数据恰好在超时瞬间到达则不中断，避免误杀正常推流
+		select {
+		case r := <-ch:
+			return r.n, r.err
+		default:
+		}
+		b.body.Close() // 关闭底层 body 使阻塞的 Read 返回，解除读阻塞
+		<-ch           // 等待被中断的 Read 退出，避免 goroutine 泄漏
+		return 0, fmt.Errorf("[llm] 流式读取空闲超时")
+	}
+}
+
+func (b *idleReadCloser) Close() error {
+	return b.body.Close()
+}
+
 // ChatJSON 聊天调用并解析 JSON 响应
 func (m *Module) ChatJSON(system, user, schemaDesc string, result interface{}) error {
 	content, err := m.Chat(system, user, &contract.ChatOptions{JSONMode: true, Temperature: 0.2})
@@ -611,6 +725,7 @@ type embedResponse struct {
 // Embed 批量嵌入（每批 ≤16 段）
 func (m *Module) Embed(texts []string) ([][]float32, error) {
 	baseURL, apiKey, model, dims := m.config.GetEmbedConfig()
+	apiKey = m.credKey("embed", apiKey)
 	if baseURL == "" || model == "" {
 		return nil, fmt.Errorf("[llm] 嵌入端点未配置（致命）")
 	}
@@ -707,7 +822,7 @@ func (m *Module) TestChatWith(baseURL, apiKey, model string, temperature float64
 	}
 	if apiKey == "" {
 		_, savedKey, _, _ := m.config.GetLLMConfig()
-		apiKey = savedKey
+		apiKey = m.credKey("llm", savedKey)
 	}
 	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
 	reqBody := chatRequest{
@@ -743,7 +858,7 @@ func (m *Module) TestEmbedWith(baseURL, apiKey, model string) error {
 	}
 	if apiKey == "" {
 		_, savedKey, _, _ := m.config.GetEmbedConfig()
-		apiKey = savedKey
+		apiKey = m.credKey("embed", savedKey)
 	}
 	url := strings.TrimRight(baseURL, "/") + "/embeddings"
 	reqBody := embedRequest{Model: model, Input: []string{"测试"}}
@@ -775,13 +890,13 @@ func (m *Module) ListModels(kind, baseURL, apiKey string) ([]string, error) {
 		switch kind {
 		case "embed":
 			_, savedKey, _, _ := m.config.GetEmbedConfig()
-			apiKey = savedKey
+			apiKey = m.credKey("embed", savedKey)
 		case "rerank":
 			_, savedKey, _ := m.config.GetRerankConfig()
-			apiKey = savedKey
+			apiKey = m.credKey("rerank", savedKey)
 		default:
 			_, savedKey, _, _ := m.config.GetLLMConfig()
-			apiKey = savedKey
+			apiKey = m.credKey("llm", savedKey)
 		}
 	}
 
@@ -832,6 +947,7 @@ type rerankResponse struct {
 // 端点未配置时返回错误，调用方据此回退到向量相似度排序（重排是可选增强，非硬依赖）。
 func (m *Module) Rerank(query string, documents []string) ([]float64, error) {
 	baseURL, apiKey, model := m.config.GetRerankConfig()
+	apiKey = m.credKey("rerank", apiKey)
 	if baseURL == "" || model == "" {
 		return nil, fmt.Errorf("[llm] 重排端点未配置")
 	}
@@ -909,7 +1025,7 @@ func (m *Module) TestRerankWith(baseURL, apiKey, model string) error {
 	}
 	if apiKey == "" {
 		_, savedKey, _ := m.config.GetRerankConfig()
-		apiKey = savedKey
+		apiKey = m.credKey("rerank", savedKey)
 	}
 	url := strings.TrimRight(baseURL, "/") + "/rerank"
 	reqBody := rerankRequest{Model: model, Query: "测试", Documents: []string{"测试文档一", "测试文档二"}}

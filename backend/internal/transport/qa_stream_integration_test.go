@@ -43,11 +43,11 @@ func (m *mockQAStorage) QASessionsCreate(mode string, fileID int64) (int64, erro
 }
 func (m *mockQAStorage) QASessionsList() ([]*contract.QASession, error) { return nil, nil }
 func (m *mockQAStorage) QASessionsDelete(id int64) error                { return nil }
-func (m *mockQAStorage) QAMessagesAppend(sessionID int64, role, content, sources string, createdAt int64) (int64, error) {
-	return 1, nil
-}
 func (m *mockQAStorage) QAMessagesBySession(sessionID int64) ([]*contract.QAMessage, error) {
 	return nil, nil
+}
+func (m *mockQAStorage) SaveExchange(sessionID int64, mode string, fileID int64, userMsg, assistantMsg, sources string, createdAt int64) (int64, int, error) {
+	return sessionID, 2, nil
 }
 
 type mockQAEvents struct{}

@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"memora/internal/documentpolicy"
 )
 
 // DirEntry 目录中的一个条目（子目录或文件）
@@ -30,12 +32,12 @@ type DirEntry struct {
 func ListDir(workspace, subPath string) ([]*DirEntry, error) {
 	abs := workspace
 	if subPath != "" {
-		// 安全：禁止越出工作区
-		sub := filepath.Clean(subPath)
-		if strings.HasPrefix(sub, "..") || filepath.IsAbs(sub) {
+		// 安全：统一走 documentpolicy.SafeJoin 词法 containment，拒绝 ../ 越界与绝对路径
+		full, err := documentpolicy.SafeJoin(workspace, subPath)
+		if err != nil {
 			return nil, fmt.Errorf("[browser] 非法路径")
 		}
-		abs = filepath.Join(workspace, sub)
+		abs = full
 	}
 
 	info, err := os.Stat(abs)
@@ -54,8 +56,8 @@ func ListDir(workspace, subPath string) ([]*DirEntry, error) {
 	var dirs, files []*DirEntry
 	for _, e := range entries {
 		name := e.Name()
-		// 忽略隐藏目录 / .git / .memora / node_modules 等
-		if strings.HasPrefix(name, ".") || name == "node_modules" {
+		// 忽略隐藏目录 / .git / .memora / node_modules 等（统一 documentpolicy 规则）
+		if documentpolicy.IsIgnoredDir(name) {
 			continue
 		}
 		rel := name
@@ -71,8 +73,8 @@ func ListDir(workspace, subPath string) ([]*DirEntry, error) {
 		if err != nil {
 			continue
 		}
-		docType := detectDocType(name)
-		indexable := docType != "" && docType != "ignored"
+		docType := documentpolicy.DetectDocType(name)
+		indexable := documentpolicy.IsIndexable(name)
 		files = append(files, &DirEntry{
 			Name:      name,
 			RelPath:   rel,
@@ -119,9 +121,10 @@ func SearchByName(workspace, query string, limit int) ([]*SearchResult, int, err
 			return nil
 		}
 		name := info.Name()
-		// 忽略隐藏目录 / .git / .memora / node_modules
+		// 忽略隐藏目录 / .git / .memora / node_modules 等（统一 documentpolicy 规则，
+		// 避免扫到工作区内链接指向的目录内容）
 		if info.IsDir() {
-			if strings.HasPrefix(name, ".") || name == "node_modules" {
+			if documentpolicy.IsIgnoredDir(name) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -132,13 +135,13 @@ func SearchByName(workspace, query string, limit int) ([]*SearchResult, int, err
 			total++
 			// 只保留前 limit 条，避免大目录全量收集内存暴涨（修复 L-1：total 为真实命中数）
 			if len(results) < limit {
-				docType := detectDocType(name)
+				docType := documentpolicy.DetectDocType(name)
 				results = append(results, &SearchResult{
 					RelPath:   relSlash,
 					Size:      info.Size(),
 					Mtime:     info.ModTime().UnixMilli(),
 					DocType:   docType,
-					Indexable: docType != "" && docType != "ignored",
+					Indexable: documentpolicy.IsIndexable(name),
 				})
 			}
 		}
@@ -150,40 +153,17 @@ func SearchByName(workspace, query string, limit int) ([]*SearchResult, int, err
 	return results, total, nil
 }
 
-// detectDocType 复用索引的文档类型判定（支持的主文档类型）
-func detectDocType(name string) string {
-	ext := strings.ToLower(filepath.Ext(name))
-	switch ext {
-	case ".pdf":
-		return "pdf"
-	case ".docx":
-		return "docx"
-	case ".pptx":
-		return "pptx"
-	case ".xlsx":
-		return "xlsx"
-	case ".txt":
-		return "txt"
-	case ".md":
-		return "md"
-	case ".doc":
-		return "ignored"
-	default:
-		return ""
-	}
-}
-
 // OpenFile 基于工作区根与相对路径构造绝对路径，校验文件存在后用系统默认程序打开。
 // 仅支持工作区内文件，防止路径穿越。Windows 使用 rundll32 打开，macOS 用 open，Linux 用 xdg-open。
 func OpenFile(workspace, relPath string) error {
 	if workspace == "" || relPath == "" {
 		return fmt.Errorf("[browser] 工作区或路径为空")
 	}
-	rel := filepath.Clean(filepath.FromSlash(relPath))
-	if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	// 最终路径 containment：跟随 symlink/junction 解析，拒绝越出工作区（含链接指向外部）
+	full, err := documentpolicy.FinalPath(workspace, relPath)
+	if err != nil {
 		return fmt.Errorf("[browser] 非法相对路径")
 	}
-	full := filepath.Join(workspace, rel)
 	info, err := os.Stat(full)
 	if err != nil || info.IsDir() {
 		return fmt.Errorf("[browser] 文件不存在")

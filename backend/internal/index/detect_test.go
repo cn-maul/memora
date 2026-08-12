@@ -1,6 +1,10 @@
 package index
 
-import "testing"
+import (
+	"testing"
+
+	"memora/internal/documentpolicy"
+)
 
 func TestDetectDocTypePPTXLSX(t *testing.T) {
 	cases := []struct {
@@ -20,8 +24,8 @@ func TestDetectDocTypePPTXLSX(t *testing.T) {
 		{"dir/b.pptx", "pptx"},
 	}
 	for _, c := range cases {
-		if got := detectDocType(c.path); got != c.want {
-			t.Errorf("detectDocType(%q) = %q, want %q", c.path, got, c.want)
+		if got := documentpolicy.DetectDocType(c.path); got != c.want {
+			t.Errorf("DetectDocType(%q) = %q, want %q", c.path, got, c.want)
 		}
 	}
 }
