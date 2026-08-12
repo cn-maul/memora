@@ -1,4 +1,11 @@
 import axios from 'axios'
+import {
+  AppError,
+  ERROR_CODES,
+  isAppError,
+  unwrapData,
+  type ErrorCode,
+} from '@/utils/errors'
 import type {
   ApiResponse,
   WorkspaceInfo,
@@ -32,7 +39,7 @@ export function translateApiError(msg: string): string {
   const s = String(msg)
   const low = s.toLowerCase()
 
-  if (/network error|timeout|etimedout|econnreset|econnrefused|无法连接/.test(low)) {
+  if (/network error|timeout|etimedout|econnreset|econnrefused|failed to fetch|无法连接/.test(low)) {
     return '无法连接服务，请检查网络或稍后重试'
   }
   if (s.includes('聊天端点未配置')) return 'AI 助手还未连接，请到「设置 → AI 助手」里连接'
@@ -47,14 +54,95 @@ export function translateApiError(msg: string): string {
   return s
 }
 
+// ──────────────────────── 统一错误（P1-13） ────────────────────────
+// 所有失败都以 AppError 形式抛出（带稳定 code + 用户可读 message + requestId）。
+// 原始 body/Blob 内容绝不作为 message 直接回吐（避免 SQL/Go 文本泄漏）。
+
+// 把未知响应体规整为 record（兼容 responseType:'text' 时 axios 返回的 JSON 字符串）。
+function toRecord(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw === 'string') {
+    const t = raw.trim()
+    if (t.startsWith('{') || t.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(t)
+        return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : null
+      } catch {
+        return null
+      }
+    }
+    return null
+  }
+  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>
+  }
+  return null
+}
+
+// 后端原始 code → 前端稳定 ErrorCode；未知 code 一律 internal（不向用户暴露）。
+function normalizeCode(code: string): ErrorCode {
+  const values = Object.values(ERROR_CODES) as string[]
+  return values.includes(code) ? (code as ErrorCode) : ERROR_CODES.internal
+}
+
+// 从响应头 + 响应体两处读取 requestId（体优先，头兜底）。
+function readRequestId(res?: { headers?: unknown; data?: unknown }): string | undefined {
+  const headers = res?.headers as Record<string, unknown> | undefined
+  if (headers) {
+    const v = headers['x-request-id'] ?? headers['X-Request-ID']
+    if (typeof v === 'string' && v) return v
+  }
+  const body = toRecord(res?.data)
+  if (body && typeof body.requestId === 'string' && body.requestId) return body.requestId
+  return undefined
+}
+
+// 信封形错误体（HTTP 非 2xx）→ AppError。非信封（网络/超时）走 fallbackMsg。
+function appErrorFromBody(raw: unknown, opts: { status?: number; headerReqId?: string; fallbackMsg: string }): AppError {
+  const body = toRecord(raw)
+  let requestId = opts.headerReqId
+  if (body && typeof body.requestId === 'string' && body.requestId) requestId = body.requestId
+  if (body && typeof body.code === 'string') {
+    const msg = typeof body.message === 'string' && body.message ? body.message : opts.fallbackMsg
+    return new AppError(msg, normalizeCode(body.code), {
+      status: opts.status,
+      requestId,
+      detail: body.data,
+    })
+  }
+  return new AppError(opts.fallbackMsg, ERROR_CODES.internal, { status: opts.status, requestId })
+}
+
+function toAppError(err: unknown): AppError {
+  const ae = err as { response?: { status?: number; headers?: unknown; data?: unknown }; message?: string; code?: string }
+  const status = ae.response?.status
+  const requestId = readRequestId(ae.response)
+
+  // 客户端主动取消（AbortController）
+  if (ae?.code === 'ERR_CANCELED') {
+    return new AppError('请求已取消', ERROR_CODES.canceled, { status, requestId })
+  }
+
+  // Blob 响应（下载端点）：不读取 blob 文本，抛出通用文案
+  if (ae.response?.data instanceof Blob) {
+    return new AppError('下载失败', ERROR_CODES.internal, { status, requestId })
+  }
+
+  // 有响应体：走信封解析（含 responseType:'text' 时的 JSON 字符串）
+  if (ae.response) {
+    return appErrorFromBody(ae.response.data, { status, headerReqId: requestId, fallbackMsg: translateApiError(ae?.message || '网络错误') })
+  }
+
+  // 无响应体（网络/超时）：保留小白友好翻译
+  return new AppError(translateApiError(ae?.message || '网络错误'), ERROR_CODES.internal, { requestId })
+}
+
 http.interceptors.response.use(
   (res) => res,
   (err) => {
-    const msg = err.response?.data?.message || err.message || '网络错误'
-    const e = new Error(translateApiError(msg))
-    // 保留原始错误供排查（界面只显示通俗文案）
-    ;(e as any).rawMsg = msg
-    return Promise.reject(e)
+    if (isAppError(err)) return Promise.reject(err)
+    return Promise.reject(toAppError(err))
   },
 )
 
@@ -62,7 +150,7 @@ http.interceptors.response.use(
 
 export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
   const { data } = await http.get<ApiResponse<WorkspaceInfo>>('/workspace/info')
-  return data.data!
+  return unwrapData<WorkspaceInfo>(data)
 }
 
 export async function initWorkspace(req: InitRequest): Promise<void> {
@@ -79,7 +167,7 @@ export async function listFiles(params: {
   sort?: string
 }): Promise<PaginatedData<FileItem>> {
   const { data } = await http.get<ApiResponse<PaginatedData<FileItem>>>('/files', { params })
-  return data.data!
+  return unwrapData<PaginatedData<FileItem>>(data)
 }
 
 export async function getRecentFiles(params?: {
@@ -87,17 +175,17 @@ export async function getRecentFiles(params?: {
   limit?: number
 }): Promise<{ items: FileItem[]; window: number }> {
   const { data } = await http.get<ApiResponse<{ items: FileItem[]; window: number }>>('/files/recent', { params })
-  return data.data!
+  return unwrapData<{ items: FileItem[]; window: number }>(data)
 }
 
 export async function getFile(id: number): Promise<FileItem> {
   const { data } = await http.get<ApiResponse<FileItem>>(`/files/${id}`)
-  return data.data!
+  return unwrapData<FileItem>(data)
 }
 
 export async function getFileHistory(id: number): Promise<{ commits: any[] }> {
   const { data } = await http.get<ApiResponse<{ commits: any[] }>>(`/files/${id}/history`)
-  return data.data!
+  return unwrapData<{ commits: any[] }>(data)
 }
 
 export async function downloadHistoryVersion(relPath: string, hash: string): Promise<Blob> {
@@ -110,7 +198,7 @@ export async function downloadHistoryVersion(relPath: string, hash: string): Pro
 
 export async function resolveFileId(relPath: string): Promise<number> {
   const { data } = await http.get<ApiResponse<{ fileId: number }>>('/files/resolve', { params: { relPath } })
-  return data.data!.fileId
+  return unwrapData<{ fileId: number }>(data).fileId
 }
 
 // 恢复文件到指定历史版本（后端会先自动保存当前状态，小白可一键找回）
@@ -143,7 +231,7 @@ export async function searchFiles(params: {
   page?: number
 }): Promise<{ items: SearchResult[]; total: number; page: number }> {
   const { data } = await http.get<ApiResponse<{ items: SearchResult[]; total: number; page: number }>>('/search', { params })
-  return data.data!
+  return unwrapData<{ items: SearchResult[]; total: number; page: number }>(data)
 }
 
 export async function reindexAll(): Promise<void> {
@@ -158,12 +246,12 @@ export async function retryFile(id: number): Promise<void> {
 
 export async function browseDir(path?: string): Promise<BrowseDirResponse> {
   const { data } = await http.get<ApiResponse<BrowseDirResponse>>('/browse', { params: path ? { path } : {} })
-  return data.data!
+  return unwrapData<BrowseDirResponse>(data)
 }
 
 export async function browseSearch(q: string, limit?: number): Promise<BrowseSearchResponse> {
   const { data } = await http.get<ApiResponse<BrowseSearchResponse>>('/browse/search', { params: { q, limit } })
-  return data.data!
+  return unwrapData<BrowseSearchResponse>(data)
 }
 
 export async function browseOpen(relPath: string): Promise<void> {
@@ -174,19 +262,19 @@ export async function browsePickDir(initial?: string): Promise<BrowsePickDirResp
   // 原生目录选择对话框：请求会一直挂到用户在对话框里选完/取消才返回（含用户思考时间）。
   // 后端已常驻 PowerShell 预加载，首次点击也秒开；此处只需给足用户选择时间即可。
   const { data } = await http.post<ApiResponse<BrowsePickDirResponse>>('/browse/pickdir', { initial }, { timeout: 180000 })
-  return data.data!
+  return unwrapData<BrowsePickDirResponse>(data)
 }
 
 // ──────── 标签 ────────
 
 export async function listTags(): Promise<TagInfo[]> {
   const { data } = await http.get<ApiResponse<{ tags: TagInfo[] }>>('/tags')
-  return data.data!.tags
+  return unwrapData<{ tags: TagInfo[] }>(data).tags
 }
 
 export async function listTagSuggestions(): Promise<TagSuggestion[]> {
   const { data } = await http.get<ApiResponse<{ suggestions: TagSuggestion[] }>>('/tag-suggestions')
-  return data.data!.suggestions
+  return unwrapData<{ suggestions: TagSuggestion[] }>(data).suggestions
 }
 
 export async function acceptSuggestion(id: number): Promise<void> {
@@ -206,19 +294,19 @@ export async function getTimeline(params: {
   to?: number
 }): Promise<TimelineNode[]> {
   const { data } = await http.get<ApiResponse<{ nodes: TimelineNode[] }>>('/timeline', { params })
-  return data.data!.nodes
+  return unwrapData<{ nodes: TimelineNode[] }>(data).nodes
 }
 
 // ──────── 问答 ────────
 
 export async function listQASessions(): Promise<QASession[]> {
   const { data } = await http.get<ApiResponse<{ sessions: QASession[] }>>('/qa/sessions')
-  return data.data!.sessions
+  return unwrapData<{ sessions: QASession[] }>(data).sessions
 }
 
 export async function getQAMessages(sessionId: number): Promise<QAMessage[]> {
   const { data } = await http.get<ApiResponse<{ messages: QAMessage[] }>>(`/qa/sessions/${sessionId}/messages`)
-  return data.data!.messages
+  return unwrapData<{ messages: QAMessage[] }>(data).messages
 }
 
 export async function askQuestionStream(
@@ -236,8 +324,19 @@ export async function askQuestionStream(
       signal,
     })
     if (!res.ok) {
-      const errBody = await res.text()
-      onError(`请求失败: ${res.status} ${errBody}`)
+      // 非 2xx：正文为统一信封（含稳定 code / message / requestId），解析为 AppError 再取值
+      let raw: unknown = null
+      try {
+        raw = await res.json()
+      } catch {
+        // 非 JSON 正文（旧后端/网关），忽略，走通用文案
+      }
+      const appErr = appErrorFromBody(raw, {
+        status: res.status,
+        headerReqId: res.headers.get('x-request-id') || undefined,
+        fallbackMsg: translateApiError(`请求失败（${res.status}）`),
+      })
+      onError(appErr.requestId ? `${appErr.message}（错误编号 ${appErr.requestId}）` : appErr.message)
       return
     }
     const reader = res.body?.getReader()
@@ -307,10 +406,12 @@ export async function askQuestionStream(
       }
     }
   } catch (e: any) {
-    if (e.name === 'AbortError') {
+    if (e.name === 'AbortError' || e?.code === 'ERR_CANCELED') {
       onError('已取消')
+    } else if (isAppError(e)) {
+      onError(e.requestId ? `${e.message}（错误编号 ${e.requestId}）` : e.message)
     } else {
-      onError(e.message || '网络错误')
+      onError(translateApiError(e?.message || '网络错误'))
     }
   }
 }
@@ -327,7 +428,7 @@ export async function getStats(params?: {
   to?: number
 }): Promise<{ enabled: boolean; metrics?: StatsMetrics }> {
   const { data } = await http.get<ApiResponse<{ enabled: boolean; metrics?: StatsMetrics }>>('/stats', { params })
-  return data.data!
+  return unwrapData<{ enabled: boolean; metrics?: StatsMetrics }>(data)
 }
 
 export async function exportStats(format: string, params?: {
@@ -344,8 +445,9 @@ export async function exportStats(format: string, params?: {
 
 export async function autoCommit(): Promise<{ hash: string | null; message?: string; ai?: string }> {
   const { data } = await http.post<ApiResponse<{ skipped?: boolean; hash?: string; message?: string; ai?: string }>>('/commits/auto')
-  if (data.data?.skipped) return { hash: null }
-  return { hash: data.data!.hash ?? null, message: data.data?.message, ai: data.data?.ai }
+  const d = unwrapData<{ skipped?: boolean; hash?: string; message?: string; ai?: string }>(data)
+  if (d?.skipped) return { hash: null }
+  return { hash: d?.hash ?? null, message: d?.message, ai: d?.ai }
 }
 
 export interface CommitFileStatus {
@@ -358,45 +460,45 @@ export async function getCommitStatus(): Promise<{
   count: number
 }> {
   const { data } = await http.get<ApiResponse<{ files: CommitFileStatus[]; count: number }>>('/commits/status')
-  return data.data!
+  return unwrapData<{ files: CommitFileStatus[]; count: number }>(data)
 }
 
 export async function suggestCommitMessage(): Promise<string> {
   const { data } = await http.post<ApiResponse<{ suggestion: string }>>('/commits/suggest')
-  return data.data!.suggestion
+  return unwrapData<{ suggestion: string }>(data).suggestion
 }
 
 export async function manualCommit(message: string): Promise<string> {
   const { data } = await http.post<ApiResponse<{ hash: string; skipped?: boolean }>>('/commits/manual', { message })
-  return data.data!.hash
+  return unwrapData<{ hash: string; skipped?: boolean }>(data).hash
 }
 
 export async function getCommitList(withFiles?: boolean): Promise<CommitItem[]> {
   const { data } = await http.get<ApiResponse<{ commits: CommitItem[] }>>('/commits/list', { params: withFiles ? { withFiles: 'true' } : undefined })
-  return data.data!.commits || []
+  return unwrapData<{ commits: CommitItem[] }>(data)?.commits || []
 }
 
 export async function getCommitFiles(commitHash: string): Promise<VersionFile[]> {
   const { data } = await http.get<ApiResponse<{ files: VersionFile[] }>>(`/commits/${commitHash}/files`)
-  return data.data?.files || []
+  return unwrapData<{ files: VersionFile[] }>(data)?.files || []
 }
 
 // getCommitDiff 获取单个提交的改动文件列表（新增/修改/删除），供版本记录页展开时按需获取。
 export async function getCommitDiff(commitHash: string): Promise<CommitFile[]> {
   const { data } = await http.get<ApiResponse<{ files: CommitFile[] }>>(`/commits/${commitHash}/diff`)
-  return data.data?.files || []
+  return unwrapData<{ files: CommitFile[] }>(data)?.files || []
 }
 
 // ──────── 设置 ────────
 
 export async function getSettings(): Promise<Record<string, any>> {
   const { data } = await http.get<ApiResponse<Record<string, any>>>('/settings')
-  return data.data!
+  return unwrapData<Record<string, any>>(data)
 }
 
 export async function updateSettings(settings: Record<string, any>): Promise<{ restartRequired: string[]; reindexRequired: boolean }> {
   const { data } = await http.put<ApiResponse<{ restartRequired: string[]; reindexRequired: boolean }>>('/settings', settings)
-  return data.data ?? { restartRequired: [], reindexRequired: false }
+  return unwrapData<{ restartRequired: string[]; reindexRequired: boolean }>(data) ?? { restartRequired: [], reindexRequired: false }
 }
 
 export async function updateSecrets(llmApiKey?: string, embedApiKey?: string, rerankApiKey?: string): Promise<void> {
@@ -407,7 +509,7 @@ export async function updateSecrets(llmApiKey?: string, embedApiKey?: string, re
 
 export async function testMarkitdown(pythonPath: string, command: string): Promise<ProbeResult> {
   const { data } = await http.post<ApiResponse<ProbeResult>>('/test/markitdown', { pythonPath, command })
-  return data.data!
+  return unwrapData<ProbeResult>(data)
 }
 
 export interface LLMTestParams {
@@ -420,7 +522,7 @@ export interface LLMTestParams {
 
 export async function testLLM(params: LLMTestParams): Promise<ProbeResult> {
   const { data } = await http.post<ApiResponse<ProbeResult>>('/test/llm', params)
-  return data.data!
+  return unwrapData<ProbeResult>(data)
 }
 
 // 获取端点支持的模型列表（「获取模型」按钮）；kind 区分 chat/embed/rerank，后端回退对应已保存密钥
@@ -431,8 +533,12 @@ export async function fetchModels(params: { kind: 'chat' | 'embed' | 'rerank'; b
     baseUrl: params.baseUrl,
     apiKey: params.apiKey,
   })
-  if (!data.data?.ok) throw new Error(data.data?.message || '获取模型失败')
-  return data.data.models || []
+  const d = unwrapData<{ ok: boolean; models?: string[]; message?: string }>(data)
+  if (!d?.ok) {
+    // 业务失败（200 响应）：以 AppError 抛出，携带 requestId 供界面定位
+    throw new AppError(d?.message || '获取模型失败', ERROR_CODES.llmError, { requestId: data.requestId })
+  }
+  return d?.models || []
 }
 
 export interface PythonDetectResult {
@@ -445,7 +551,7 @@ export interface PythonDetectResult {
 
 export async function detectPython(): Promise<PythonDetectResult> {
   const { data } = await http.get<ApiResponse<{ results: PythonDetectResult[] }>>('/python/detect')
-  const results = data.data?.results || []
+  const results = unwrapData<{ results: PythonDetectResult[] }>(data)?.results || []
   const found = results.find((r) => r.ok) || results[0] || { path: '', ok: false, error: '未检测到 Python' }
   return found
 }
@@ -461,7 +567,7 @@ export interface QueueStatus {
 
 export async function getQueueStatus(): Promise<QueueStatus> {
   const { data } = await http.get<ApiResponse<QueueStatus>>('/queue/status')
-  return data.data!
+  return unwrapData<QueueStatus>(data)
 }
 
 export async function pauseQueue(): Promise<void> {

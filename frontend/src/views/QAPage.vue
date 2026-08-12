@@ -301,7 +301,8 @@ function stripDangerousHtml(html: string): string {
         </button>
       </div>
       <div class="qa-sessions__list">
-        <div v-if="qa.sessions.length === 0" class="empty-state qa-sessions__empty">暂无会话</div>
+        <div v-if="qa.sessionsError" class="empty-state qa-sessions__empty qa-sessions__empty--error">{{ qa.sessionsError }}</div>
+        <div v-else-if="qa.sessions.length === 0" class="empty-state qa-sessions__empty">暂无会话</div>
         <div
           v-for="s in qa.sessions"
           :key="s.id"
@@ -376,15 +377,17 @@ function stripDangerousHtml(html: string): string {
           <option value="">-- 请选择文件 --</option>
           <option v-for="f in files.items" :key="f.id" :value="f.id">{{ f.relPath }}</option>
         </select>
-        <span v-if="files.loading" class="file-picker__hint">加载中…</span>
+        <span v-if="files.error" class="file-picker__hint file-picker__hint--error">{{ files.error }}</span>
+        <span v-else-if="files.loading" class="file-picker__hint">加载中…</span>
         <span v-else-if="files.items.length === 0" class="file-picker__hint">暂无可问答文件（请先索引文档）</span>
       </div>
 
       <div v-if="qaError" class="alert alert--error qa-error">{{ qaError }}</div>
+      <div v-if="qa.error" class="alert alert--error qa-error">{{ qa.error }}</div>
 
       <!-- 消息列表 -->
       <div ref="listRef" class="message-list">
-        <div v-if="qa.messages.length === 0" class="qa-welcome">
+        <div v-if="qa.messages.length === 0 && !qa.error" class="qa-welcome">
           <div class="qa-welcome__logo">
             <Icon name="memory" :size="30" />
           </div>
@@ -522,6 +525,10 @@ function stripDangerousHtml(html: string): string {
   padding: 24px 10px;
 }
 
+.qa-sessions__empty--error {
+  color: var(--c-danger);
+}
+
 .session-item {
   display: flex;
   align-items: center;
@@ -644,6 +651,11 @@ function stripDangerousHtml(html: string): string {
   color: var(--c-text-tertiary);
   flex-shrink: 0;
   white-space: nowrap;
+}
+
+.file-picker__hint--error {
+  color: var(--c-danger);
+  white-space: normal;
 }
 
 .qa-error {

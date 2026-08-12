@@ -15,6 +15,8 @@ export const useQAStore = defineStore('qa', () => {
   const messages = ref<QAMessage[]>([])
   const sending = ref(false)
   const abortCtrl = ref<AbortController | null>(null)
+  const sessionsError = ref('') // 会话列表加载失败（修复：不静默伪装成"暂无会话"）
+  const error = ref('') // 会话消息加载失败（修复：不静默伪装成空对话）
 
   // 上次活跃会话 ID 持久化（localStorage），重启后自动恢复（需求：再次打开加载上一次对话）
   const LAST_SESSION_KEY = 'memora.lastSessionId'
@@ -22,8 +24,9 @@ export const useQAStore = defineStore('qa', () => {
   async function fetchSessions() {
     try {
       sessions.value = (await listQASessions()) ?? []
-    } catch {
-      sessions.value = []
+      sessionsError.value = ''
+    } catch (e: any) {
+      sessionsError.value = e?.message || '加载会话列表失败'
     }
   }
 
@@ -36,8 +39,10 @@ export const useQAStore = defineStore('qa', () => {
     }
     try {
       messages.value = (await getQAMessages(id)) ?? []
-    } catch {
+      error.value = ''
+    } catch (e: any) {
       messages.value = []
+      error.value = e?.message || '加载对话消息失败'
     }
   }
 
@@ -113,6 +118,7 @@ export const useQAStore = defineStore('qa', () => {
 
   async function send(params: { question: string; mode: string; fileId?: number; sessionId?: number }) {
     sending.value = true
+    error.value = '' // 新一次提问清空历史加载错误，避免旧错误残留
     // 立即插入用户消息，显示本人气泡
     const userMsg: QAMessage = {
       id: -Date.now(),
@@ -232,6 +238,8 @@ export const useQAStore = defineStore('qa', () => {
     currentSessionId,
     messages,
     sending,
+    sessionsError,
+    error,
     fetchSessions,
     selectSession,
     restoreLastSession,

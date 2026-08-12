@@ -22,6 +22,7 @@ const searchResults = ref<SearchResult[]>([])
 const searchTotal = ref(0)
 const searching = ref(false)
 const hasSearched = ref(false)
+const searchError = ref('') // 搜索失败提示（修复：失败不再误报"没有找到"）
 
 // 状态/标签筛选（与后端 FilesList 状态机一致：pending/extracting/embedding/indexed/failed/ignored）
 const statusOptions = [
@@ -94,13 +95,14 @@ async function doSearch() {
   if (!q) return
   searching.value = true
   fileError.value = ''
+  searchError.value = ''
   hasSearched.value = true
   try {
     const res = await searchFiles({ q, tag: files.tagFilter || undefined })
     searchResults.value = res.items
     searchTotal.value = res.total
   } catch (e: any) {
-    fileError.value = e.message || '搜索失败'
+    searchError.value = e.message || '搜索失败'
     searchResults.value = []
     searchTotal.value = 0
   } finally {
@@ -113,6 +115,7 @@ function clearSearch() {
   searchResults.value = []
   searchTotal.value = 0
   hasSearched.value = false
+  searchError.value = ''
 }
 
 // 标签过滤切换
@@ -266,6 +269,7 @@ function scoreLevel(score: number): string {
     <template v-if="ws.initialized">
       <div v-if="fileError" class="alert alert--error">{{ fileError }}</div>
       <div v-if="openError" class="alert alert--error">{{ openError }}</div>
+      <div v-if="tags.error" class="alert alert--error">{{ tags.error }}</div>
 
       <!-- AI 未配置引导 -->
       <div v-if="!ws.info?.embedConfigured" class="ai-hint card">
@@ -345,6 +349,7 @@ function scoreLevel(score: number): string {
       <!-- 语义搜索结果 -->
       <div v-if="hasSearched" class="search-results">
         <div v-if="searching" class="loading">搜索中…</div>
+        <div v-else-if="searchError" class="alert alert--error">{{ searchError }}</div>
         <div v-else-if="searchResults.length === 0" class="empty-state">
           <span class="empty-state__title">没有找到「{{ searchQuery }}」相关的内容</span>
           <span class="empty-state__desc">试试换个说法或更简短的关键词</span>

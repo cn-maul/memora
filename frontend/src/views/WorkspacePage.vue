@@ -36,9 +36,28 @@ const searching = ref(false)
 const showSearch = ref(false)
 const searchError = ref('') // 搜索失败提示（修复：失败不再静默误报"未找到"）
 
+// 下载/预览类请求失败时，错误体可能是 Blob、原始 HTTP 文本或完整 JSON body，
+// 一律映射为友好提示，绝不把原始内容展示给用户（修复：[object Blob]/body 泄漏）
+function safeErrorMsg(e: any, fallback: string): string {
+  const raw = e?.message
+  if (typeof raw !== 'string' || !raw.trim()) return fallback
+  const s = raw.trim()
+  if (/\[object (Blob|File)\]/.test(s) || /request failed with status code/i.test(s)) return fallback
+  if (/^[{[]/.test(s)) return fallback // 完整 JSON body 不直接展示
+  return s
+}
+
+// 文件未索引/不存在（not_found）属预期的"无版本历史"空态；其余失败需明确提示
+function isNotFound(e: any): boolean {
+  if (e?.code === 'not_found') return true
+  const m = String(e?.message || '')
+  return /文件不存在|未索引|not ?found/i.test(m)
+}
+
 // ── 提交版本浏览 ──
 // commitHash 为空 = 查看工作区（最新）；非空 = 查看某提交快照的全部文件
 const commits = ref<CommitItem[]>([])
+const commitError = ref('') // 提交列表加载失败（修复：不静默伪装成空下拉）
 const commitHash = ref('')
 const versionFiles = ref<VersionFile[]>([])
 const versionLoading = ref(false)
@@ -72,10 +91,12 @@ watch(() => route.query.commit, async (val) => {
 // ── 提交版本浏览 ──
 
 async function loadCommits() {
+  commitError.value = ''
   try {
     commits.value = (await getCommitList()) || []
-  } catch {
+  } catch (e: any) {
     commits.value = []
+    commitError.value = e?.message || '加载提交记录失败'
   }
 }
 
@@ -131,7 +152,7 @@ async function openVersionPreview(f: VersionFile) {
   try {
     previewContent.value = await getCommitFileContent(commitHash.value, f.path)
   } catch (e: any) {
-    previewError.value = e.message || '预览失败'
+    previewError.value = safeErrorMsg(e, '预览失败')
   } finally {
     previewLoading.value = false
   }
@@ -156,7 +177,7 @@ async function downloadVersionFile() {
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
   } catch (e: any) {
-    previewError.value = e.message || '下载失败'
+    previewError.value = safeErrorMsg(e, '下载失败，请重试')
   } finally {
     previewDownloading.value = false
   }
@@ -211,9 +232,11 @@ async function loadChildren(node: TreeNode) {
       children: [],
     }))
     node.hasLoaded = true
-  } catch {
+    node.error = ''
+  } catch (e: any) {
+    // 失败不置 hasLoaded：再次展开可重试；只提示错误，不伪装成"空文件夹"
     node.children = []
-    node.empty = true
+    node.error = safeErrorMsg(e, '加载目录失败，请重试')
   } finally {
     node.loading = false
   }
@@ -278,6 +301,7 @@ const detailRestoring = ref<string | null>(null)
 const detailConfirmRestore = ref<{ hash: string; time: number; message: string } | null>(null)
 const detailFileId = ref(0)
 const detailError = ref('')
+const detailHistoryError = ref('') // 版本历史加载失败（非 not_found 时展示，修复：失败伪装"暂无版本"）
 const detailNotice = ref('')
 
 async function openFile(relPath: string) {
@@ -296,6 +320,7 @@ async function openDetailModal(e: BrowseEntry) {
   detailEntry.value = e
   detailVersions.value = []
   detailError.value = ''
+  detailHistoryError.value = ''
   detailNotice.value = ''
   detailConfirmRestore.value = null
   detailLoadingHistory.value = true
@@ -306,8 +331,15 @@ async function openDetailModal(e: BrowseEntry) {
     detailVersions.value = history.commits
       .map((c: any) => ({ hash: c.hash, time: c.time, message: c.message, author: c.author }))
       .slice(0, 30)
-  } catch {
-    // 文件未索引则无版本历史，静默
+  } catch (err: any) {
+    if (isNotFound(err)) {
+      // 文件未索引则无版本历史，属预期空态
+      detailVersions.value = []
+    } else {
+      // 其它失败（网络/服务异常）明确提示，不伪装成"暂无版本"
+      detailVersions.value = []
+      detailHistoryError.value = err?.message || '加载版本历史失败'
+    }
   } finally {
     detailLoadingHistory.value = false
   }
@@ -354,7 +386,7 @@ async function downloadVersion(version: { hash: string; time: number }) {
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
   } catch (e: any) {
-    detailError.value = e.message || '下载失败'
+    detailError.value = safeErrorMsg(e, '下载失败，请重试')
   } finally {
     detailDownloading.value = null
   }
@@ -426,6 +458,7 @@ function docIcon(e: BrowseEntry) {
     </div>
 
     <template v-if="ws.initialized">
+      <div v-if="commitError" class="alert alert--error">{{ commitError }}</div>
       <!-- 工作区模式（最新）：搜索栏 + 目录树/文件列表浏览 -->
       <template v-if="!inVersionMode">
       <!-- 文件名搜索栏 -->
@@ -518,7 +551,7 @@ function docIcon(e: BrowseEntry) {
           </div>
           <div class="list-scroll">
             <div v-if="listing" class="loading">加载中…</div>
-            <div v-else-if="entries.length === 0" class="empty-state empty-state--icon">
+            <div v-else-if="entries.length === 0 && !browseError" class="empty-state empty-state--icon">
               <span class="empty-state__icon"><Icon name="folder-open" :size="20" /></span>
               <span class="empty-state__title">此目录为空</span>
               <span class="empty-state__desc">将文档放入该目录后会自动加入索引</span>
@@ -635,6 +668,7 @@ function docIcon(e: BrowseEntry) {
             <span class="detail-section__hint">每次自动提交即一个版本</span>
           </div>
           <div v-if="detailLoadingHistory" class="loading">加载历史中…</div>
+          <div v-else-if="detailHistoryError" class="alert alert--error">{{ detailHistoryError }}</div>
           <div v-else-if="detailVersions.length === 0" class="detail-empty">暂无版本历史（该文件未发生过自动提交）</div>
           <div v-else class="version-list">
             <div v-for="(v, i) in detailVersions" :key="v.hash" class="version-item">

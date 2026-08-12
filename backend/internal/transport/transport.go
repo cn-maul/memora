@@ -233,13 +233,38 @@ func RequestIDFrom(r *http.Request) string {
 	return ""
 }
 
+// requestIDProvider 由 requestIDWriter 实现，供 writeJSON 从写侧回填 requestId。
+type requestIDProvider interface {
+	requestID() string
+}
+
+// requestIDWriter 包装 http.ResponseWriter，记录本次请求的 request ID，
+// 使 writeJSON 无需持有请求对象即可把 requestId 注入响应体（避免改动 120 处写点）。
+type requestIDWriter struct {
+	http.ResponseWriter
+	reqID string
+}
+
+func (w *requestIDWriter) requestID() string { return w.reqID }
+
+// Unwrap 供 http.ResponseController 剥开包装找到底层写器（SetWriteDeadline 等）。
+func (w *requestIDWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Flush 透传底层 Flusher：SSE / 流式问答依赖 w.(http.Flusher) 断言。
+func (w *requestIDWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // newRequestID 生成 request ID：base64(时间戳纳秒),无需外部依赖,单调且碰撞概率极低
 func newRequestID() string {
 	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
 }
 
 // withProtection HTTP 安全中间件：链式执行
-//  1. request ID：取客户端传入或生成,回写响应头并存入 context（供 handler/recovery 读取）
+//  1. request ID：取客户端传入或生成,回写响应头并存入 context（供 handler/recovery 读取），
+//     同时用 requestIDWriter 包装 w,使 writeJSON 把 requestId 注入每个响应体
 //  2. recovery：捕获下游（CORS/路由/处理器）panic → 500,不向客户端回吐 panic 细节
 //  3. body 限制：对每个请求套 MaxBytesReader,超限读时触发 MaxBytesError
 //
@@ -251,7 +276,8 @@ func (m *Module) withProtection(next http.Handler) http.Handler {
 		if id == "" {
 			id = newRequestID()
 		}
-		w.Header().Set("X-Request-ID", id)
+		ww := &requestIDWriter{ResponseWriter: w, reqID: id}
+		ww.Header().Set("X-Request-ID", id)
 		ctx := context.WithValue(r.Context(), ctxKeyRequestID, id)
 		r = r.WithContext(ctx)
 
@@ -259,14 +285,14 @@ func (m *Module) withProtection(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				logx.Error("transport", "handler panic", "requestID", id, "path", r.URL.Path, "panic", fmt.Sprintf("%v", rec))
-				writeError(w, "internal", "服务器内部错误", http.StatusInternalServerError)
+				writeError(ww, "internal", "服务器内部错误", http.StatusInternalServerError)
 			}
 		}()
 
 		// 3) body 大小限制
-		r.Body = http.MaxBytesReader(w, r.Body, m.maxBodyBytes)
+		r.Body = http.MaxBytesReader(ww, r.Body, m.maxBodyBytes)
 
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(ww, r)
 	})
 }
 
@@ -288,9 +314,10 @@ type SSEEvent struct {
 
 // Response 统一响应
 type Response struct {
-	Code    string      `json:"code"`
-	Data    interface{} `json:"data,omitempty"`
-	Message string      `json:"message,omitempty"`
+	Code      string      `json:"code"`
+	Data      interface{} `json:"data,omitempty"`
+	Message   string      `json:"message,omitempty"`
+	RequestId string      `json:"requestId,omitempty"`
 }
 
 // New 创建传输模块
@@ -680,6 +707,14 @@ func (m *Module) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 // writeJSON 写入 JSON 响应
 func writeJSON(w http.ResponseWriter, code int, resp *Response) {
+	// 从 withProtection 注入的包装写器读 request ID 回填响应体；
+	// 未包装（测试直连 mux 等）时按需生成，保证请求级可追踪。
+	if p, ok := w.(requestIDProvider); ok && p.requestID() != "" {
+		resp.RequestId = p.requestID()
+	}
+	if resp.RequestId == "" {
+		resp.RequestId = newRequestID()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(resp)
@@ -697,6 +732,35 @@ func writeError(w http.ResponseWriter, code string, message string, httpCode int
 		dataVal = data[0]
 	}
 	writeJSON(w, httpCode, &Response{Code: code, Message: message, Data: dataVal})
+}
+
+// wrapErr 构造契约错误：稳定 code + 面向用户的中文消息（不携带内部错误文本），
+// 原始错误仅作为内部 cause 挂在错误对象上，供日志排查，不序列化。
+func wrapErr(code, message string, err error) *contract.AppError {
+	return contract.NewAppError(code, message, 0).WithCause(err)
+}
+
+// writeContractError 基于契约错误模型（contract）写错误响应：
+//   - 未知错误经 contract.AsAppError 归一为 code=internal / 500 / "内部错误"，
+//     内部 cause 仅保留在错误对象（供日志），不泄露 SQL/Go 细节到响应体；
+//   - *contract.AppError 原样保留其稳定 code / message / status。
+func writeContractError(w http.ResponseWriter, err error) {
+	ae := contract.AsAppError(err)
+	if ae == nil {
+		ae = contract.NewAppError(contract.ErrCodeInternal, "内部错误", http.StatusInternalServerError)
+	}
+	if ae.Status <= 0 {
+		ae.Status = contract.StatusForCode(ae.Code)
+	}
+	// 内部细节只进日志，不序列化到响应
+	inner := err
+	if ae.Err != nil {
+		inner = ae.Err
+	}
+	if inner != nil {
+		logx.Warn("transport", "请求失败", "code", ae.Code, "op", ae.Op, "err", inner.Error())
+	}
+	writeJSON(w, ae.Status, &Response{Code: ae.Code, Message: ae.Message})
 }
 
 // readBody 读取请求体
@@ -721,7 +785,7 @@ func (m *Module) decodeStrictBody(w http.ResponseWriter, r *http.Request, v inte
 		if errors.As(err, &maxErr) {
 			writeError(w, "request_too_large", "请求体过大", http.StatusRequestEntityTooLarge)
 		} else {
-			writeError(w, "bad_request", "请求体不合法: "+err.Error(), http.StatusBadRequest)
+			writeContractError(w, wrapErr(contract.ErrCodeBadRequest, "请求体不合法", err))
 		}
 		return false
 	}
@@ -816,47 +880,47 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 		}
 		ok, msg := m.handler.Extract.Probe(probePython, probeCmd)
 		if !ok {
-			writeError(w, "bad_request", "MarkItDown 探测失败: "+msg, http.StatusBadRequest)
+			writeContractError(w, wrapErr(contract.ErrCodeBadRequest, "MarkItDown 探测失败", errors.New(msg)))
 			return
 		}
 	}
 	// 2) 嵌入端点测试（若本次提供了嵌入配置）
 	if req.Embed.BaseURL != "" || req.Embed.Model != "" {
 		if err := m.handler.LLM.TestEmbedWith(req.Embed.BaseURL, req.Embed.APIKey, req.Embed.Model); err != nil {
-			writeError(w, "bad_request", "嵌入端点测试失败: "+err.Error(), http.StatusBadRequest)
+			writeContractError(w, wrapErr(contract.ErrCodeBadRequest, "嵌入端点测试失败", err))
 			return
 		}
 	}
 	// 3) 聊天端点测试（若本次提供了 LLM 配置）
 	if req.LLM != nil && (req.LLM.BaseURL != "" || req.LLM.Model != "") {
 		if err := m.handler.LLM.TestChatWith(req.LLM.BaseURL, req.LLM.APIKey, req.LLM.Model, req.LLM.Temperature); err != nil {
-			writeError(w, "bad_request", "聊天端点测试失败: "+err.Error(), http.StatusBadRequest)
+			writeContractError(w, wrapErr(contract.ErrCodeBadRequest, "聊天端点测试失败", err))
 			return
 		}
 	}
 
 	// 1. 保存工作区路径（错误须检查,M-02）
 	if err := m.handler.Config.Set("workspace.path", req.WorkspacePath); err != nil {
-		writeError(w, "internal", fmt.Sprintf("保存工作区路径失败: %v", err), http.StatusInternalServerError)
+		writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存工作区路径失败", err))
 		return
 	}
 
 	// 1.5 将 config.json 迁移到工作区 .memora/（D13）
 	if err := m.handler.Config.Relocate(req.WorkspacePath); err != nil {
-		writeError(w, "internal", fmt.Sprintf("迁移配置文件失败: %v", err), http.StatusInternalServerError)
+		writeContractError(w, wrapErr(contract.ErrCodeInternal, "迁移配置文件失败", err))
 		return
 	}
 
 	// 2. 保存 markitdown 配置（错误须检查,M-02）
 	if req.Markitdown.PythonPath != "" {
 		if err := m.handler.Config.Set("markitdown.pythonPath", req.Markitdown.PythonPath); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 pythonPath 失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 pythonPath 失败", err))
 			return
 		}
 	}
 	if req.Markitdown.Command != "" {
 		if err := m.handler.Config.Set("markitdown.command", req.Markitdown.Command); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 command 失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 command 失败", err))
 			return
 		}
 	}
@@ -865,19 +929,19 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 	if req.LLM != nil {
 		if req.LLM.BaseURL != "" {
 			if err := m.handler.Config.Set("llm.baseUrl", req.LLM.BaseURL); err != nil {
-				writeError(w, "internal", fmt.Sprintf("保存 LLM 接口失败: %v", err), http.StatusInternalServerError)
+				writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 LLM 接口失败", err))
 				return
 			}
 		}
 		if req.LLM.APIKey != "" {
 			if err := m.handler.Config.UpsertSecrets(req.LLM.APIKey, "", ""); err != nil {
-				writeError(w, "internal", fmt.Sprintf("保存 LLM 密钥失败: %v", err), http.StatusInternalServerError)
+				writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 LLM 密钥失败", err))
 				return
 			}
 		}
 		if req.LLM.Model != "" {
 			if err := m.handler.Config.Set("llm.model", req.LLM.Model); err != nil {
-				writeError(w, "internal", fmt.Sprintf("保存 LLM 模型失败: %v", err), http.StatusInternalServerError)
+				writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 LLM 模型失败", err))
 				return
 			}
 		}
@@ -885,7 +949,7 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 			// init 请求携带完整 LLM 配置时保存 temperature（含 0,确定性输出）。
 			// 仅当 LLM 有实质配置时才保存,避免用户未配置 LLM 时误覆盖现有值（review warn）
 			if err := m.handler.Config.Set("llm.temperature", req.LLM.Temperature); err != nil {
-				writeError(w, "internal", fmt.Sprintf("保存 LLM 温度失败: %v", err), http.StatusInternalServerError)
+				writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 LLM 温度失败", err))
 				return
 			}
 		}
@@ -894,25 +958,25 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 	// 4. 保存 Embed 配置（错误须检查,M-02）
 	if req.Embed.BaseURL != "" {
 		if err := m.handler.Config.Set("embed.baseUrl", req.Embed.BaseURL); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 Embed 接口失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 Embed 接口失败", err))
 			return
 		}
 	}
 	if req.Embed.APIKey != "" {
 		if err := m.handler.Config.UpsertSecrets("", req.Embed.APIKey, ""); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 Embed 密钥失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 Embed 密钥失败", err))
 			return
 		}
 	}
 	if req.Embed.Model != "" {
 		if err := m.handler.Config.Set("embed.model", req.Embed.Model); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 Embed 模型失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 Embed 模型失败", err))
 			return
 		}
 	}
 	if req.Embed.Dimensions != 0 {
 		if err := m.handler.Config.Set("embed.dimensions", float64(req.Embed.Dimensions)); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 Embed 维度失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 Embed 维度失败", err))
 			return
 		}
 	}
@@ -920,19 +984,19 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 	// 4.5 保存 Rerank 配置（错误须检查）
 	if req.Rerank.BaseURL != "" {
 		if err := m.handler.Config.Set("rerank.baseUrl", req.Rerank.BaseURL); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 Rerank 接口失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 Rerank 接口失败", err))
 			return
 		}
 	}
 	if req.Rerank.APIKey != "" {
 		if err := m.handler.Config.UpsertSecrets("", "", req.Rerank.APIKey); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 Rerank 密钥失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 Rerank 密钥失败", err))
 			return
 		}
 	}
 	if req.Rerank.Model != "" {
 		if err := m.handler.Config.Set("rerank.model", req.Rerank.Model); err != nil {
-			writeError(w, "internal", fmt.Sprintf("保存 Rerank 模型失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "保存 Rerank 模型失败", err))
 			return
 		}
 	}
@@ -942,13 +1006,13 @@ func (m *Module) handleWorkspaceInit(w http.ResponseWriter, r *http.Request) {
 	//    若未注入重建回调,则退化为仅初始化 Git 并触发重建（修复 B-01）。
 	if m.handler.RebuildWorkspace != nil {
 		if err := m.handler.RebuildWorkspace(req.WorkspacePath); err != nil {
-			writeError(w, "internal", fmt.Sprintf("应用工作区失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "应用工作区失败", err))
 			return
 		}
 	} else {
 		// 确保 Git 仓库已初始化
 		if err := m.handler.Git.EnsureRepo(req.WorkspacePath); err != nil {
-			writeError(w, "internal", fmt.Sprintf("Git 初始化失败: %v", err), http.StatusInternalServerError)
+			writeContractError(w, wrapErr(contract.ErrCodeInternal, "Git 初始化失败", err))
 			return
 		}
 		// 触发全量重建索引（经队列合并执行，P0-03）
@@ -1057,7 +1121,7 @@ func (m *Module) handleFiles(w http.ResponseWriter, r *http.Request) {
 
 	files, total, err := m.handler.Storage.FilesList(status, tag, page, pageSize, sortOrder)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1072,7 +1136,7 @@ func (m *Module) handleFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	tagMap, err := m.handler.Storage.FileTagsByFiles(ids)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	items := make([]FileItem, 0, len(files))
@@ -1136,7 +1200,7 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(path, "/text") && r.Method == http.MethodGet {
 		chunks, err := m.handler.Storage.ChunksByFile(id)
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		var text string
@@ -1156,7 +1220,7 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 		}
 		// 使用系统默认程序打开文件（修复 H-06）
 		if err := m.handler.Browser.OpenFile(m.workspacePath(), file.RelPath); err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]bool{"ok": true})
@@ -1172,7 +1236,7 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 		}
 		commits, err := m.handler.Git.FileHistory(file.RelPath)
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]interface{}{
@@ -1194,7 +1258,7 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := m.handler.Tag.ManualOverride(id, req.Add, req.Remove); err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		tags, _ := m.handler.Storage.FileTagsListByFile(id)
@@ -1205,7 +1269,7 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 	// POST /api/files/{id}/retry —— 将 failed 文件重置为 pending 并重新入队
 	if strings.HasSuffix(path, "/retry") && r.Method == http.MethodPost {
 		if err := m.handler.Storage.FilesRetryStatus(id); err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		// 重新入队索引任务
@@ -1237,7 +1301,7 @@ func (m *Module) handleFileByID(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := m.handler.Timeline.Restore(file.RelPath, req.CommitHash); err != nil {
 			// 恢复已无 409 门槛：工作区有改动时后端自动先保存当前状态再恢复
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]interface{}{"ok": true, "modified": []string{file.RelPath}})
@@ -1265,7 +1329,7 @@ func (m *Module) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	results, total, err := m.handler.Search.Query(q, tagFilter, page)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1315,7 +1379,7 @@ func (m *Module) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	sub := getQueryParam(r, "path")
 	entries, err := m.handler.Browser.ListDir(ws, sub)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	// 为可索引的文件补充实际索引状态（indexed/pending/failed 等）,不支持的保持空
@@ -1352,7 +1416,7 @@ func (m *Module) handleBrowseSearch(w http.ResponseWriter, r *http.Request) {
 	limit := getQueryInt(r, "limit", 100)
 	results, total, err := m.handler.Browser.SearchByName(ws, q, limit)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	writeOK(w, map[string]interface{}{
@@ -1386,7 +1450,7 @@ func (m *Module) handleBrowseOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := m.handler.Browser.OpenFile(ws, req.RelPath); err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	writeOK(w, map[string]bool{"ok": true})
@@ -1410,7 +1474,7 @@ func (m *Module) handleBrowsePickDir(w http.ResponseWriter, r *http.Request) {
 	}
 	path, err := m.handler.Browser.PickDirectory(initial)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	writeOK(w, map[string]interface{}{
@@ -1428,7 +1492,7 @@ func (m *Module) handleTags(w http.ResponseWriter, r *http.Request) {
 
 	tags, err := m.handler.Tag.ListLibrary()
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1443,7 +1507,7 @@ func (m *Module) handleTagSuggestions(w http.ResponseWriter, r *http.Request) {
 	if path == "/api/tag-suggestions" && r.Method == http.MethodGet {
 		suggestions, err := m.handler.Storage.SuggestionsListPending()
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]interface{}{"suggestions": suggestions})
@@ -1460,7 +1524,7 @@ func (m *Module) handleTagSuggestions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := m.handler.Tag.AcceptSuggestion(id); err != nil {
-			writeError(w, "not_found", err.Error(), http.StatusNotFound)
+			writeContractError(w, wrapErr(contract.ErrCodeNotFound, "建议不存在或已处理", err))
 			return
 		}
 		writeOK(w, map[string]bool{"ok": true})
@@ -1477,7 +1541,7 @@ func (m *Module) handleTagSuggestions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := m.handler.Tag.RejectSuggestion(id); err != nil {
-			writeError(w, "not_found", err.Error(), http.StatusNotFound)
+			writeContractError(w, wrapErr(contract.ErrCodeNotFound, "建议不存在或已处理", err))
 			return
 		}
 		writeOK(w, map[string]bool{"ok": true})
@@ -1509,7 +1573,7 @@ func (m *Module) handleFileDownloadHistory(w http.ResponseWriter, r *http.Reques
 
 	content, err := m.handler.Git.ShowFileAt(relPath, hash)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1582,7 +1646,7 @@ func (m *Module) handleFilesRecent(w http.ResponseWriter, r *http.Request) {
 
 	files, err := m.handler.Storage.FilesRecent(since, limit)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1641,7 +1705,7 @@ func (m *Module) handleTimeline(w http.ResponseWriter, r *http.Request) {
 
 	nodes, err := m.handler.Timeline.Get(q)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1653,7 +1717,7 @@ func (m *Module) handleQASessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		sessions, err := m.handler.QA.Sessions()
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]interface{}{"sessions": sessions})
@@ -1680,7 +1744,7 @@ func (m *Module) handleQA(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err := m.handler.QA.Ask(&req)
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, resp)
@@ -1792,7 +1856,7 @@ func (m *Module) handleQAByID(w http.ResponseWriter, r *http.Request) {
 		}
 		messages, err := m.handler.Storage.QAMessagesBySession(id)
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]interface{}{"messages": messages})
@@ -1808,7 +1872,7 @@ func (m *Module) handleQAByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := m.handler.QA.DeleteSession(id); err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]bool{"ok": true})
@@ -1845,7 +1909,7 @@ func (m *Module) handleStats(w http.ResponseWriter, r *http.Request) {
 		To:    int64(to),
 	})
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1877,7 +1941,7 @@ func (m *Module) handleStatsExport(w http.ResponseWriter, r *http.Request) {
 
 	content, err := m.handler.Stats.Export(format, &contract.StatsRange{Range: rng})
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1919,7 +1983,7 @@ func (m *Module) handleQueuePause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := m.handler.TaskQueue.Pause(); err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	writeOK(w, map[string]bool{"ok": true})
@@ -1936,7 +2000,7 @@ func (m *Module) handleQueueResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := m.handler.TaskQueue.Resume(); err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	writeOK(w, map[string]bool{"ok": true})
@@ -1956,7 +2020,7 @@ func (m *Module) handleCommitAuto(w http.ResponseWriter, r *http.Request) {
 		// AI 成功,用 AI 备注手动提交
 		hash, err := m.handler.Git.CommitManual(aiMsg)
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]string{"hash": hash, "message": aiMsg, "ai": "true"})
@@ -1966,7 +2030,7 @@ func (m *Module) handleCommitAuto(w http.ResponseWriter, r *http.Request) {
 	// AI 不可用,回退到默认自动提交
 	hash, skipped, err := m.handler.Git.CommitAuto(nil)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -1985,7 +2049,7 @@ func (m *Module) handleCommitHead(w http.ResponseWriter, r *http.Request) {
 	}
 	head, err := m.handler.Git.Head()
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	writeOK(w, head)
@@ -2002,7 +2066,7 @@ func (m *Module) handleCommitList(w http.ResponseWriter, r *http.Request) {
 	withFiles := getQueryParam(r, "withFiles") == "true"
 	commits, err := m.handler.Git.Log()
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 
@@ -2049,7 +2113,7 @@ func (m *Module) handleCommitByHash(w http.ResponseWriter, r *http.Request) {
 		}
 		files, err := m.handler.Git.ListTreeAt(hash)
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]interface{}{"hash": hash, "files": files})
@@ -2067,7 +2131,7 @@ func (m *Module) handleCommitByHash(w http.ResponseWriter, r *http.Request) {
 		}
 		files, err := m.handler.Git.CommitFiles(hash)
 		if err != nil {
-			writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+			writeContractError(w, err)
 			return
 		}
 		writeOK(w, map[string]interface{}{"hash": hash, "files": files})
@@ -2107,7 +2171,7 @@ func (m *Module) handleCommitByHash(w http.ResponseWriter, r *http.Request) {
 		}
 		summary, err := m.handler.Timeline.GenerateSummary(hash)
 		if err != nil {
-			writeError(w, "not_found", err.Error(), http.StatusNotFound)
+			writeContractError(w, wrapErr(contract.ErrCodeNotFound, "该版本无法生成总结", err))
 			return
 		}
 		writeOK(w, map[string]string{"summary": summary})
@@ -2124,7 +2188,7 @@ func (m *Module) handleCommitStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	status, err := m.handler.Git.Status()
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	type fileStatus struct {
@@ -2151,7 +2215,7 @@ func (m *Module) handleCommitManual(w http.ResponseWriter, r *http.Request) {
 		Message string `json:"message"`
 	}
 	if err := readBody(r, &req); err != nil {
-		writeError(w, "bad_request", err.Error(), http.StatusBadRequest)
+		writeContractError(w, wrapErr(contract.ErrCodeBadRequest, "请求体解析失败", err))
 		return
 	}
 	msg := strings.TrimSpace(req.Message)
@@ -2159,7 +2223,7 @@ func (m *Module) handleCommitManual(w http.ResponseWriter, r *http.Request) {
 	// 无变更时返回 skipped,不报错（前端据此提示"无变更"）
 	status, err := m.handler.Git.Status()
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	hasChanges := false
@@ -2199,7 +2263,7 @@ func (m *Module) handleCommitManual(w http.ResponseWriter, r *http.Request) {
 
 	hash, err := m.handler.Git.CommitManual(msg)
 	if err != nil {
-		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+		writeContractError(w, err)
 		return
 	}
 	writeOK(w, map[string]string{"hash": hash, "message": msg})
@@ -2213,7 +2277,7 @@ func (m *Module) handleCommitSuggest(w http.ResponseWriter, r *http.Request) {
 	}
 	suggestion, err := m.handler.Timeline.SuggestCommitMessage()
 	if err != nil {
-		writeError(w, "ai_unavailable", err.Error(), http.StatusUnprocessableEntity)
+		writeContractError(w, contract.NewAppError("ai_unavailable", "AI 服务暂不可用", http.StatusUnprocessableEntity).WithCause(err))
 		return
 	}
 	writeOK(w, map[string]string{"suggestion": suggestion})
@@ -2236,7 +2300,7 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if err := m.handler.Config.UpsertSecrets(req.LLMApiKey, req.EmbedApiKey, req.RerankApiKey); err != nil {
-				writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+				writeContractError(w, err)
 				return
 			}
 			writeOK(w, map[string]bool{"ok": true})
@@ -2285,14 +2349,14 @@ func (m *Module) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if err := m.handler.Config.Set(key, value); err != nil {
-				writeError(w, "bad_request", err.Error(), http.StatusBadRequest)
+				writeContractError(w, wrapErr(contract.ErrCodeBadRequest, "保存配置失败", err))
 				return
 			}
 			// 同步 stats.enabled 到 stats 模块（运行时开关）
 			if key == "stats.enabled" {
 				if b, ok := value.(bool); ok {
 					if err := m.handler.Stats.SetEnabled(b); err != nil {
-						writeError(w, "internal", err.Error(), http.StatusInternalServerError)
+						writeContractError(w, err)
 						return
 					}
 				}

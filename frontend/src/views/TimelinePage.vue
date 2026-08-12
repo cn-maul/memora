@@ -40,15 +40,18 @@ function toggle(hash: string) {
 // 按提交按需获取改动文件明细（缓存，避免重复请求）
 const filesCache = ref<Record<string, CommitFile[]>>({})
 const loadingFiles = ref<Set<string>>(new Set())
+const fileLoadErrors = ref<Record<string, string>>({}) // 明细加载失败（修复：失败不再伪装成"没有文件改动"）
 
 async function loadFilesForHash(hash: string) {
   if (filesCache.value[hash] !== undefined) return
   if (loadingFiles.value.has(hash)) return
   loadingFiles.value.add(hash)
+  fileLoadErrors.value[hash] = ''
   try {
     filesCache.value[hash] = await getCommitDiff(hash)
   } catch {
-    filesCache.value[hash] = []
+    delete filesCache.value[hash] // 移除缓存以便再次展开可重试
+    fileLoadErrors.value[hash] = '加载文件明细失败，请重试'
   } finally {
     loadingFiles.value.delete(hash)
   }
@@ -132,7 +135,7 @@ function statusSign(s: string) {
     <div v-if="loadError" class="alert alert--error">{{ loadError }}</div>
 
     <div v-if="loading" class="loading">加载中…</div>
-    <div v-else-if="commits.length === 0" class="empty-state empty-state--icon">
+    <div v-else-if="commits.length === 0 && !loadError" class="empty-state empty-state--icon">
       <span class="empty-state__icon"><Icon name="git-branch" :size="20" /></span>
       <span class="empty-state__title">还没有版本</span>
       <span class="empty-state__desc">修改任意文件后，系统会自动保存第一个版本；有需要时也可手动保存</span>
@@ -175,7 +178,8 @@ function statusSign(s: string) {
           <div v-if="expanded[c.hash]" class="tl-files">
             <div v-if="loadingFiles.has(c.hash)" class="tl-files-empty">加载文件明细中…</div>
             <template v-else>
-              <div v-if="filesOf(c.hash).length === 0" class="tl-files-empty">该提交没有文件改动</div>
+              <div v-if="fileLoadErrors[c.hash]" class="tl-files-empty tl-files-empty--error">{{ fileLoadErrors[c.hash] }}</div>
+              <div v-else-if="filesOf(c.hash).length === 0" class="tl-files-empty">该提交没有文件改动</div>
               <div v-for="f in filesOf(c.hash)" :key="f.status + f.path" class="tl-file">
               <span class="tl-file-sign" :class="`tf--${f.status}`">{{ statusSign(f.status) }}</span>
               <span class="tl-file-badge" :class="`tf--${f.status}`">{{ statusLabel(f.status) }}</span>
@@ -396,6 +400,10 @@ function statusSign(s: string) {
   padding: 12px 16px;
   font-size: 12.5px;
   color: var(--c-text-tertiary);
+}
+
+.tl-files-empty--error {
+  color: var(--c-danger);
 }
 
 .tl-file {

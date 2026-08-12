@@ -9,6 +9,7 @@ export interface TreeNode {
   isDir?: boolean
   docType?: string
   empty?: boolean // 目录是否完全为空（无子文件夹也无文件）；仅此才显示"空文件夹"
+  error?: string // 目录加载失败提示（修复：失败不再伪装成"空文件夹"）
   expanded: boolean
   loading: boolean
   hasLoaded: boolean
@@ -123,6 +124,9 @@ const emptyIndent = computed(() => `${10 + (props.depth + 1) * 16 + 38}px`)
     <div v-if="node.expanded && node.children.length === 0 && !node.loading && node.empty" class="tree-empty" :style="{ paddingLeft: emptyIndent }">
       空文件夹
     </div>
+    <div v-else-if="node.expanded && node.children.length === 0 && !node.loading && node.error" class="tree-empty tree-empty--error" :style="{ paddingLeft: emptyIndent }">
+      {{ node.error }}
+    </div>
 
     <TreeBranch
       v-for="child in node.children"
@@ -231,5 +235,10 @@ const emptyIndent = computed(() => `${10 + (props.depth + 1) * 16 + 38}px`)
   color: var(--c-text-tertiary);
   font-style: italic;
   padding: 2px 0;
+}
+
+.tree-empty--error {
+  color: var(--c-danger);
+  font-style: normal;
 }
 </style>

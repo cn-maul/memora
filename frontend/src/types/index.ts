@@ -163,11 +163,16 @@ export interface TagCount {
 
 // ──────────────────────── API 响应 ────────────────────────
 
+// 后端统一信封：成功 code="ok"，失败 code 为稳定错误码（详见 src/utils/errors.ts 的 ERROR_CODES）。
 export interface ApiResponse<T = any> {
   code: string
   data?: T
   message?: string
+  requestId?: string
 }
+
+// 与 errors.ts 的统一信封类型对齐（只做类型再导出，避免重复定义）。
+export type { ApiEnvelope, ErrorCode } from '@/utils/errors'
 
 export interface PaginatedData<T> {
   page: number

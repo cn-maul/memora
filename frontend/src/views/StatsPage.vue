@@ -14,6 +14,17 @@ const exporting = ref(false)
 const exportOpen = ref(false)
 const loadError = ref('')
 
+// 导出请求（responseType: blob）失败时，错误体可能是 Blob、原始 HTTP 文本或完整 JSON body，
+// 一律映射为友好提示，绝不把原始内容展示给用户（修复：[object Blob]/body 泄漏）
+function safeErrorMsg(e: any, fallback: string): string {
+  const raw = e?.message
+  if (typeof raw !== 'string' || !raw.trim()) return fallback
+  const s = raw.trim()
+  if (/\[object (Blob|File)\]/.test(s) || /request failed with status code/i.test(s)) return fallback
+  if (/^[{[]/.test(s)) return fallback // 完整 JSON body 不直接展示
+  return s
+}
+
 onMounted(async () => {
   await loadStats()
 })
@@ -48,7 +59,7 @@ async function doExport(format: string) {
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
   } catch (e: any) {
-    loadError.value = e.message || '导出失败'
+    loadError.value = safeErrorMsg(e, '导出失败，请稍后重试')
   } finally {
     exporting.value = false
   }
@@ -94,21 +105,26 @@ const tagDistribution = computed(() => stats.value?.tagDistribution || [])
       </div>
     </div>
 
-    <div v-if="loadError" class="alert alert--error">{{ loadError }}</div>
-
-    <div v-if="!enabled" class="empty-state">
+    <div v-if="!enabled && !loadError" class="empty-state">
       统计已关闭，可在「设置」里开启
       <button class="btn btn-primary btn-sm" style="margin-top: 10px" @click="router.push('/settings')">去设置</button>
     </div>
 
     <div v-else-if="loading" class="loading">加载中…</div>
 
+    <div v-else-if="!stats && loadError" class="empty-state">
+      <span class="empty-state__title">统计加载失败</span>
+      <span class="empty-desc">{{ loadError }}</span>
+      <button class="btn btn-primary btn-sm" style="margin-top: 12px" @click="loadStats">重试</button>
+    </div>
+
     <div v-else-if="!stats" class="empty-state">
-      还没有统计数据
+      <span class="empty-state__title">还没有统计数据</span>
       <span class="empty-desc">修改文件并自动保存版本后，这里会出现你的活跃趋势</span>
     </div>
 
     <div v-else class="stats-content">
+      <div v-if="loadError" class="alert alert--error">{{ loadError }}</div>
       <div class="range-bar segmented">
         <button class="btn" :class="{ 'btn--active': range === 'week' }" @click="range = 'week'; loadStats()">本周</button>
         <button class="btn" :class="{ 'btn--active': range === 'month' }" @click="range = 'month'; loadStats()">本月</button>

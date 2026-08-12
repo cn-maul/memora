@@ -19,6 +19,24 @@ const loadError = ref('')
 const openingPath = ref('')
 const openError = ref('')
 
+// 下载/预览类请求失败时，错误体可能是 Blob、原始 HTTP 文本或完整 JSON body，
+// 一律映射为友好提示，绝不把原始内容展示给用户（修复：[object Blob]/body 泄漏）
+function safeErrorMsg(e: any, fallback: string): string {
+  const raw = e?.message
+  if (typeof raw !== 'string' || !raw.trim()) return fallback
+  const s = raw.trim()
+  if (/\[object (Blob|File)\]/.test(s) || /request failed with status code/i.test(s)) return fallback
+  if (/^[{[]/.test(s)) return fallback // 完整 JSON body 不直接展示
+  return s
+}
+
+// 文件未索引/不存在（not_found）属预期的"无版本历史"空态；其余失败需明确提示
+function isNotFound(e: any): boolean {
+  if (e?.code === 'not_found') return true
+  const m = String(e?.message || '')
+  return /文件不存在|未索引|not ?found/i.test(m)
+}
+
 // ── 统一搜索（S3：一个框同时搜文件名 + 文档内容）──
 const searchQuery = ref('')
 const searching = ref(false)
@@ -238,6 +256,7 @@ const detailRestoring = ref<string | null>(null)
 const detailConfirmRestore = ref<{ hash: string; time: number; message: string } | null>(null)
 const detailFileId = ref(0)
 const detailError = ref('')
+const detailHistoryError = ref('') // 版本历史加载失败（非 not_found 时展示，修复：失败伪装"暂无版本"）
 const detailNotice = ref('')
 
 function baseName(p: string) {
@@ -249,6 +268,7 @@ async function openDetailModal(f: FileItem) {
   detailEntry.value = f
   detailVersions.value = []
   detailError.value = ''
+  detailHistoryError.value = ''
   detailNotice.value = ''
   detailConfirmRestore.value = null
   detailLoadingHistory.value = true
@@ -259,8 +279,15 @@ async function openDetailModal(f: FileItem) {
     detailVersions.value = history.commits
       .map((c: any) => ({ hash: c.hash, time: c.time, message: c.message, author: c.author }))
       .slice(0, 30)
-  } catch {
-    // 文件未索引则无版本历史，静默
+  } catch (err: any) {
+    if (isNotFound(err)) {
+      // 文件未索引则无版本历史，属预期空态
+      detailVersions.value = []
+    } else {
+      // 其它失败（网络/服务异常）明确提示，不伪装成"暂无版本"
+      detailVersions.value = []
+      detailHistoryError.value = err?.message || '加载版本历史失败'
+    }
   } finally {
     detailLoadingHistory.value = false
   }
@@ -308,7 +335,7 @@ async function downloadVersion(version: { hash: string; time: number }) {
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
   } catch (e: any) {
-    detailError.value = e.message || '下载失败'
+    detailError.value = safeErrorMsg(e, '下载失败，请重试')
   } finally {
     detailDownloading.value = null
   }
@@ -445,7 +472,7 @@ function formatTime(ms?: number) {
       <template v-else>
       <div v-if="highlightRel ? highlightLoading : loading" class="loading">加载中…</div>
       <div v-else-if="highlightRel && highlightError" class="alert alert--error">{{ highlightError }}</div>
-      <div v-else-if="displayItems.length === 0" class="empty-state empty-state--icon">
+      <div v-else-if="displayItems.length === 0 && !loadError" class="empty-state empty-state--icon">
         <span class="empty-state__icon"><Icon name="clock" :size="20" /></span>
         <span class="empty-state__title">{{ highlightRel ? '无法显示该文件' : `${windowLabel(windowHours)}内有修改的文件` }}</span>
         <span class="empty-state__desc">{{ highlightRel ? '文件可能已删除或未索引' : '尚无文件，文档修改后会自动出现在这里' }}</span>
@@ -523,6 +550,7 @@ function formatTime(ms?: number) {
             <span class="detail-section__hint">每次自动提交即一个版本</span>
           </div>
           <div v-if="detailLoadingHistory" class="loading">加载历史中…</div>
+          <div v-else-if="detailHistoryError" class="alert alert--error">{{ detailHistoryError }}</div>
           <div v-else-if="detailVersions.length === 0" class="detail-empty">暂无版本历史（该文件未发生过自动提交）</div>
           <div v-else class="version-list">
             <div v-for="(v, i) in detailVersions" :key="v.hash" class="version-item">
