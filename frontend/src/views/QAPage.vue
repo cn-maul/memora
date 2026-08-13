@@ -259,6 +259,7 @@ function newSession() {
         v-if="qa.messages.length > 0"
         :messages="qa.messages"
         :sending="qa.sending"
+        :thinking="qa.thinking"
         placeholder="输入问题，Enter 发送，Shift+Enter 换行"
         @send="handleSendMessage"
         @cancel="qa.cancel"

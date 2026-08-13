@@ -8,8 +8,10 @@ import {
   testMarkitdown,
   browsePickDir,
   detectPython,
+  probeMarkitdown,
   translateApiError,
   type PythonDetectResult,
+  type MarkitdownProbeResult,
 } from '@/api/client'
 import type { ProviderControllers } from '@/composables/useProviderSettings'
 
@@ -25,6 +27,9 @@ export function useSettings(providers: ProviderControllers) {
   const pythonDetected = ref<PythonDetectResult | null>(null)
   const pythonDetecting = ref(false)
   const pythonDetectError = ref('')
+  const markitdownDetected = ref<MarkitdownProbeResult | null>(null)
+  const markitdownDetecting = ref(false)
+  const markitdownDetectError = ref('')
 
   // ───── 工作区 ─────
   const workspacePath = ref('')
@@ -239,10 +244,9 @@ export function useSettings(providers: ProviderControllers) {
     pickingPython.value = true
     pythonDetectError.value = ''
     try {
-      const res = await browsePickDir(undefined)
+      const res = await browsePickDir(undefined, "python")
       if (!res.cancelled && res.path) {
         const dir = res.path
-        // 尝试将 dir 视为 python 解释器路径
         const exe = dir.endsWith('.exe') ? dir : `${dir}\\python.exe`
         pythonPath.value = exe
         pythonDetected.value = { path: exe, ok: true, version: '' }
@@ -273,9 +277,10 @@ export function useSettings(providers: ProviderControllers) {
     pickingMd.value = true
     mdPickError.value = ''
     try {
-      const res = await browsePickDir(undefined)
+      const res = await browsePickDir(undefined, "exe")
       if (!res.cancelled && res.path) {
         markitdownCmd.value = res.path
+        markitdownDetected.value = { ok: true, version: '', path: res.path }
       }
     } catch (e: any) {
       mdPickError.value = `✗ ${e.message}`
@@ -297,9 +302,14 @@ export function useSettings(providers: ProviderControllers) {
           pythonPath.value = res.path
           command.value = `python -m markitdown "{file}"`
         }
-        // 后端已探测 markitdown 路径，直接填入
+        // 后端已探测 markitdown 位置与版本，直接填入
         if (!markitdownCmd.value && res.markitdownCmd) {
           markitdownCmd.value = res.markitdownCmd
+        }
+        markitdownDetected.value = {
+          ok: !!(res.markitdownVersion || res.markitdownCmd),
+          version: res.markitdownVersion || '',
+          path: res.markitdownCmd || '',
         }
       } else {
         pythonDetectError.value = res.error || '未检测到 Python'
@@ -308,6 +318,28 @@ export function useSettings(providers: ProviderControllers) {
       pythonDetectError.value = `✗ ${e.message}`
     } finally {
       pythonDetecting.value = false
+    }
+  }
+
+  // ───── MarkItDown 探测 ─────
+  async function runMarkitdownDetect() {
+    markitdownDetecting.value = true
+    markitdownDetectError.value = ''
+    markitdownDetected.value = null
+    try {
+      const res = await probeMarkitdown(pythonPath.value)
+      if (res.ok) {
+        markitdownDetected.value = res
+        if (!markitdownCmd.value && res.path) {
+          markitdownCmd.value = res.path
+        }
+      } else {
+        markitdownDetectError.value = res.error || '未检测到 MarkItDown'
+      }
+    } catch (e: any) {
+      markitdownDetectError.value = `✗ ${translateApiError(e.message)}`
+    } finally {
+      markitdownDetecting.value = false
     }
   }
 
@@ -348,6 +380,9 @@ export function useSettings(providers: ProviderControllers) {
     pythonDetected,
     pythonDetecting,
     pythonDetectError,
+    markitdownDetected,
+    markitdownDetecting,
+    markitdownDetectError,
     workspacePath,
     scanIntervalSec,
     recentWindowHours,
@@ -369,6 +404,7 @@ export function useSettings(providers: ProviderControllers) {
     initialize,
     retryLoadSettings,
     runPythonDetect,
+    runMarkitdownDetect,
     handleSaveSecrets,
     handleSaveSettings,
     handleInitWorkspace,

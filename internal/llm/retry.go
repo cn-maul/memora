@@ -8,23 +8,23 @@ import (
 	"memora/internal/logx"
 )
 
-// rateLimitWait 限频等待
-func (m *Module) rateLimitWait() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// rateLimitWait 限频等待（已废弃：改用 rateLimiter.wait）
+func (m *Module) rateLimitWait(lim *rateLimiter) {
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
 
-	elapsed := time.Since(m.lastReqTime)
-	if elapsed < m.rateLimit {
-		time.Sleep(m.rateLimit - elapsed)
+	elapsed := time.Since(lim.lastReqTime)
+	if elapsed < lim.rate {
+		time.Sleep(lim.rate - elapsed)
 	}
-	m.lastReqTime = time.Now()
+	lim.lastReqTime = time.Now()
 }
 
-// retry 退避重试（≤3 次）
-func (m *Module) retry(fn func() ([]byte, error)) ([]byte, error) {
+// retry 退避重试（≤3 次），每次请求前按传入的独立限频器限频（A4）
+func (m *Module) retry(lim *rateLimiter, fn func() ([]byte, error)) ([]byte, error) {
 	var lastErr error
 	for i := 0; i < 3; i++ {
-		m.rateLimitWait()
+		m.rateLimitWait(lim)
 
 		data, err := fn()
 		if err == nil {

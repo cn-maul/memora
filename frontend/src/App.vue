@@ -366,6 +366,7 @@ onUnmounted(() => {
         <ChatSurface
           :messages="qa.messages as any[]"
           :sending="qa.sending"
+          :thinking="qa.thinking"
           @send="handleChatSend"
           @cancel="qa.cancel"
         />

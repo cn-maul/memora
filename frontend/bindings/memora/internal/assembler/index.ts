@@ -50,6 +50,8 @@ export type {
     LLMTestResult,
     ManualCommitRequest,
     ManualCommitResult,
+    MarkitdownProbeResult,
+    PickDirRequest,
     PickDirectoryResult,
     PythonDetectResult,
     QAMessagesResponse,

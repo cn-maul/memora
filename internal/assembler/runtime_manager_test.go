@@ -46,7 +46,7 @@ func TestRuntimeManagerCommitReturnsOld(t *testing.T) {
 }
 
 // TestRebuildWorkspaceSwitchesGenerationAndModules 用真实装配 App 验证工作区重建：
-// 旧 storage 被替换、generation 递增、传输层 handler 引用同时切换、配置随工作区移动。
+// 旧 storage 被替换、generation 递增、模块引用随重建切换、配置随工作区移动。
 func TestRebuildWorkspaceSwitchesGenerationAndModules(t *testing.T) {
 	cfgDir := t.TempDir()
 	app, err := NewApp(context.Background(), filepath.Join(cfgDir, "config.json"))
@@ -81,8 +81,8 @@ func TestRebuildWorkspaceSwitchesGenerationAndModules(t *testing.T) {
 	if app.wsPath != workspace {
 		t.Fatalf("重建后工作区应为 %q, got %q", workspace, app.wsPath)
 	}
-	if app.handler == nil || app.handler.Storage != cur.Storage {
-		t.Fatalf("重建后传输层 handler 应指向新 storage")
+	if app.Storage != cur.Storage {
+		t.Fatalf("重建后模块引用应指向新 storage")
 	}
 	if ws, err := app.Config.Get("workspace.path"); err != nil || ws != workspace {
 		t.Fatalf("配置 workspace.path 应为 %q, got %v (err=%v)", workspace, ws, err)

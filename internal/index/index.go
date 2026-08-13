@@ -18,6 +18,15 @@ import (
 	"memora/internal/logx"
 )
 
+// indexConcurrency 索引处理的上界并发数：并行处理含 LLM 的嵌入/打标，缩短全量重建索引耗时（A6）。
+const indexConcurrency = 4
+
+// fileJob 单文件索引作业
+ type fileJob struct {
+	file    *contract.FileInfo
+	relPath string
+}
+
 // IStorage index 模块所需的 storage 接口
 type IStorage interface {
 	FilesGet(id int64) (*contract.FileInfo, error)
@@ -311,6 +320,27 @@ func (m *Module) chunkText(text string) []string {
 
 // ──────────────────── 核心流程 ────────────────────
 
+func (m *Module) processJobsConcurrent(jobs []fileJob, errs *[]error) {
+	const concurrency = indexConcurrency
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, j := range jobs {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(job fileJob) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := m.ProcessFile(job.file); err != nil {
+				mu.Lock()
+				*errs = append(*errs, fmt.Errorf("[index] 处理文件失败 %s: %w", job.relPath, err))
+				mu.Unlock()
+			}
+		}(j)
+	}
+	wg.Wait()
+}
+
 // FullReindex 全量重建索引
 func (m *Module) FullReindex() error {
 	logx.Info("index", "开始全量重建索引")
@@ -335,8 +365,8 @@ func (m *Module) FullReindex() error {
 
 	var errs []error
 
-	for i, relPath := range files {
-		// 检查文档类型
+	jobs := make([]fileJob, 0, total)
+	for _, relPath := range files {
 		docType := documentpolicy.DetectDocType(relPath)
 		if docType == "" || docType == "ignored" {
 			continue
@@ -347,41 +377,28 @@ func (m *Module) FullReindex() error {
 			DocType:     docType,
 			IndexStatus: "pending",
 		}
-		// 扫描时补充文件元数据（修复全量重建后大小恒为 0B 的问题）
 		if stat, err := os.Stat(filepath.Join(m.workspace, relPath)); err == nil && !stat.IsDir() {
 			fileInfo.Size = stat.Size()
 			fileInfo.Mtime = stat.ModTime().UnixMilli()
 		}
-		// 复用已有 ContentHash：FilesUpsert 在 hash 为空时保留库中旧值，
-		// 但 fileInfo 结构体本身未回填，导致 ProcessFile 的幂等检查
-		// `file.ContentHash == cacheKey` 恒 false、每次全量重建都全量重提取+重嵌入（修复 review 发现）。
 		if existing, err := m.storage.FilesFindByRelPath(relPath); err == nil && existing != nil {
 			fileInfo.ContentHash = existing.ContentHash
 		}
 
-		// 写入文件元数据
 		id, err := m.storage.FilesUpsert(fileInfo)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("[index] 写入文件元数据失败 %s: %w", relPath, err))
 			continue
 		}
 		fileInfo.ID = id
-
-		// 处理单个文件（P1-15：错误收集而非仅 logx.Warn）
-		if err := m.ProcessFile(fileInfo); err != nil {
-			errs = append(errs, fmt.Errorf("[index] 处理文件失败 %s: %w", relPath, err))
-		}
-
-		// 广播进度
-		m.events.Notify("index_progress", map[string]interface{}{
-			"phase":   "processing",
-			"done":    i + 1,
-			"total":   total,
-			"current": relPath,
-		})
+		jobs = append(jobs, fileJob{file: fileInfo, relPath: relPath})
 	}
 
-	// 重建完成
+	// A6：并行处理含 LLM 的嵌入/打标，缩短全量重建索引耗时
+	if len(jobs) > 0 {
+		m.processJobsConcurrent(jobs, &errs)
+	}
+
 	m.events.Notify("index_progress", map[string]interface{}{
 		"phase": "done",
 		"total": total,
@@ -444,9 +461,9 @@ func (m *Module) cleanupMissingFiles(onDisk []string) error {
 func (m *Module) Incremental(changed, removed []string) error {
 	var errs []error
 
-	// 处理变更的文件
+	// 先做元数据 upsert，收集作业；再并行处理（A6）
+	jobs := make([]fileJob, 0, len(changed))
 	for _, relPath := range changed {
-		// 防御校验：跳过目录、未知类型及 ignored 类型（修复 H-04）
 		docType := documentpolicy.DetectDocType(relPath)
 		if docType == "" || docType == "ignored" {
 			continue
@@ -469,7 +486,6 @@ func (m *Module) Incremental(changed, removed []string) error {
 		}
 
 		if fileInfo == nil {
-			// 新文件
 			fileInfo = &contract.FileInfo{
 				RelPath:     relPath,
 				DocType:     docType,
@@ -494,9 +510,11 @@ func (m *Module) Incremental(changed, removed []string) error {
 			fileInfo.ID = id
 		}
 
-		if err := m.ProcessFile(fileInfo); err != nil {
-			errs = append(errs, fmt.Errorf("[index] 增量索引文件 %s 处理失败: %w", relPath, err))
-		}
+		jobs = append(jobs, fileJob{file: fileInfo, relPath: relPath})
+	}
+
+	if len(jobs) > 0 {
+		m.processJobsConcurrent(jobs, &errs)
 	}
 
 	// 处理删除的文件

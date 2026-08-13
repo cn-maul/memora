@@ -13,6 +13,7 @@ const props = withDefaults(
   defineProps<{
     messages: QAMessage[]
     sending?: boolean
+    thinking?: string
     placeholder?: string
   }>(),
   { placeholder: '输入问题，Enter 发送，Shift+Enter 换行' },
@@ -167,6 +168,11 @@ onUnmounted(() => {
 // 输入区
 // ────────────────────────────────────────────────────────────────
 const inputText = ref('')
+// 流式期间仅对"正在被写入"的那条助手消息用纯文本渲染，避免每 flush 全量重解析 Markdown（B1）
+function isStreaming(msg: QAMessage): boolean {
+  return props.sending && msg.role === 'assistant' && msg === props.messages[props.messages.length - 1]
+}
+
 const inputRef = ref<HTMLTextAreaElement | null>(null)
 // 输入框随内容自适应高度（最多 180px），发送后重置为初始高度
 function autosize() {
@@ -213,12 +219,22 @@ function handleSend() {
           <div
             v-else-if="hasRenderableContent(msg)"
             class="message-content"
-            v-html="renderMarkdown(msg.content)"
-          ></div>
+            :class="{ streaming: isStreaming(msg) }"
+          >
+            <template v-if="isStreaming(msg)">{{ msg.content }}</template>
+            <!-- v-html 不能用于 <template>（Vue 不渲染、vue-tsc 也不统计其引用），须用真实元素 -->
+            <div v-else v-html="renderMarkdown(msg.content)"></div>
+          </div>
           <!-- 流式输出等待期的打字光标 -->
           <span v-if="msg.role === 'assistant' && !msg.content && sending" class="typing-cursor">▍</span>
         </div>
       </div>
+    </div>
+
+    <!-- A1/B4：流式阶段提示（retrieving→"正在检索文档…"，generating→"正在生成回答…"） -->
+    <div v-if="thinking" class="thinking-indicator">
+      <span class="thinking-dots">…</span>
+      <span class="thinking-text">{{ thinking }}</span>
     </div>
 
     <!-- 输入区（旧样式：圆角输入框 + 工具栏发送/取消按钮） -->
@@ -557,6 +573,32 @@ function handleSend() {
   50% {
     opacity: 0;
   }
+}
+
+
+/* A1/B4：流式阶段提示（retrieving / generating） */
+.thinking-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 4px 4px;
+  margin-left: 44px;
+  font-size: 12.5px;
+  color: var(--c-text-tertiary);
+  align-self: flex-start;
+}
+.thinking-dots {
+  display: inline-block;
+  font-size: 16px;
+  color: var(--c-brand);
+  animation: thinking-pulse 1.2s ease-in-out infinite;
+}
+.thinking-text {
+  line-height: 1.4;
+}
+@keyframes thinking-pulse {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 1; }
 }
 
 /* ─────── 输入区（旧样式：圆角输入框 + 工具栏） ─────── */

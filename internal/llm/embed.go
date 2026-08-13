@@ -3,6 +3,7 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -54,7 +55,7 @@ func (m *Module) Embed(texts []string) ([][]float32, error) {
 			Dimensions: dims, // 显式指定维度，避免模型默认维度与配置不一致
 		}
 
-		data, err := m.retry(func() ([]byte, error) {
+		data, err := m.retry(&m.embedLimiter, func() ([]byte, error) {
 			return m.doRequest("POST", url, reqBody, apiKey)
 		})
 		if err != nil {
@@ -95,10 +96,41 @@ func (m *Module) Embed(texts []string) ([][]float32, error) {
 // 查询侧加上"为检索生成表示"指令，文档侧不加，可显著提升查询-文档相似度）
 const retrievalInstruction = "为这个句子生成表示以用于检索相关文章："
 
-// EmbedQuery 嵌入单条查询（自动加检索指令前缀）。
+// preprocessQuery 对中文查询做去噪预处理，提升查询-文档相似度：
+// 1) 去掉句首常见引导词（如"请问""帮我看看"）与句尾语气词/标点，避免无意义词拉低相似度；
+// 2) 压缩空白；
+// 3) 尽量保留文件名、人名、术语等核心词（不做激进停用词剔除，以免切碎专有名词）。
+var queryPrefixRe = regexp.MustCompile(`^(?:请问|帮我看看|帮我查一下|帮我查|帮我找找|帮我找|帮我|看看|查一下|查一查|找一下|找一找|关于|有没有|有没|请问一下|麻烦|请)\s*`)
+
+func preprocessQuery(text string) string {
+	t := queryPrefixRe.ReplaceAllString(text, "")
+	t = strings.TrimRightFunc(t, func(r rune) bool {
+		return r == '！' || r == '!' || r == '。' || r == '？' || r == '?' || r == '，' || r == ','
+	})
+	t = strings.TrimSpace(t)
+	return t
+}
+
+// retrievalInstructionFor 按嵌入模型选择查询指令前缀（D4）：
+// - qwen/bge 系列：加"为检索生成表示"指令（官方建议，文档侧不加）
+// - e5 系列：使用 "query: " 前缀
+// - 其他模型：不加前缀，避免对无指令训练的模型有害
+func retrievalInstructionFor(model string) string {
+	m := strings.ToLower(model)
+	if strings.Contains(m, "e5") {
+		return "query: "
+	}
+	if strings.Contains(m, "qwen") || strings.Contains(m, "bge") {
+		return "为这个句子生成表示以用于检索相关文章："
+	}
+	return ""
+}
+
+// EmbedQuery 嵌入单条查询（自动加按模型适配的检索指令前缀）。
 // 文档索引用 Embed（原文），查询用 EmbedQuery（带指令），二者维度一致、方向对齐。
 func (m *Module) EmbedQuery(text string) ([]float32, error) {
-	vecs, err := m.Embed([]string{retrievalInstruction + text})
+	_, _, model, _ := m.config.GetEmbedConfig()
+	vecs, err := m.Embed([]string{retrievalInstructionFor(model) + preprocessQuery(text)})
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +158,7 @@ func (m *Module) TestEmbedWith(baseURL, apiKey, model string) error {
 	}
 	url := strings.TrimRight(baseURL, "/") + "/embeddings"
 	reqBody := embedRequest{Model: model, Input: []string{"测试"}}
-	data, err := m.retry(func() ([]byte, error) {
+	data, err := m.retry(&m.embedLimiter, func() ([]byte, error) {
 		return m.doRequest("POST", url, reqBody, apiKey)
 	})
 	if err != nil {

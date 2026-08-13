@@ -160,14 +160,15 @@ type IEvents interface {
 
 // Module 问答模块
 type Module struct {
-	storage         IStorage
-	llm             ILLM
-	events          IEvents
-	maxContextChars int
+	storage          IStorage
+	llm              ILLM
+	events           IEvents
+	maxContextChars  int
+	userSystemPrompt string
 }
 
 // systemPrompt 问答系统提示词（Ask 与 AskStream 共用，精简以减少输入 token）
-const systemPrompt = "你是 Memora 文档问答助手。依据下方 [文件=路径, 段落=序号] 标注的文档片段回答。引用文件时务必用 [文件=路径, 段落=序号] 标记原样标出（如 [文件=预算表.xlsx, 段落=3]），不要用反引号或只写文件名。用 Markdown 简洁作答（# 标题、- 列表、**加粗**），不要开场白与结束语。若片段中没有答案，直接说明\"根据现有文档，未找到相关信息\"，不要猜测。"
+const systemPrompt = "你是 Memora 文档问答助手。依据下方 [文件=路径, 段落=序号] 标注的文档片段回答。引用文件时务必用 [文件=路径, 段落=序号] 标记原样标出（如 [文件=预算表.xlsx, 段落=3]），不要用反引号或只写文件名。用 Markdown 简洁作答（# 标题、- 列表、**加粗**），不要开场白与结束语。若片段中没有答案，直接说明\"根据现有文档，未找到相关信息\"，不要猜测。不得编造文档中不存在的数据、日期或人名；必要时明确区分事实与推断。以下可能包含历史对话，请结合历史回答当前问题。"
 
 // qaMaxTokens 问答最大输出 token。
 // 推理模型（SenseNova reasoning 等）会先消耗大量 token 输出思维链（delta.reasoning）
@@ -183,13 +184,22 @@ var quotedKeywordRe = regexp.MustCompile(`[“"『「《]([^”"』」》]{1,30}
 const fullTextDirectLimit = 6000
 
 // New 创建问答模块
-func New(storage IStorage, llm ILLM, events IEvents, maxContextChars int) *Module {
+func New(storage IStorage, llm ILLM, events IEvents, maxContextChars int, systemPrompt string) *Module {
 	return &Module{
-		storage:         storage,
-		llm:             llm,
-		events:          events,
-		maxContextChars: maxContextChars,
+		storage:          storage,
+		llm:              llm,
+		events:           events,
+		maxContextChars:  maxContextChars,
+		userSystemPrompt: systemPrompt,
 	}
+}
+
+// effectiveSystemPrompt 返回有效系统提示词：优先用户配置，否则回退默认。
+func (m *Module) effectiveSystemPrompt() string {
+	if m.userSystemPrompt != "" {
+		return m.userSystemPrompt
+	}
+	return systemPrompt
 }
 
 // QASink 流式问答输出槽：把流水线产生的增量逐块交给调用方。
@@ -203,6 +213,53 @@ type QASink struct {
 // errCanceled 统一的"已取消"哨兵错误：流式管道在任意取消点返回它，
 // 由 AskStream 包装层转换成 done{Error: "已取消"}（与取消响应线协议一致）。
 var errCanceled = errors.New("已取消")
+
+// qaHistoryMaxRunes 注入对话历史的总字符上限，超出按最旧优先截断（A2）。
+const qaHistoryMaxRunes = 2000
+
+// qaHistoryMaxMessages 保留最近若干条消息（~4 轮对话）。
+const qaHistoryMaxMessages = 8
+
+// buildHistory 读取会话历史并格式化为可注入 userPrompt 的文本（A2 多轮上下文）。
+// 返回空串表示无历史：首次提问或存储读取失败时均属正常。
+func (m *Module) buildHistory(sessionID int64) string {
+	if sessionID == 0 {
+		return ""
+	}
+	msgs, err := m.storage.QAMessagesBySession(sessionID)
+	if err != nil || len(msgs) == 0 {
+		return ""
+	}
+	if len(msgs) > qaHistoryMaxMessages {
+		msgs = msgs[len(msgs)-qaHistoryMaxMessages:]
+	}
+	var sb strings.Builder
+	sb.WriteString("## 对话历史\n")
+	totalRunes := 0
+	for _, msg := range msgs {
+		var prefix string
+		switch msg.Role {
+		case "user":
+			prefix = "用户："
+		case "assistant":
+			prefix = "助手："
+		default:
+			continue
+		}
+		line := prefix + msg.Content
+		rn := utf8.RuneCountInString(line)
+		if totalRunes+rn > qaHistoryMaxRunes {
+			break
+		}
+		totalRunes += rn
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	if totalRunes == 0 {
+		return ""
+	}
+	return sb.String()
+}
 
 // Execute 统一问答流水线（Ask 与 AskStream 的单一实现，P2-06）。
 // sink == nil → 非流式：走 LLM.Chat，错误直接返回（Ask 使用）；
@@ -223,6 +280,12 @@ func (m *Module) Execute(ctx context.Context, req *contract.QARequest, sink *QAS
 			return nil, fmt.Errorf("[qa] 创建会话失败: %w", err)
 		}
 	}
+
+	// 加载多轮对话历史（A2），首次提问或读取失败时为空串
+	historyStr := m.buildHistory(sessionID)
+
+	// A1：流式模式下，在检索阶段开始前发出阶段事件，前端显示「正在检索文档…」（配合 B4）
+	emitStage(ctx, sink, "retrieving")
 
 	// 用户消息延迟到模型成功后写入（修复 M-03：避免留下无回答的孤立消息/会话）
 
@@ -258,9 +321,17 @@ func (m *Module) Execute(ctx context.Context, req *contract.QARequest, sink *QAS
 		return &contract.QAResponse{Answer: notFound, SessionID: sessionID}, nil
 	}
 
-	userPrompt := fmt.Sprintf("%s\n\n问题：%s", contextStr, req.Question)
+	// 拼接用户提示：历史对话（若有）+ 检索上下文 + 当前问题（A2 多轮上下文）
+	var userPrompt string
+	if historyStr != "" {
+		userPrompt = historyStr + "\n\n" + contextStr + "\n\n问题：" + req.Question
+	} else {
+		userPrompt = contextStr + "\n\n问题：" + req.Question
+	}
 
 	// 模型回答：唯一的 LLM 环节——非流式单次 Chat；流式 ChatStream + 空回答重试
+	// A1：检索完成后发出"generating"阶段事件，前端切换为「正在生成回答…」
+	emitStage(ctx, sink, "generating")
 	answer, err := m.generateAnswer(ctx, req, userPrompt, sink)
 	if err != nil {
 		// 失败回滚：若是本次新建的会话则整会话删除，避免留下孤立空会话（修复 M-03）
@@ -305,7 +376,7 @@ func (m *Module) Execute(ctx context.Context, req *contract.QARequest, sink *QAS
 func (m *Module) generateAnswer(ctx context.Context, req *contract.QARequest, userPrompt string, sink *QASink) (string, error) {
 	// 非流式：单次 Chat
 	if sink == nil {
-		answer, err := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
+		answer, err := m.llm.Chat(m.effectiveSystemPrompt(), userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
 		if err != nil {
 			return "", err
 		}
@@ -317,7 +388,7 @@ func (m *Module) generateAnswer(ctx context.Context, req *contract.QARequest, us
 	}
 
 	// 流式：ChatStream + 逐块输出，取消通道合并 ctx 与 sink.Canceled
-	chunks, err := m.llm.ChatStream(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens}, streamCancel(ctx, sink))
+	chunks, err := m.llm.ChatStream(m.effectiveSystemPrompt(), userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens}, streamCancel(ctx, sink))
 	if err != nil {
 		return "", err
 	}
@@ -346,8 +417,7 @@ func (m *Module) generateAnswer(ctx context.Context, req *contract.QARequest, us
 	answer := sb.String()
 
 	// 空回答防御：流式返回空/纯空白时，用非流式 Chat 重试一次兜底。
-	// 修复：部分端点流式格式不标准（如 message 字段、空 delta）导致流式内容为空，
-	// 直接给提示无法自愈；非流式重试可拿到完整回答。
+	// A5：重试前先发出一句提示，避免用户在重试期间以为"卡死"（加剧慢体感）
 	if strings.TrimSpace(answer) == "" {
 		// 重试前检查取消：非流式 Chat 无法中途打断，取消后不应再发起重试（review 发现）
 		if canceled(ctx, sink) {
@@ -355,7 +425,11 @@ func (m *Module) generateAnswer(ctx context.Context, req *contract.QARequest, us
 		}
 
 		logx.Warn("qa", "流式回答为空，改用非流式重试", "question", req.Question)
-		retried, rerr := m.llm.Chat(systemPrompt, userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
+		// A5：先推送一句说明性提示，让用户感知正在处理，而非静默等待重试
+		if emitChunk(ctx, sink, "正在为您重新生成回答，请稍候…") != nil {
+			return "", err
+		}
+		retried, rerr := m.llm.Chat(m.effectiveSystemPrompt(), userPrompt, &contract.ChatOptions{Temperature: 0.2, MaxTokens: qaMaxTokens})
 		// 重试完成后再次检查取消：用户中止时丢弃重试结果，不写入会话（review 发现）
 		if canceled(ctx, sink) {
 			return "", errCanceled
@@ -433,6 +507,23 @@ func (m *Module) AskStream(req *contract.QARequest, cancel <-chan struct{}) (<-c
 	}()
 
 	return ch, done
+}
+
+// stageChunkPrefix 检索/生成阶段事件前缀（A1 配合 B4 的前端「正在检索文档…」反馈）。
+// 格式：__STAGE__:<stage>，stage ∈ {retrieving, generating}。
+// 通过 chunks 通道透出，前端按前缀过滤、不写入消息内容。
+const stageChunkPrefix = "__STAGE__:"
+
+// emitStage 通过 sink 透出一个阶段事件（A1 配合 B4）。仅流式模式（sink != nil）且未取消时生效。
+// stage ∈ {retrieving, generating}，前端据此显示「正在检索文档…」「正在生成回答…」。
+func emitStage(ctx context.Context, sink *QASink, stage string) {
+	if sink == nil || sink.OnChunk == nil {
+		return
+	}
+	if canceled(ctx, sink) {
+		return
+	}
+	sink.OnChunk(stageChunkPrefix + stage)
 }
 
 // emitChunk 把流式块推给 sink，并在任意取消点中止：
@@ -531,7 +622,7 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 				return nil, nil, fmt.Errorf("[qa] 嵌入问题失败: %w", err)
 			}
 			// 全库搜索取回 2×块数，容忍其他文件高分块挤占，再按 fileID 过滤
-			entries, err := m.storage.VectorsSearch(queryVec, len(chunks)*2)
+			entries, err := m.storage.VectorsSearch(queryVec, min(len(chunks)*2, 40))
 			if err == nil {
 				// 批量拉取候选分块，替代逐条 ChunksGet（消除 N+1）
 				chunksByID, err := m.chunksForEntries(entries)
@@ -539,14 +630,13 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 					return nil, nil, fmt.Errorf("[qa] 批量获取分块失败: %w", err)
 				}
 				type scoredChunk struct {
-					chunk *contract.Chunk
-					score float64
+					chunk       *contract.Chunk
+					score       float64
+					rerankScore float64
 				}
 				var scored []scoredChunk
 				for _, e := range entries {
-					// 宽召回不过滤余弦分：阈值（此前 0.3/0.1）会在重排前丢掉相关块，
-					// 即使配了重排也"找不到"。全部候选交给重排精排决定。
-					if e.ChunkID == 0 {
+					if e.ChunkID == 0 || e.Score < 0.1 {
 						continue
 					}
 					chunk := chunksByID[e.ChunkID]
@@ -555,20 +645,37 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 					}
 					scored = append(scored, scoredChunk{chunk: chunk, score: e.Score})
 				}
-				// 重排精排（若已配置）：交叉编码器对候选块重新打分，替代余弦分数
+				// 重排精排（若已配置）：交叉编码器对候选块重新打分，作为余弦之上的加分信号
 				if len(scored) > 1 {
 					texts := make([]string, len(scored))
 					for i := range scored {
 						texts[i] = scored[i].chunk.Text
 					}
 					if rs, rerr := m.llm.Rerank(req.Question, texts); rerr == nil && len(rs) == len(scored) {
+						// D3：min-max 归一化 rerank 分数后与余弦混合（0.3 余弦 + 0.7 rerank），
+						// 替代旧逻辑 if rs[i] > 0.8 { score += 0.3 }，避免粗阈值导致的排序突变
+						var maxRs, minRs float64 = -1, 1
+						for _, v := range rs {
+							if v > maxRs {
+								maxRs = v
+							}
+							if v < minRs {
+								minRs = v
+							}
+						}
+						spread := maxRs - minRs
 						for i := range scored {
-							scored[i].score = rs[i]
+							scored[i].rerankScore = rs[i]
+							rsNorm := rs[i]
+							if spread > 0 {
+								rsNorm = (rs[i] - minRs) / spread
+							}
+							scored[i].score = scored[i].score*0.3 + rsNorm*0.7
 						}
 					}
 				}
-				// bounded top-8：固定容量小顶堆只保留最高分 8 个，替代全量 sort.Slice
-				scored = topKByScore(scored, 8, func(s scoredChunk) float64 { return s.score })
+				// bounded top-5：固定容量小顶堆只保留最高分 8 个，替代全量 sort.Slice
+				scored = topKByScore(scored, 5, func(s scoredChunk) float64 { return s.score })
 				// 按 maxContextChars 累计裁剪，防止上下文超限拖慢首 token
 				usedRunes := 0
 				for _, c := range scored {
@@ -588,7 +695,7 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 		if err != nil {
 			return nil, nil, fmt.Errorf("[qa] 嵌入问题失败: %w", err)
 		}
-		entries, err := m.storage.VectorsSearch(queryVec, 100)
+		entries, err := m.storage.VectorsSearch(queryVec, 40)
 		if err == nil {
 			// 批量拉取候选分块与文件，替代逐条 ChunksGet/FilesGet（消除 N+1）
 			chunksByID, err := m.chunksForEntries(entries)
@@ -600,14 +707,16 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 				return nil, nil, fmt.Errorf("[qa] 批量获取文件失败: %w", err)
 			}
 			type scored struct {
-				chunk *contract.Chunk
-				file  *contract.FileInfo
-				score float64
+				chunk       *contract.Chunk
+				file        *contract.FileInfo
+				score       float64
+				rerankScore float64
 			}
-			// 宽召回不过滤余弦分：阈值（此前 0.3/0.1）会在重排前丢掉相关块，
-			// 且维度不匹配时余弦全为 0 会被阈值清空导致"检索为空"。全部候选交给重排精排决定。
 			var scoredChunks []scored
 			for _, e := range entries {
+				if e.Score < 0.1 {
+					continue
+				}
 				chunk := chunksByID[e.ChunkID]
 				if chunk == nil {
 					continue
@@ -625,13 +734,30 @@ func (m *Module) buildContext(req *contract.QARequest) ([]string, []contract.QAS
 					texts[i] = scoredChunks[i].chunk.Text
 				}
 				if rs, rerr := m.llm.Rerank(req.Question, texts); rerr == nil && len(rs) == len(scoredChunks) {
+					// D3：min-max 归一化 rerank 分数后与余弦混合（0.3 余弦 + 0.7 rerank），
+					// 替代旧逻辑 if rs[i] > 0.8 { score += 0.3 }，避免粗阈值导致的排序突变
+					var maxRs, minRs float64 = -1, 1
+					for _, v := range rs {
+						if v > maxRs {
+							maxRs = v
+						}
+						if v < minRs {
+							minRs = v
+						}
+					}
+					spread := maxRs - minRs
 					for i := range scoredChunks {
-						scoredChunks[i].score = rs[i]
+						scoredChunks[i].rerankScore = rs[i]
+						rsNorm := rs[i]
+						if spread > 0 {
+							rsNorm = (rs[i] - minRs) / spread
+						}
+						scoredChunks[i].score = scoredChunks[i].score*0.3 + rsNorm*0.7
 					}
 				}
 			}
-			// bounded top-8：固定容量小顶堆只保留最高分 8 个，替代全量 sort.Slice
-			scoredChunks = topKByScore(scoredChunks, 8, func(s scored) float64 { return s.score })
+			// bounded top-5：重排分数作为加分叠加在余弦之上，混合排序（D3）
+			scoredChunks = topKByScore(scoredChunks, 5, func(s scored) float64 { return s.score })
 			// 按 maxContextChars 累计裁剪，防止上下文超限拖慢首 token
 			usedRunes := 0
 			for _, c := range scoredChunks {

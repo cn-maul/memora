@@ -104,6 +104,7 @@ export interface FileHistoryResponse {
 
 /**
  * FileListRequest 文件列表请求
+ * WindowHours 仅 Recent 使用：最近 N 小时内修改的文件（0 = 全部）
  */
 export interface FileListRequest {
     "status": string;
@@ -111,6 +112,7 @@ export interface FileListRequest {
     "page": number;
     "pageSize": number;
     "sort": string;
+    "windowHours": number;
 }
 
 /**
@@ -124,9 +126,15 @@ export interface FileListResponse {
 
 /**
  * InitRequest 工作区初始化请求
+ * 结构与迁移前的 POST /api/workspace/init 一致：工作区路径 + 可选的 markitdown/llm/embed/rerank 配置区块，
+ * 初始化时一并落盘（修复：此前仅传 workspace，向导/设置页填写的 AI 配置被静默丢弃）。
  */
 export interface InitRequest {
     "workspace": string;
+    "markitdown": {"pythonPath": string, "command": string};
+    "llm": {"baseUrl": string, "apiKey": string, "model": string, "temperature": number} | null;
+    "embed": {"baseUrl": string, "apiKey": string, "model": string, "dimensions": number};
+    "rerank": {"baseUrl": string, "apiKey": string, "model": string};
 }
 
 /**
@@ -169,6 +177,21 @@ export interface ManualCommitResult {
 }
 
 /**
+ * MarkitdownProbeResult MarkItDown 探测结果（版本 + 位置）
+ */
+export interface MarkitdownProbeResult {
+    "path": string;
+    "version"?: string;
+    "ok": boolean;
+    "error"?: string;
+}
+
+export interface PickDirRequest {
+    "initial": string;
+    "kind": string;
+}
+
+/**
  * PickDirectoryResult 目录选择结果
  */
 export interface PickDirectoryResult {
@@ -183,6 +206,7 @@ export interface PythonDetectResult {
     "ok": boolean;
     "version"?: string;
     "markitdownCmd"?: string;
+    "markitdownVersion"?: string;
     "error"?: string;
 }
 
@@ -208,6 +232,13 @@ export interface QAStreamRequest {
     "mode": string;
     "fileId": number;
     "sessionId": number;
+
+    /**
+     * RequestID 前端生成的流式事件 id（qa:chunk:<id> / qa:done:<id> / qa:error:<id>）。
+     * 事件名是"前端订阅名 vs 后端 emit 名"的双向握手协议，id 必须由同一侧生成并回传，
+     * 否则前后端各自生成、永不匹配（修复：问答事件收不到、sending 卡死）。
+     */
+    "requestId": string;
 }
 
 /**
@@ -335,9 +366,13 @@ export interface UpdateTagsRequest {
 
 /**
  * WorkspaceInfo 工作区信息（返回给前端）
+ * 字段形状与迁移前的 /api/workspace/info 保持一致（initialized/workspacePath/dirtyCounts/configured），
+ * 前端 stores/workspace.ts 依赖这些字段判断"是否已初始化"。
  */
 export interface WorkspaceInfo {
     "workspace": string;
+    "workspacePath": string;
+    "initialized": boolean;
     "dataDir": string;
     "generation": string;
     "version": string;
@@ -345,4 +380,8 @@ export interface WorkspaceInfo {
     "buildTime": string;
     "config": { [_ in string]?: any } | null;
     "head"?: contract$0.HeadInfo | null;
+    "dirtyCounts"?: { [_ in string]?: number } | null;
+    "markitdownConfigured": boolean;
+    "llmConfigured": boolean;
+    "embedConfigured": boolean;
 }

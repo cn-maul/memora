@@ -136,7 +136,7 @@ func newFakeModule(st IStorage, llm ILLM, ev *fakeEvents) *Module {
 	if llm == nil {
 		llm = &fakeLLM{answer: "测试回答"}
 	}
-	return New(st, llm, ev, 30000)
+	return New(st, llm, ev, 30000, "")
 }
 
 // 单文件 small chunk → 走"全文直发"路径，不发嵌入请求（离线）

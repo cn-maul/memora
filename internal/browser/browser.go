@@ -11,10 +11,18 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 
+	"github.com/wailsapp/wails/v3/pkg/application"
 	"memora/internal/documentpolicy"
 )
+
+// Dialog 是对话框能力接口（供 PickDirectory/PickFile 调用，便于测试注入）。
+// openDir 弹出目录选择、openFile 弹出文件选择；filters 为后缀过滤（如 []string{".exe"}）。
+// 未注入时回退到浏览器包内建的 Wails 实现（app.Run 后 application.Get() 非空）。
+type Dialog interface {
+	openDir(title, initial string) (string, error)
+	openFile(title string, filters []string, initial string) (string, error)
+}
 
 // DirEntry 目录中的一个条目（子目录或文件）
 type DirEntry struct {
@@ -103,6 +111,21 @@ type SearchResult struct {
 	Indexable bool   `json:"indexable"`
 }
 
+// isSubsequence 检查 query 是否为 s 的字符子序列（按序出现即算命中）。
+// 比 strings.Contains 更宽松：记错字序也能命中（E4）。
+func isSubsequence(s, query string) bool {
+	qi := 0
+	if qi >= len(query) {
+		return true
+	}
+	for i := 0; i < len(s) && qi < len(query); i++ {
+		if s[i] == query[qi] {
+			qi++
+		}
+	}
+	return qi >= len(query)
+}
+
 // SearchByName 按文件名/相对路径做大小写不敏感模糊搜索。
 // 递归扫描工作区，限制返回数量（默认 100）以控制开销。
 // 返回截断后的结果与真实命中总数（修复 L-1：前端截断提示需要真实 total）
@@ -132,7 +155,10 @@ func SearchByName(workspace, query string, limit int) ([]*SearchResult, int, err
 		}
 		rel, _ := filepath.Rel(workspace, path)
 		relSlash := filepath.ToSlash(rel)
-		if strings.Contains(strings.ToLower(name), query) || strings.Contains(strings.ToLower(relSlash), query) {
+		n := strings.ToLower(name)
+		r := strings.ToLower(relSlash)
+		// E4：优先子串匹配；记错字序时用子序列兜底
+		if strings.Contains(n, query) || strings.Contains(r, query) || isSubsequence(n, query) || isSubsequence(r, query) {
 			total++
 			// 只保留前 limit 条，避免大目录全量收集内存暴涨（修复 L-1：total 为真实命中数）
 			if len(results) < limit {
@@ -185,45 +211,54 @@ func OpenFile(workspace, relPath string) error {
 	return nil
 }
 
-// PickDirectory 弹出 Windows 原生目录选择对话框，返回所选绝对路径。
-// 使用 PowerShell + System.Windows.Forms.FolderBrowserDialog（需 -STA）。
-// 非 Windows 或调用失败返回空串与错误。
+// PickDirectory 弹出原生目录选择对话框，返回所选绝对路径。
+// 跨平台：通过 Wails 原生对话框（Windows COM IFileDialog / macOS NSOpenPanel / Linux GTK），
+// 无需 PowerShell 或 GUI 自动化；用户取消时返回空串与 nil error。
 func PickDirectory(initial string) (string, error) {
-	if os.PathSeparator == '\\' { // Windows
-		return pickWindowsDir(initial)
-	}
-	return "", fmt.Errorf("[browser] 当前系统不支持原生目录选择")
+	return pickDialog("选择目录", initial, true)
 }
 
-func pickWindowsDir(initial string) (string, error) {
-	// 使用 -STA 以支持 FolderBrowserDialog；输出所选路径到 stdout
-	// 修复：中文 Windows 上 PowerShell 默认按 GBK/OEM 代码页编码 stdout，
-	// Go 端按 UTF-8 解读会乱码（中文路径变 �����z�）。先强制 stdout 用 UTF-8。
-	script := `
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Windows.Forms
-$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = "选择工作区目录"
-`
-	if initial != "" {
-		escaped := strings.ReplaceAll(initial, "'", "''")
-		script += fmt.Sprintf("$dialog.SelectedPath = '%s'\n", escaped)
-	}
-	script += `
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-	Write-Output $dialog.SelectedPath
+// PickFile 弹出原生文件选择对话框，返回所选绝对路径。
+// title 标题、filters 过滤后缀（如 []string{".exe"}）、initial 初始目录。
+// 用户取消时返回空串与 nil error。
+func PickFile(title string, filters []string, initial string) (string, error) {
+	return pickDialog(title, initial, false, filters...)
 }
-`
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("[browser] 打开目录选择失败: %w", err)
+
+// pickDialog 统一的原生对话框实现。isDir 为 true 时选择目录，否则选择文件。
+// 非 Wails 环境（如单元测试）且未注入 Dialog 时返回错误。
+func pickDialog(title, initial string, isDir bool, filters ...string) (string, error) {
+	if dial := dialog; dial != nil {
+		if isDir {
+			return dial.openDir(title, initial)
+		}
+		return dial.openFile(title, filters, initial)
 	}
-	path := strings.TrimSpace(string(output))
+	app := application.Get()
+	if app == nil {
+		return "", fmt.Errorf("[browser] 当前环境不支持原生对话框（需在 Wails 应用内调用）")
+	}
+	dlg := app.Dialog.OpenFile().SetTitle(title)
+	if isDir {
+		dlg = dlg.CanChooseDirectories(true).CanChooseFiles(false)
+	} else {
+		dlg = dlg.CanChooseFiles(true).CanChooseDirectories(false)
+		for _, f := range filters {
+			dlg = dlg.AddFilter("Files", "*"+f)
+		}
+	}
+	if initial != "" {
+		dlg = dlg.SetDirectory(initial)
+	}
+	path, err := dlg.PromptForSingleSelection()
+	if err != nil {
+		return "", fmt.Errorf("[browser] 选择失败: %w", err)
+	}
 	if path == "" {
-		// 用户取消
 		return "", nil
 	}
 	return path, nil
 }
+
+// dialog 可由测试注入的对话框实现（nil 时回退到 Wails 原生）。
+var dialog Dialog

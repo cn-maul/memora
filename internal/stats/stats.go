@@ -274,7 +274,7 @@ func (m *Module) exportMarkdown(metrics *contract.StatsMetrics) (string, error) 
 
 // Purge 清除统计缓存
 func (m *Module) Purge() error {
-	m.enabled = true // 不清除开关，只重置状态
-	// 统计模块无持久化缓存，仅内存汇总，调用 Summary 时自动重算
+	// 统计模块无持久化缓存，仅内存汇总，调用 Summary 时自动重算。
+	// 注意：不清除 enabled 开关——用户主动关闭统计后执行 Purge 不应被重新打开（修复）。
 	return nil
 }

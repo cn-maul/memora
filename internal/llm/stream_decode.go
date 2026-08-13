@@ -85,7 +85,7 @@ func clipSample(s string) string {
 // idleReadCloser 包装流式响应体，提供读侧 idle 超时：
 // 底层 Read 持续空闲超过 idle 后被中断（关闭底层 body 使阻塞的 Read 返回错误），
 // 避免对端断流但连接未关（SSE 停推）时流式 goroutine 永久悬挂。
-// 每次读取都开启独立的空闲窗口，正常推流（数据持续到达）不受影响。
+// B3：Read 在独立 goroutine 中执行，timer 每次 Read 新建/Stop，idle 超时保护有效。
 type idleReadCloser struct {
 	body io.ReadCloser
 	idle time.Duration
@@ -96,30 +96,32 @@ func newIdleReadCloser(body io.ReadCloser, idle time.Duration) io.ReadCloser {
 }
 
 func (b *idleReadCloser) Read(p []byte) (int, error) {
-	type readResult struct {
+	// B3 修正：底层 Read 必须在 goroutine 里，才能让 timer 在 Read 阻塞期间触发超时；
+	// 之前把 b.body.Read(p) 同步放在同一 goroutine，Read 阻塞期间代码走不到 select，
+	// 导致 idle 超时保护失效（对端断流但连接未关时流式 goroutine 永久悬挂）。
+	type res struct {
 		n   int
 		err error
 	}
-	ch := make(chan readResult, 1)
+	ch := make(chan res, 1)
 	go func() {
 		n, err := b.body.Read(p)
-		ch <- readResult{n, err}
+		ch <- res{n, err}
 	}()
-
 	timer := time.NewTimer(b.idle)
 	defer timer.Stop()
 	select {
 	case r := <-ch:
 		return r.n, r.err
 	case <-timer.C:
-		// 数据恰好在超时瞬间到达则不中断，避免误杀正常推流
+		// 数据恰好在超时瞬间到达则不中断
 		select {
-		case r := <-ch:
-			return r.n, r.err
+		case res := <-ch:
+			return res.n, res.err
 		default:
 		}
-		b.body.Close() // 关闭底层 body 使阻塞的 Read 返回，解除读阻塞
-		<-ch           // 等待被中断的 Read 退出，避免 goroutine 泄漏
+		b.body.Close()
+		<-ch
 		return 0, fmt.Errorf("[llm] 流式读取空闲超时")
 	}
 }

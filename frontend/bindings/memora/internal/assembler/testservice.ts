@@ -17,6 +17,13 @@ export function DetectPython(): $CancellablePromise<$models.PythonDetectResult |
     return $Call.ByID(2625130181);
 }
 
+/**
+ * ProbeMarkitdown 基于指定 Python（为空时自动探测）返回 markitdown 位置与版本
+ */
+export function ProbeMarkitdown(pythonPath: string): $CancellablePromise<$models.MarkitdownProbeResult | null> {
+    return $Call.ByID(596994890, pythonPath);
+}
+
 export function TestLLM(req: $models.LLMTestRequest): $CancellablePromise<$models.LLMTestResult | null> {
     return $Call.ByID(2894649063, req);
 }

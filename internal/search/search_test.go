@@ -48,6 +48,9 @@ func (f *fakeSearchStorage) FilesList(status, tag string, page, pageSize int, so
 	return nil, 0, nil
 }
 func (f *fakeSearchStorage) TagsList() ([]*contract.TagInfo, error) { return nil, nil }
+func (f *fakeSearchStorage) FilesFindByName(keyword string, limit int) ([]*contract.FileInfo, error) {
+	return nil, nil
+}
 func (f *fakeSearchStorage) FileTagsListByFile(fileID int64) ([]contract.FileTag, error) {
 	return nil, nil
 }

@@ -164,7 +164,7 @@ func (m *Module) FilesByIDs(ids []int64) (map[int64]*contract.FileInfo, error) {
 	return files, nil
 }
 
-// FilesFindByName 按文件名/路径模糊搜索（LIKE 匹配），返回已索引文件。
+// FilesFindByName 按文件名/路径模糊搜索，返回已索引文件。
 // 供 AI 问答的"标题模糊搜索"兜底：语义检索无结果时用文件名匹配定位文件。
 func (m *Module) FilesFindByName(keyword string, limit int) ([]*contract.FileInfo, error) {
 	if keyword == "" {
@@ -180,22 +180,57 @@ func (m *Module) FilesFindByName(keyword string, limit int) ([]*contract.FileInf
 		 FROM files
 		 WHERE rel_path LIKE '%' || ? || '%' ESCAPE '\' AND index_status='indexed'
 		 ORDER BY last_indexed_at DESC LIMIT ?`,
-		escaped, limit,
+		escaped, limit*3,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("[storage] 按名称搜索文件失败: %w", err)
 	}
 	defer rows.Close()
 
-	files := make([]*contract.FileInfo, 0)
+	var candidates []*contract.FileInfo
 	for rows.Next() {
 		f := &contract.FileInfo{}
 		if err := rows.Scan(&f.ID, &f.RelPath, &f.Size, &f.Mtime, &f.ContentHash, &f.DocType, &f.IndexStatus, &f.LastError, &f.FirstSeenAt, &f.LastIndexedAt); err != nil {
 			return nil, fmt.Errorf("[storage] 扫描文件行失败: %w", err)
 		}
-		files = append(files, f)
+		candidates = append(candidates, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("[storage] 扫描文件行失败: %w", err)
+	}
+
+	// 优先返回 LIKE 命中；若无命中且关键词长度 ≥2，用子序列匹配兜底（E4）
+	var files []*contract.FileInfo
+	for _, f := range candidates {
+		if strings.Contains(strings.ToLower(f.RelPath), strings.ToLower(keyword)) {
+			files = append(files, f)
+		}
+	}
+	if len(files) == 0 && len(keyword) >= 2 {
+		for _, f := range candidates {
+			if isSubsequence(strings.ToLower(f.RelPath), strings.ToLower(keyword)) {
+				files = append(files, f)
+			}
+		}
+	}
+	if len(files) > limit {
+		files = files[:limit]
 	}
 	return files, nil
+}
+
+// isSubsequence 检查 query 是否为 s 的字符子序列（按序出现即算命中）
+func isSubsequence(s, query string) bool {
+	qi := 0
+	if qi >= len(query) {
+		return true
+	}
+	for i := 0; i < len(s) && qi < len(query); i++ {
+		if s[i] == query[qi] {
+			qi++
+		}
+	}
+	return qi >= len(query)
 }
 
 // FilesList 列出文件（支持过滤和分页）

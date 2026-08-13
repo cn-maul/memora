@@ -13,11 +13,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/wailsapp/wails/v3/pkg/application"
 	"memora/internal/browser"
 	"memora/internal/contract"
-	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 // ======================================================================
@@ -25,18 +26,26 @@ import (
 // ======================================================================
 
 // WorkspaceService 工作区（初始化、状态、诊断）
-type WorkspaceService struct { App *App }
+type WorkspaceService struct{ App *App }
 
 // WorkspaceInfo 工作区信息（返回给前端）
+// 字段形状与迁移前的 /api/workspace/info 保持一致（initialized/workspacePath/dirtyCounts/configured），
+// 前端 stores/workspace.ts 依赖这些字段判断"是否已初始化"。
 type WorkspaceInfo struct {
-	Workspace string                 `json:"workspace"`
-	DataDir   string                 `json:"dataDir"`
-	Generation string                `json:"generation"`
-	Version   string                 `json:"version"`
-	Commit    string                 `json:"commit"`
-	BuildTime string                 `json:"buildTime"`
-	Config    map[string]interface{} `json:"config"`
-	Head      *contract.HeadInfo     `json:"head,omitempty"`
+	Workspace            string                 `json:"workspace"`
+	WorkspacePath        string                 `json:"workspacePath"`
+	Initialized          bool                   `json:"initialized"`
+	DataDir              string                 `json:"dataDir"`
+	Generation           string                 `json:"generation"`
+	Version              string                 `json:"version"`
+	Commit               string                 `json:"commit"`
+	BuildTime            string                 `json:"buildTime"`
+	Config               map[string]interface{} `json:"config"`
+	Head                 *contract.HeadInfo     `json:"head,omitempty"`
+	DirtyCounts          map[string]int         `json:"dirtyCounts,omitempty"`
+	MarkitdownConfigured bool                   `json:"markitdownConfigured"`
+	LLMConfigured        bool                   `json:"llmConfigured"`
+	EmbedConfigured      bool                   `json:"embedConfigured"`
 }
 
 func (s *WorkspaceService) Info() (*WorkspaceInfo, error) {
@@ -45,33 +54,201 @@ func (s *WorkspaceService) Info() (*WorkspaceInfo, error) {
 	if rt := s.App.runtime.Current(); rt != nil {
 		gen = rt.Generation
 	}
+	workspacePath, _ := snapshot["workspacePath"].(string)
+	initialized := workspacePath != ""
 	info := &WorkspaceInfo{
-		Workspace:  s.App.wsPath,
-		DataDir:    "",
-		Generation: gen,
-		Version:    BuildVersion,
-		Commit:     BuildCommit,
-		BuildTime:  BuildTime,
-		Config:     snapshot,
+		Workspace:     s.App.wsPath,
+		WorkspacePath: workspacePath,
+		Initialized:   initialized,
+		DataDir:       "",
+		Generation:    gen,
+		Version:       BuildVersion,
+		Commit:        BuildCommit,
+		BuildTime:     BuildTime,
+		Config:        snapshot,
 	}
 	if rt := s.App.runtime.Current(); rt != nil {
 		info.DataDir = rt.DataDir
 	}
-	if head, err := s.App.Git.Head(); err == nil {
-		info.Head = head
+	// 已初始化：附带工作区脏状态与 HEAD 概要（对齐旧实现语义）
+	if initialized {
+		if status, err := s.App.Git.Status(); err == nil {
+			dirty := map[string]int{"modified": 0, "untracked": 0, "deleted": 0}
+			for _, code := range status {
+				switch code {
+				case "M":
+					dirty["modified"]++
+				case "?", "A":
+					dirty["untracked"]++
+				case "D":
+					dirty["deleted"]++
+				}
+			}
+			info.DirtyCounts = dirty
+		}
+		if head, err := s.App.Git.Head(); err == nil {
+			info.Head = head
+		}
+	}
+	// AI 配置就绪标记：baseUrl 非空即视为已配置
+	if llm, ok := snapshot["llm"].(map[string]interface{}); ok {
+		info.LLMConfigured = llm["baseUrl"] != ""
+	}
+	if emb, ok := snapshot["embed"].(map[string]interface{}); ok {
+		info.EmbedConfigured = emb["baseUrl"] != ""
+	}
+	// markitdown 已配置：pythonPath / markitdownCmd 任一显式配置即视为已配置。
+	// command 有默认值 `python -m markitdown "{file}"`，不能作为判断依据，否则恒为 true。
+	if md, ok := snapshot["markitdown"].(map[string]interface{}); ok {
+		info.MarkitdownConfigured = md["pythonPath"] != "" || md["markitdownCmd"] != ""
 	}
 	return info, nil
 }
 
 // InitRequest 工作区初始化请求
+// 结构与迁移前的 POST /api/workspace/init 一致：工作区路径 + 可选的 markitdown/llm/embed/rerank 配置区块，
+// 初始化时一并落盘（修复：此前仅传 workspace，向导/设置页填写的 AI 配置被静默丢弃）。
 type InitRequest struct {
-	Workspace string `json:"workspace"`
+	Workspace  string `json:"workspace"`
+	Markitdown struct {
+		PythonPath string `json:"pythonPath"`
+		Command    string `json:"command"`
+	} `json:"markitdown"`
+	LLM *struct {
+		BaseURL     string  `json:"baseUrl"`
+		APIKey      string  `json:"apiKey"`
+		Model       string  `json:"model"`
+		Temperature float64 `json:"temperature"`
+	} `json:"llm"`
+	Embed struct {
+		BaseURL    string `json:"baseUrl"`
+		APIKey     string `json:"apiKey"`
+		Model      string `json:"model"`
+		Dimensions int    `json:"dimensions"`
+	} `json:"embed"`
+	Rerank struct {
+		BaseURL string `json:"baseUrl"`
+		APIKey  string `json:"apiKey"`
+		Model   string `json:"model"`
+	} `json:"rerank"`
 }
 
 func (s *WorkspaceService) Init(req InitRequest) error {
 	if req.Workspace == "" {
 		return fmt.Errorf("工作区路径不能为空")
 	}
+	// M-01：校验工作区路径存在且为目录
+	wsInfo, err := os.Stat(req.Workspace)
+	if err != nil || !wsInfo.IsDir() {
+		return fmt.Errorf("工作区路径不存在或不是目录")
+	}
+
+	// M-01：提交配置前先探测与模型测试，失败不得留下半初始化状态
+	if req.Markitdown.PythonPath != "" || req.Markitdown.Command != "" {
+		probePython := req.Markitdown.PythonPath
+		probeCmd := req.Markitdown.Command
+		if probeCmd == "" {
+			probeCmd = `python -m markitdown "{file}"`
+		}
+		if ok, msg := s.App.Extract.Probe(probePython, probeCmd); !ok {
+			return fmt.Errorf("MarkItDown 探测失败: %s", msg)
+		}
+	}
+	if req.Embed.BaseURL != "" || req.Embed.Model != "" {
+		if err := s.App.LLM.TestEmbedWith(req.Embed.BaseURL, req.Embed.APIKey, req.Embed.Model); err != nil {
+			return fmt.Errorf("嵌入端点测试失败: %w", err)
+		}
+	}
+	if req.LLM != nil && (req.LLM.BaseURL != "" || req.LLM.Model != "") {
+		if err := s.App.LLM.TestChatWith(req.LLM.BaseURL, req.LLM.APIKey, req.LLM.Model, req.LLM.Temperature); err != nil {
+			return fmt.Errorf("聊天端点测试失败: %w", err)
+		}
+	}
+
+	// 1. 保存工作区路径并迁移配置到工作区 .memora/（对齐旧流程 D13）
+	if err := s.App.Config.Set("workspace.path", req.Workspace); err != nil {
+		return err
+	}
+	if err := s.App.Config.Relocate(req.Workspace); err != nil {
+		return err
+	}
+
+	// 2. 保存 markitdown 配置（仅非空覆盖，错误须检查）
+	if req.Markitdown.PythonPath != "" {
+		if err := s.App.Config.Set("markitdown.pythonPath", req.Markitdown.PythonPath); err != nil {
+			return err
+		}
+	}
+	if req.Markitdown.Command != "" {
+		if err := s.App.Config.Set("markitdown.command", req.Markitdown.Command); err != nil {
+			return err
+		}
+	}
+
+	// 3. 保存 LLM 配置（含密钥与温度；仅在携带实质配置时保存 temperature，含 0）
+	if req.LLM != nil {
+		if req.LLM.BaseURL != "" {
+			if err := s.App.Config.Set("llm.baseUrl", req.LLM.BaseURL); err != nil {
+				return err
+			}
+		}
+		if req.LLM.APIKey != "" {
+			if err := s.App.Config.UpsertSecrets(req.LLM.APIKey, "", ""); err != nil {
+				return err
+			}
+		}
+		if req.LLM.Model != "" {
+			if err := s.App.Config.Set("llm.model", req.LLM.Model); err != nil {
+				return err
+			}
+		}
+		if req.LLM.BaseURL != "" || req.LLM.Model != "" {
+			if err := s.App.Config.Set("llm.temperature", req.LLM.Temperature); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 4. 保存 Embed 配置
+	if req.Embed.BaseURL != "" {
+		if err := s.App.Config.Set("embed.baseUrl", req.Embed.BaseURL); err != nil {
+			return err
+		}
+	}
+	if req.Embed.APIKey != "" {
+		if err := s.App.Config.UpsertSecrets("", req.Embed.APIKey, ""); err != nil {
+			return err
+		}
+	}
+	if req.Embed.Model != "" {
+		if err := s.App.Config.Set("embed.model", req.Embed.Model); err != nil {
+			return err
+		}
+	}
+	if req.Embed.Dimensions != 0 {
+		if err := s.App.Config.Set("embed.dimensions", float64(req.Embed.Dimensions)); err != nil {
+			return err
+		}
+	}
+
+	// 5. 保存 Rerank 配置
+	if req.Rerank.BaseURL != "" {
+		if err := s.App.Config.Set("rerank.baseUrl", req.Rerank.BaseURL); err != nil {
+			return err
+		}
+	}
+	if req.Rerank.APIKey != "" {
+		if err := s.App.Config.UpsertSecrets("", "", req.Rerank.APIKey); err != nil {
+			return err
+		}
+	}
+	if req.Rerank.Model != "" {
+		if err := s.App.Config.Set("rerank.model", req.Rerank.Model); err != nil {
+			return err
+		}
+	}
+
+	// 6. 重建工作区运行时（换代、排水、重监视、全量重建）
 	return s.App.RebuildWorkspace(req.Workspace)
 }
 
@@ -80,19 +257,21 @@ func (s *WorkspaceService) Init(req InitRequest) error {
 // ======================================================================
 
 // FileListRequest 文件列表请求
+// WindowHours 仅 Recent 使用：最近 N 小时内修改的文件（0 = 全部）
 type FileListRequest struct {
-	Status   string `json:"status"`
-	Tag      string `json:"tag"`
-	Page     int    `json:"page"`
-	PageSize int    `json:"pageSize"`
-	Sort     string `json:"sort"`
+	Status      string `json:"status"`
+	Tag         string `json:"tag"`
+	Page        int    `json:"page"`
+	PageSize    int    `json:"pageSize"`
+	Sort        string `json:"sort"`
+	WindowHours int64  `json:"windowHours"`
 }
 
 // FileListResponse 文件列表响应
 type FileListResponse struct {
-	Items      []*contract.FileInfo `json:"items"`
-	Total      int                  `json:"total"`
-	Page       int                  `json:"page"`
+	Items []*contract.FileInfo `json:"items"`
+	Total int                  `json:"total"`
+	Page  int                  `json:"page"`
 }
 
 // RecentFilesResponse 最近文件响应
@@ -101,7 +280,7 @@ type RecentFilesResponse struct {
 	Window int64                `json:"window"`
 }
 
-type FilesService struct { App *App }
+type FilesService struct{ App *App }
 
 func (s *FilesService) List(req FileListRequest) (*FileListResponse, error) {
 	files, total, err := s.App.Storage.FilesList(req.Status, req.Tag, req.Page, req.PageSize, req.Sort)
@@ -112,11 +291,20 @@ func (s *FilesService) List(req FileListRequest) (*FileListResponse, error) {
 }
 
 func (s *FilesService) Recent(req FileListRequest) (*RecentFilesResponse, error) {
-	files, err := s.App.Storage.FilesRecent(int64(req.PageSize), req.PageSize)
+	limit := req.PageSize
+	if limit <= 0 {
+		limit = 50
+	}
+	// 时间窗换算：windowHours>0 时取 now-window 之前的修改时间；0 = 全部
+	var sinceMs int64
+	if req.WindowHours > 0 {
+		sinceMs = time.Now().UnixMilli() - req.WindowHours*3600*1000
+	}
+	files, err := s.App.Storage.FilesRecent(sinceMs, limit)
 	if err != nil {
 		return nil, err
 	}
-	return &RecentFilesResponse{Items: files, Window: int64(req.PageSize)}, nil
+	return &RecentFilesResponse{Items: files, Window: req.WindowHours}, nil
 }
 
 func (s *FilesService) Get(id int64) (*contract.FileInfo, error) {
@@ -155,7 +343,7 @@ func (s *FilesService) Resolve(relPath string) (int64, error) {
 
 // RestoreFileRequest 恢复文件请求
 type RestoreFileRequest struct {
-	ID        int64  `json:"id"`
+	ID         int64  `json:"id"`
 	CommitHash string `json:"commitHash"`
 }
 
@@ -192,20 +380,20 @@ func (s *FilesService) Retry(id int64) error {
 
 // SearchRequest 搜索请求
 type SearchRequest struct {
-	Q       string   `json:"q"`
-	Tag     string   `json:"tag"`
-	Page    int      `json:"page"`
+	Q         string   `json:"q"`
+	Tag       string   `json:"tag"`
+	Page      int      `json:"page"`
 	TagFilter []string `json:"tagFilter"`
 }
 
 // SearchResponse 搜索响应
 type SearchResponse struct {
-	Items  []*contract.SearchResult `json:"items"`
-	Total  int                      `json:"total"`
-	Page   int                      `json:"page"`
+	Items []*contract.SearchResult `json:"items"`
+	Total int                      `json:"total"`
+	Page  int                      `json:"page"`
 }
 
-type SearchService struct { App *App }
+type SearchService struct{ App *App }
 
 func (s *SearchService) Search(req SearchRequest) (*SearchResponse, error) {
 	tagFilter := []string{}
@@ -226,7 +414,7 @@ func (s *SearchService) Search(req SearchRequest) (*SearchResponse, error) {
 // IndexService 索引服务
 // ======================================================================
 
-type IndexService struct { App *App }
+type IndexService struct{ App *App }
 
 func (s *IndexService) Reindex() error {
 	return s.App.TriggerReindex()
@@ -248,8 +436,8 @@ type BrowseDirResponse struct {
 
 // BrowseSearchRequest 文件搜索请求
 type BrowseSearchRequest struct {
-	Q      string `json:"q"`
-	Limit  int    `json:"limit"`
+	Q     string `json:"q"`
+	Limit int    `json:"limit"`
 }
 
 // BrowseSearchResponse 文件搜索响应
@@ -268,7 +456,7 @@ type PickDirectoryResult struct {
 	Path string `json:"path"`
 }
 
-type BrowseService struct { App *App }
+type BrowseService struct{ App *App }
 
 func (s *BrowseService) Dir(req BrowseDirRequest) (*BrowseDirResponse, error) {
 	entries, err := s.App.Browser.ListDir(s.App.wsPath, req.Path)
@@ -290,28 +478,26 @@ func (s *BrowseService) OpenFile(relPath string) error {
 	return s.App.Browser.OpenFile(s.App.wsPath, relPath)
 }
 
-func (s *BrowseService) PickDir(initial string) (*PickDirectoryResult, error) {
-	// 使用原生目录选择对话框，超时 3 分钟
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	type pickResult struct {
-		path string
-		err  error
+type PickDirRequest struct {
+	Initial string `json:"initial"`
+	Kind    string `json:"kind"`
+}
+
+func (s *BrowseService) PickDir(req PickDirRequest) (*PickDirectoryResult, error) {
+	var path string
+	var err error
+	switch req.Kind {
+	case "python":
+		path, err = s.App.Browser.PickFile("选择 Python 解释器", []string{".exe"}, "")
+	case "exe":
+		path, err = s.App.Browser.PickFile("选择可执行文件", []string{".exe"}, req.Initial)
+	default:
+		path, err = s.App.Browser.PickDirectory(req.Initial)
 	}
-	ch := make(chan pickResult, 1)
-	go func() {
-		p, err := s.App.Browser.PickDirectory(initial)
-		ch <- pickResult{path: p, err: err}
-	}()
-	select {
-	case res := <-ch:
-		if res.err != nil {
-			return nil, res.err
-		}
-		return &PickDirectoryResult{Path: res.path}, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("目录选择超时")
+	if err != nil {
+		return nil, err
 	}
+	return &PickDirectoryResult{Path: path}, nil
 }
 
 // ======================================================================
@@ -328,7 +514,7 @@ type TagSuggestionsResponse struct {
 	Suggestions []*contract.TagSuggestion `json:"suggestions"`
 }
 
-type TagsService struct { App *App }
+type TagsService struct{ App *App }
 
 func (s *TagsService) List() (*TagsListResponse, error) {
 	tags, err := s.App.Tag.ListLibrary()
@@ -374,15 +560,22 @@ type QAStreamRequest struct {
 	Mode      string `json:"mode"`
 	FileID    int64  `json:"fileId"`
 	SessionID int64  `json:"sessionId"`
+	// RequestID 前端生成的流式事件 id（qa:chunk:<id> / qa:done:<id> / qa:error:<id>）。
+	// 事件名是"前端订阅名 vs 后端 emit 名"的双向握手协议，id 必须由同一侧生成并回传，
+	// 否则前后端各自生成、永不匹配（修复：问答事件收不到、sending 卡死）。
+	RequestID string `json:"requestId"`
 }
 
 // QADoneResult 流式问答完成结果
 type QADoneResult struct {
-	SessionID int64            `json:"sessionId"`
+	SessionID int64               `json:"sessionId"`
 	Sources   []contract.QASource `json:"sources"`
+	// Answer 仅当流式返回为空、后端用非流式重试兜底时携带完整回答；
+	// 正常流式路径前端已通过 chunk 拿到全部内容，本字段为空。
+	Answer string `json:"answer,omitempty"`
 }
 
-type QAService struct { App *App }
+type QAService struct{ App *App }
 
 func (s *QAService) Sessions() (*QASessionsResponse, error) {
 	sessions, err := s.App.QA.Sessions()
@@ -427,14 +620,75 @@ func (s *QAService) AskStream(req QAStreamRequest, _ string) error {
 		}
 	}()
 	chunks, done := s.App.QA.AskStream(askReq, cancelCh)
-	id := fmt.Sprintf("%d-%d", time.Now().UnixNano(), req.FileID)
+	id := req.RequestID
+	if id == "" {
+		id = fmt.Sprintf("%d-%d", time.Now().UnixNano(), req.FileID)
+	}
 	prefixChunk := "qa:chunk:" + id
 	prefixDone := "qa:done:" + id
 	prefixError := "qa:error:" + id
 
-	for chunk := range chunks {
-		emit(prefixChunk, chunk)
+	// B2：chunk 聚合——小 chunk 按 30ms / 32 字符缓冲后一次性 emit，
+	// 减少高频 Wails 跨边界事件次数；__STAGE__ 阶段事件立即透出，不缓冲。
+	const chunkBatchInterval = 30 * time.Millisecond
+	const chunkBatchSize = 32
+
+	ticker := time.NewTicker(chunkBatchInterval)
+	defer ticker.Stop()
+	var buf strings.Builder
+	var bufMu sync.Mutex
+
+	flushAndEmit := func() {
+		bufMu.Lock()
+		if buf.Len() > 0 {
+			val := buf.String()
+			buf.Reset()
+			bufMu.Unlock()
+			emit(prefixChunk, val)
+		} else {
+			bufMu.Unlock()
+		}
 	}
+
+	var drainWg sync.WaitGroup
+	drainCh := make(chan struct{})
+	drainWg.Add(1)
+	go func() {
+		defer drainWg.Done()
+		for {
+			select {
+			case <-ticker.C:
+				flushAndEmit()
+			case <-drainCh:
+				flushAndEmit()
+				return
+			}
+		}
+	}()
+
+	for chunk := range chunks {
+		// __STAGE__ / THINK 阶段/思考事件：立即透出，不进入聚合缓冲。
+		// __STAGE__：首屏反馈（A1/B4）；THINK：推理模型思维链（前端按前缀过滤到 thinking 区）。
+		// 二者都不应进入正文缓冲——思考块与正文混批 emit 会使前端 startsWith(THINK_PREFIX)
+		// 判归属失效，正文漏进思考区 / 思考漏进正文（B2 边界风险）。
+		if strings.HasPrefix(chunk, "__STAGE__:") || strings.HasPrefix(chunk, contract.ThinkChunkPrefix) {
+			emit(prefixChunk, chunk)
+			continue
+		}
+		bufMu.Lock()
+		buf.WriteString(chunk)
+		if buf.Len() >= chunkBatchSize {
+			val := buf.String()
+			buf.Reset()
+			bufMu.Unlock()
+			emit(prefixChunk, val)
+		} else {
+			bufMu.Unlock()
+		}
+	}
+	close(drainCh)
+	drainWg.Wait()
+
 	res := <-done
 	if res.Error != "" {
 		emit(prefixError, res.Error)
@@ -443,6 +697,7 @@ func (s *QAService) AskStream(req QAStreamRequest, _ string) error {
 	emit(prefixDone, &QADoneResult{
 		SessionID: res.SessionID,
 		Sources:   res.Sources,
+		Answer:    res.Answer,
 	})
 	return nil
 }
@@ -457,6 +712,7 @@ func emit(name string, data interface{}) {
 	}
 	app.Event.Emit(name, data)
 }
+
 // ======================================================================
 // StatsService 统计服务
 // ======================================================================
@@ -470,8 +726,8 @@ type StatsRequest struct {
 
 // StatsResponse 统计响应
 type StatsResponse struct {
-	Enabled  bool                     `json:"enabled"`
-	Metrics  *contract.StatsMetrics   `json:"metrics"`
+	Enabled bool                   `json:"enabled"`
+	Metrics *contract.StatsMetrics `json:"metrics"`
 }
 
 // SetStatsEnabledRequest
@@ -479,7 +735,7 @@ type SetStatsEnabledRequest struct {
 	Enabled bool `json:"enabled"`
 }
 
-type StatsService struct { App *App }
+type StatsService struct{ App *App }
 
 func (s *StatsService) Get(req StatsRequest) (*StatsResponse, error) {
 	rng := &contract.StatsRange{Range: req.Range, From: req.From, To: req.To}
@@ -513,10 +769,10 @@ func (s *StatsService) Purge() error {
 
 // AutoCommitResult 自动提交结果
 type AutoCommitResult struct {
-	Skipped bool              `json:"skipped"`
-	Hash    string            `json:"hash,omitempty"`
-	Message string            `json:"message,omitempty"`
-	AI      string            `json:"ai,omitempty"`
+	Skipped bool   `json:"skipped"`
+	Hash    string `json:"hash,omitempty"`
+	Message string `json:"message,omitempty"`
+	AI      string `json:"ai,omitempty"`
 }
 
 // CommitFileStatus 提交文件状态
@@ -562,7 +818,7 @@ type CommitTreeAtResponse struct {
 	Files []*contract.VersionFile `json:"files"`
 }
 
-type CommitsService struct { App *App }
+type CommitsService struct{ App *App }
 
 func (s *CommitsService) AutoCommit() (*AutoCommitResult, error) {
 	hash, skipped, err := s.App.Git.CommitAuto(nil)
@@ -648,18 +904,18 @@ func (s *CommitsService) Diff(hash string) (*contract.DiffStat, error) {
 
 // UpdateSettingsResult 更新设置结果
 type UpdateSettingsResult struct {
-	RestartRequired  []string `json:"restartRequired"`
-	ReindexRequired  bool     `json:"reindexRequired"`
+	RestartRequired []string `json:"restartRequired"`
+	ReindexRequired bool     `json:"reindexRequired"`
 }
 
 // UpdateSecretsRequest 更新密钥请求
 type UpdateSecretsRequest struct {
-	LLMKey      string `json:"llmApiKey"`
-	EmbedKey    string `json:"embedApiKey"`
-	RerankKey   string `json:"rerankApiKey"`
+	LLMKey    string `json:"llmApiKey"`
+	EmbedKey  string `json:"embedApiKey"`
+	RerankKey string `json:"rerankApiKey"`
 }
 
-type SettingsService struct { App *App }
+type SettingsService struct{ App *App }
 
 func (s *SettingsService) Get() (map[string]interface{}, error) {
 	return s.App.Config.Snapshot(), nil
@@ -741,14 +997,23 @@ type LLMTestResult struct {
 
 // PythonDetectResult Python 探测结果
 type PythonDetectResult struct {
-	Path          string `json:"path"`
-	Ok            bool   `json:"ok"`
-	Version       string `json:"version,omitempty"`
-	MarkitdownCmd string `json:"markitdownCmd,omitempty"`
-	Error         string `json:"error,omitempty"`
+	Path              string `json:"path"`
+	Ok                bool   `json:"ok"`
+	Version           string `json:"version,omitempty"`
+	MarkitdownCmd     string `json:"markitdownCmd,omitempty"`
+	MarkitdownVersion string `json:"markitdownVersion,omitempty"`
+	Error             string `json:"error,omitempty"`
 }
 
-type TestService struct { App *App }
+// MarkitdownProbeResult MarkItDown 探测结果（版本 + 位置）
+type MarkitdownProbeResult struct {
+	Path    string `json:"path"`
+	Version string `json:"version,omitempty"`
+	Ok      bool   `json:"ok"`
+	Error   string `json:"error,omitempty"`
+}
+
+type TestService struct{ App *App }
 
 func (s *TestService) TestMarkItDown(req TestMarkItDownRequest) (*contract.ProbeResult, error) {
 	ok, msg := s.App.Extract.Probe(req.PythonPath, req.Command)
@@ -802,12 +1067,7 @@ func (s *TestService) DetectPython() (*PythonDetectResult, error) {
 			continue
 		}
 		if _, err := os.Stat(p); err == nil {
-			return &PythonDetectResult{
-				Path:          p,
-				Ok:            true,
-				Version:       probePyVersion(p),
-				MarkitdownCmd: formatMarkitdownCmd(p),
-			}, nil
+			return buildPythonDetectResult(p), nil
 		}
 	}
 
@@ -828,12 +1088,7 @@ func (s *TestService) DetectPython() (*PythonDetectResult, error) {
 					if entry.IsDir() && strings.HasPrefix(entry.Name(), "pythoncore-") {
 						candidate := filepath.Join(pythonDir, entry.Name(), "python.exe")
 						if _, err := os.Stat(candidate); err == nil {
-							return &PythonDetectResult{
-								Path:          candidate,
-								Ok:            true,
-								Version:       probePyVersion(candidate),
-								MarkitdownCmd: formatMarkitdownCmd(candidate),
-							}, nil
+							return buildPythonDetectResult(candidate), nil
 						}
 					}
 				}
@@ -845,12 +1100,7 @@ func (s *TestService) DetectPython() (*PythonDetectResult, error) {
 					if entry.IsDir() && strings.HasPrefix(entry.Name(), "Python") {
 						candidate := filepath.Join(programsDir, entry.Name(), "python.exe")
 						if _, err := os.Stat(candidate); err == nil {
-							return &PythonDetectResult{
-								Path:          candidate,
-								Ok:            true,
-								Version:       probePyVersion(candidate),
-								MarkitdownCmd: formatMarkitdownCmd(candidate),
-							}, nil
+							return buildPythonDetectResult(candidate), nil
 						}
 					}
 				}
@@ -865,12 +1115,7 @@ func (s *TestService) DetectPython() (*PythonDetectResult, error) {
 					if entry.IsDir() && strings.HasPrefix(entry.Name(), "Python") {
 						candidate := filepath.Join(pythonDir, entry.Name(), "python.exe")
 						if _, err := os.Stat(candidate); err == nil {
-							return &PythonDetectResult{
-								Path:          candidate,
-								Ok:            true,
-								Version:       probePyVersion(candidate),
-								MarkitdownCmd: formatMarkitdownCmd(candidate),
-							}, nil
+							return buildPythonDetectResult(candidate), nil
 						}
 					}
 				}
@@ -881,10 +1126,60 @@ func (s *TestService) DetectPython() (*PythonDetectResult, error) {
 	return &PythonDetectResult{Ok: false, Error: "未检测到 Python"}, nil
 }
 
-func formatMarkitdownCmd(path string) string {
-	// Windows 路径用反斜杠，需要转义
-	p := strings.ReplaceAll(filepath.ToSlash(path), `/`, `\\`)
-	return fmt.Sprintf(`"%s" -m markitdown "{file}"`, p)
+// buildPythonDetectResult 组装探测结果：附带 markitdown 可执行位置与版本
+func buildPythonDetectResult(pythonPath string) *PythonDetectResult {
+	return &PythonDetectResult{
+		Path:              pythonPath,
+		Ok:                true,
+		Version:           probePyVersion(pythonPath),
+		MarkitdownCmd:     probeMarkitdownExe(pythonPath),
+		MarkitdownVersion: probeMarkitdownVersion(pythonPath),
+	}
+}
+
+// ProbeMarkitdown 基于指定 Python（为空时自动探测）返回 markitdown 位置与版本
+func (s *TestService) ProbeMarkitdown(pythonPath string) (*MarkitdownProbeResult, error) {
+	if pythonPath == "" {
+		p, _ := s.DetectPython()
+		if p == nil || !p.Ok {
+			return &MarkitdownProbeResult{Ok: false, Error: "未检测到 Python，请先设置 Python 路径"}, nil
+		}
+		pythonPath = p.Path
+	}
+	exe := probeMarkitdownExe(pythonPath)
+	version := probeMarkitdownVersion(pythonPath)
+	if version == "" && exe == "" {
+		return &MarkitdownProbeResult{Ok: false, Error: "未检测到 MarkItDown，请确认已安装: pip install markitdown"}, nil
+	}
+	return &MarkitdownProbeResult{Ok: true, Path: exe, Version: version}, nil
+}
+
+// probeMarkitdownExe 返回与 python 同目录的 markitdown 可执行文件位置（不存在则空）
+func probeMarkitdownExe(pythonPath string) string {
+	if pythonPath == "" {
+		return ""
+	}
+	scriptsDir := filepath.Join(filepath.Dir(pythonPath), "Scripts")
+	exe := filepath.Join(scriptsDir, "markitdown.exe")
+	if _, err := os.Stat(exe); err == nil {
+		return exe
+	}
+	return ""
+}
+
+// probeMarkitdownVersion 通过 python 探测 markitdown 已装版本
+func probeMarkitdownVersion(pythonPath string) string {
+	if pythonPath == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, pythonPath, "-c", "import importlib.metadata as m; print(m.version('markitdown'))")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func probePyVersion(path string) string {
@@ -909,7 +1204,7 @@ type QueueStatusResponse struct {
 	Paused  bool `json:"paused"`
 }
 
-type QueueService struct { App *App }
+type QueueService struct{ App *App }
 
 func (s *QueueService) Status() (*QueueStatusResponse, error) {
 	running, pending, paused := s.App.TaskQueue.Status()
@@ -936,7 +1231,7 @@ type DiagnosticsInfo struct {
 	StorageOK  bool   `json:"storageOk"`
 }
 
-type DiagnosticsService struct { App *App }
+type DiagnosticsService struct{ App *App }
 
 func (s *DiagnosticsService) Info() (*DiagnosticsInfo, error) {
 	gen := ""

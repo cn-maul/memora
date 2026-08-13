@@ -92,10 +92,15 @@ export const useQAStore = defineStore('qa', () => {
   // 思考过程块前缀与后端 contract.ThinkChunkPrefix 一致（\x00MTHINK\x00），
   // 推理模型（SenseNova reasoning 等）思维链以该前缀标识，单独渲染、不计入回答
   const THINK_PREFIX = '\u0000MTHINK\u0000'
+  // A1/B4：阶段事件前缀，后端 __STAGE__:<stage> 透出的检索/生成阶段标记，不写入消息内容
+  const STAGE_PREFIX = '__STAGE__:'
   let pending = ''
   let thinkPending = ''
   let flushTimer: ReturnType<typeof setTimeout> | null = null
   let activeAsstMsg: QAMessage | null = null
+
+  // A1/B4：流式阶段的 UI 状态（retrieving→"正在检索文档…"，generating→"正在生成回答…"）
+  const thinking = ref<string>('')
 
   const flush = (seq: number) => {
     if (flushTimer) {
@@ -156,6 +161,16 @@ export const useQAStore = defineStore('qa', () => {
           params,
           (chunk) => {
             if (generation.value !== currentGen || mySeq !== sendSeq.value) return
+            // A1/B4：阶段事件（__STAGE__:<stage>）不写入消息内容，仅更新 thinking 状态
+            if (chunk.startsWith(STAGE_PREFIX)) {
+              const stage = chunk.slice(STAGE_PREFIX.length)
+              if (stage === 'retrieving') {
+                thinking.value = '正在检索文档…'
+              } else if (stage === 'generating') {
+                thinking.value = '正在生成回答…'
+              }
+              return
+            }
             if (chunk.startsWith(THINK_PREFIX)) {
               thinkPending += chunk.slice(THINK_PREFIX.length)
             } else {
@@ -174,6 +189,12 @@ export const useQAStore = defineStore('qa', () => {
           (result) => {
             if (generation.value !== currentGen || mySeq !== sendSeq.value) return
             flush(mySeq) // 立即刷新未写入的增量
+            thinking.value = '' // 流完成：清空阶段状态
+            // 流式为空、后端非流式重试兜底时：answer 携带完整回答，
+            // 此时无任何 chunk 输出，直接把占位消息补全（正常流式路径 answer 为空，无需处理）
+            if (result.answer && activeAsstMsg && !activeAsstMsg.content) {
+              activeAsstMsg.content = result.answer
+            }
             if (result.sessionId && !currentSessionId.value) {
               currentSessionId.value = result.sessionId
             }
@@ -259,6 +280,7 @@ export const useQAStore = defineStore('qa', () => {
     currentSessionId,
     messages,
     sending,
+    thinking,
     sessionsError,
     error,
     fetchSessions,

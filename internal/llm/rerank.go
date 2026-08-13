@@ -54,7 +54,7 @@ func (m *Module) Rerank(query string, documents []string) ([]float64, error) {
 		}
 
 		reqBody := rerankRequest{Model: model, Query: query, Documents: batch}
-		data, err := m.retry(func() ([]byte, error) {
+		data, err := m.retry(&m.rerankLimiter, func() ([]byte, error) {
 			return m.doRequest("POST", url, reqBody, apiKey)
 		})
 		if err != nil {
@@ -89,7 +89,7 @@ func (m *Module) Rerank(query string, documents []string) ([]float64, error) {
 
 // maxRerankRunes 重排单条文档截断上限（按 rune）：
 // 交叉编码器只取相关性信号，超长文本没必要完整送入，截断可显著降低请求体与超限概率。
-const maxRerankRunes = 800
+const maxRerankRunes = 1800
 
 // truncateRunes 按 rune 截断文本，避免切碎多字节字符
 func truncateRunes(s string, maxRunes int) string {
@@ -97,7 +97,8 @@ func truncateRunes(s string, maxRunes int) string {
 	if len(r) <= maxRunes {
 		return s
 	}
-	return string(r[:maxRunes])
+	half := maxRunes / 2
+	return string(r[:half]) + "..." + string(r[len(r)-half:])
 }
 
 // TestRerankWith 用临时配置测试重排端点，不依赖已保存配置。
@@ -111,7 +112,7 @@ func (m *Module) TestRerankWith(baseURL, apiKey, model string) error {
 	}
 	url := strings.TrimRight(baseURL, "/") + "/rerank"
 	reqBody := rerankRequest{Model: model, Query: "测试", Documents: []string{"测试文档一", "测试文档二"}}
-	data, err := m.retry(func() ([]byte, error) {
+	data, err := m.retry(&m.rerankLimiter, func() ([]byte, error) {
 		return m.doRequest("POST", url, reqBody, apiKey)
 	})
 	if err != nil {

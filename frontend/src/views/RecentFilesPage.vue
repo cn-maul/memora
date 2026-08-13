@@ -427,11 +427,6 @@ function formatTime(ms?: number) {
       </template>
     </template>
     <div v-else-if="!ws.info" class="loading">加载工作区信息…</div>
-    <div v-else class="empty-state">
-      <span class="empty-state__title">还没有选择要管理的文件夹</span>
-      <span class="empty-state__desc">选好文件夹后，这里会显示最近修改的文件</span>
-      <button class="btn btn-primary btn-sm" style="margin-top: 12px" @click="router.push('/settings')">去设置</button>
-    </div>
 
     <!-- 文件详情弹窗（共享组件：版本历史 + 下载 + 恢复） -->
     <FileHistoryDialog

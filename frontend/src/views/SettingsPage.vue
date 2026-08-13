@@ -31,12 +31,12 @@ const {
   rerankUseSelect,
 } = providers
 const {
-  pythonPath,
-  command,
-  markitdownCmd,
   pythonDetected,
   pythonDetecting,
   pythonDetectError,
+  markitdownDetected,
+  markitdownDetecting,
+  markitdownDetectError,
   workspacePath,
   scanIntervalSec,
   recentWindowHours,
@@ -58,6 +58,7 @@ const {
   initialize,
   retryLoadSettings,
   runPythonDetect,
+  runMarkitdownDetect,
   handleSaveSecrets,
   handleSaveSettings,
   handleInitWorkspace,
@@ -295,39 +296,41 @@ onUnmounted(() => {
               <div class="settings-row">
                 <div class="settings-row__text">
                   <div class="settings-row__title">Python 路径</div>
-                  <div class="settings-row__desc">指向可调用 markitdown 的 Python 解释器</div>
+                  <div class="settings-row__desc">本机 Python 解释器，用于运行 MarkItDown</div>
                 </div>
                 <div class="settings-row__control settings-row__control--wide python-control">
-                  <div v-if="pythonDetected && pythonDetected.ok" class="python-detected-chip">
-                    <span class="python-detected-chip__dot python-detected-chip__dot--ok"></span>
-                    <span class="python-detected-chip__info">
-                      <span class="python-detected-chip__version">Python {{ pythonDetected.version }}</span>
-                      <span class="python-detected-chip__path" :title="pythonDetected.path">{{ pythonDetected.path }}</span>
-                    </span>
-                    <button class="python-detected-chip__refresh" title="重新检测" @click="runPythonDetect">
-                      <Icon name="refresh" :size="12" />
-                    </button>
-                  </div>
-                  <div v-else-if="pythonDetecting" class="python-detected-chip">
-                    <span class="python-detected-chip__dot python-detected-chip__dot--busy"></span>
-                    <span class="python-detected-chip__version">正在检测…</span>
-                  </div>
-                  <div v-else class="python-detected-chip">
-                    <span class="python-detected-chip__dot python-detected-chip__dot--err"></span>
-                    <span class="python-detected-chip__version">未检测到 Python</span>
-                    <button class="python-detected-chip__refresh" title="重新检测" @click="runPythonDetect">
-                      <Icon name="refresh" :size="12" />
-                    </button>
-                  </div>
-                  <div class="python-control__foot">
+                  <div class="python-control__main">
+                    <div v-if="pythonDetected && pythonDetected.ok" class="python-detected-chip">
+                      <span class="python-detected-chip__dot python-detected-chip__dot--ok"></span>
+                      <span class="python-detected-chip__info">
+                        <span class="python-detected-chip__version">
+                          <span class="python-detected-chip__version-name">Python</span>
+                          <span class="python-detected-chip__version-num">{{ pythonDetected.version }}</span>
+                        </span>
+                        <span class="python-detected-chip__path" :title="pythonDetected.path">{{ pythonDetected.path }}</span>
+                      </span>
+                      <button class="python-detected-chip__refresh" title="重新检测" @click="runPythonDetect">
+                        <Icon name="refresh" :size="12" />
+                      </button>
+                    </div>
+                    <div v-else-if="pythonDetecting" class="python-detected-chip">
+                      <span class="python-detected-chip__dot python-detected-chip__dot--busy"></span>
+                      <span class="python-detected-chip__version">正在检测…</span>
+                    </div>
+                    <div v-else class="python-detected-chip">
+                      <span class="python-detected-chip__dot python-detected-chip__dot--err"></span>
+                      <span class="python-detected-chip__version">未检测到 Python</span>
+                      <button class="python-detected-chip__refresh" title="重新检测" @click="runPythonDetect">
+                        <Icon name="refresh" :size="12" />
+                      </button>
+                    </div>
                     <button
-                      class="btn btn-ghost btn-sm"
+                      class="btn btn-ghost btn-sm python-control__pick"
                       :disabled="pickingPython"
                       @click="pickPythonDir"
                     >
                       {{ pickingPython ? '选择中…' : '手动选择' }}
                     </button>
-                    <span v-if="pythonPath" class="settings-row__hint" :title="pythonPath">当前 Python：{{ pythonPath }}</span>
                   </div>
                 </div>
               </div>
@@ -335,44 +338,47 @@ onUnmounted(() => {
 
               <div class="settings-row">
                 <div class="settings-row__text">
-                  <div class="settings-row__title">MarkItDown 路径</div>
-                  <div class="settings-row__desc">直接指定 markitdown 可执行文件路径（优先于 Python 路径），留空则使用 Python 命令</div>
+                  <div class="settings-row__title">MarkItDown</div>
+                  <div class="settings-row__desc">文档转 Markdown 提取工具</div>
                 </div>
-                <div class="settings-row__control settings-row__control--wide">
-                  <input
-                    v-model="markitdownCmd"
-                    class="input"
-                    placeholder="如 C:\Python312\Scripts\markitdown.exe，或 python -m markitdown"
-                  />
-                  <button
-                    class="btn btn-ghost btn-sm"
-                    :disabled="pickingMd"
-                    @click="pickMarkitdownExe"
-                  >
-                    {{ pickingMd ? '选择中…' : '浏览' }}
-                  </button>
-                </div>
-              </div>
-              <span v-if="mdPickError" class="settings-row__error">{{ mdPickError }}</span>
-
-              <details class="settings-advanced">
-                <summary>高级选项（一般无需修改）</summary>
-                <div class="settings-advanced__body">
-                  <div class="settings-row">
-                    <div class="settings-row__text">
-                      <div class="settings-row__title">命令模板</div>
-                      <div class="settings-row__desc">使用 <code>{file}</code> 占位表示待提取文件路径</div>
+                <div class="settings-row__control settings-row__control--wide python-control">
+                  <div class="python-control__main">
+                    <div v-if="markitdownDetected && markitdownDetected.ok" class="python-detected-chip">
+                      <span class="python-detected-chip__dot python-detected-chip__dot--ok"></span>
+                      <span class="python-detected-chip__info">
+                        <span class="python-detected-chip__version">
+                          <span class="python-detected-chip__version-name">MarkItDown</span>
+                          <span class="python-detected-chip__version-num">{{ markitdownDetected.version || '已手动选择' }}</span>
+                        </span>
+                        <span class="python-detected-chip__path" :title="markitdownDetected.path || '随 Python 使用'">{{ markitdownDetected.path || '随 Python 使用' }}</span>
+                      </span>
+                      <button class="python-detected-chip__refresh" title="重新检测" @click="runMarkitdownDetect">
+                        <Icon name="refresh" :size="12" />
+                      </button>
                     </div>
-                    <div class="settings-row__control settings-row__control--wide">
-                      <input
-                        v-model="command"
-                        class="input"
-                        placeholder='python -m markitdown "{file}"'
-                      />
+                    <div v-else-if="markitdownDetecting" class="python-detected-chip">
+                      <span class="python-detected-chip__dot python-detected-chip__dot--busy"></span>
+                      <span class="python-detected-chip__version">正在检测…</span>
                     </div>
+                    <div v-else class="python-detected-chip">
+                      <span class="python-detected-chip__dot python-detected-chip__dot--err"></span>
+                      <span class="python-detected-chip__version">未检测到 MarkItDown</span>
+                      <button class="python-detected-chip__refresh" title="重新检测" @click="runMarkitdownDetect">
+                        <Icon name="refresh" :size="12" />
+                      </button>
+                    </div>
+                    <button
+                      class="btn btn-ghost btn-sm python-control__pick"
+                      :disabled="pickingMd"
+                      @click="pickMarkitdownExe"
+                    >
+                      {{ pickingMd ? '选择中…' : '手动选择' }}
+                    </button>
                   </div>
                 </div>
-              </details>
+              </div>
+              <span v-if="markitdownDetectError" class="settings-row__error">{{ markitdownDetectError }}</span>
+              <span v-if="mdPickError" class="settings-row__error">{{ mdPickError }}</span>
 
               <div class="settings-row settings-row--action">
                 <div class="settings-row__text"></div>
@@ -521,27 +527,42 @@ onUnmounted(() => {
                   <div class="settings-row__title">模型</div>
                   <div class="settings-row__desc">点「获取模型」拉取该服务的可用模型，从下拉选择</div>
                 </div>
-                <div class="settings-row__control settings-row__control--wide">
-                  <select
-                    v-if="embedUseSelect"
-                    v-model="embed.state.model"
-                    class="select"
-                  >
-                    <option v-for="m in embedModelOptions" :key="m" :value="m">{{ m }}</option>
-                  </select>
-                  <input
-                    v-else
-                    v-model="embed.state.model"
-                    class="input"
-                    placeholder="text-embedding-3-small"
-                  />
-                  <button
-                    class="btn btn-ghost btn-sm"
-                    :disabled="fetchingModels === 'embed'"
-                    @click="handleFetchModels('embed')"
-                  >
-                    {{ fetchingModels === 'embed' ? '获取中…' : '获取模型' }}
-                  </button>
+                <div class="settings-row__control settings-row__control--wide python-control">
+                  <div class="python-detected-chip model-chip">
+                    <span
+                      class="python-detected-chip__dot"
+                      :class="embed.state.model ? 'python-detected-chip__dot--ok' : 'python-detected-chip__dot--warn'"
+                    ></span>
+                    <span
+                      class="python-detected-chip__version"
+                      :class="{ 'python-detected-chip__version--warn': !embed.state.model }"
+                      :title="embed.state.model || '未选择模型'"
+                    >
+                      {{ embed.state.model || '未选择模型' }}
+                    </span>
+                  </div>
+                  <div class="python-control__foot">
+                    <select
+                      v-if="embedUseSelect"
+                      v-model="embed.state.model"
+                      class="select"
+                    >
+                      <option v-for="m in embedModelOptions" :key="m" :value="m">{{ m }}</option>
+                    </select>
+                    <input
+                      v-else
+                      v-model="embed.state.model"
+                      class="input"
+                      placeholder="text-embedding-3-small"
+                    />
+                    <button
+                      class="btn btn-ghost btn-sm"
+                      :disabled="fetchingModels === 'embed'"
+                      @click="handleFetchModels('embed')"
+                    >
+                      {{ fetchingModels === 'embed' ? '获取中…' : '获取模型' }}
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -643,27 +664,42 @@ onUnmounted(() => {
                   <div class="settings-row__title">模型</div>
                   <div class="settings-row__desc">点「获取模型」拉取该服务的可用模型，从下拉选择</div>
                 </div>
-                <div class="settings-row__control settings-row__control--wide">
-                  <select
-                    v-if="rerankUseSelect"
-                    v-model="rerank.state.model"
-                    class="select"
-                  >
-                    <option v-for="m in rerankModelOptions" :key="m" :value="m">{{ m }}</option>
-                  </select>
-                  <input
-                    v-else
-                    v-model="rerank.state.model"
-                    class="input"
-                    placeholder="Pro/BAAI/bge-reranker-v2-m3"
-                  />
-                  <button
-                    class="btn btn-ghost btn-sm"
-                    :disabled="fetchingModels === 'rerank'"
-                    @click="handleFetchModels('rerank')"
-                  >
-                    {{ fetchingModels === 'rerank' ? '获取中…' : '获取模型' }}
-                  </button>
+                <div class="settings-row__control settings-row__control--wide python-control">
+                  <div class="python-detected-chip model-chip">
+                    <span
+                      class="python-detected-chip__dot"
+                      :class="rerank.state.model ? 'python-detected-chip__dot--ok' : 'python-detected-chip__dot--warn'"
+                    ></span>
+                    <span
+                      class="python-detected-chip__version"
+                      :class="{ 'python-detected-chip__version--warn': !rerank.state.model }"
+                      :title="rerank.state.model || '未选择模型'"
+                    >
+                      {{ rerank.state.model || '未选择模型' }}
+                    </span>
+                  </div>
+                  <div class="python-control__foot">
+                    <select
+                      v-if="rerankUseSelect"
+                      v-model="rerank.state.model"
+                      class="select"
+                    >
+                      <option v-for="m in rerankModelOptions" :key="m" :value="m">{{ m }}</option>
+                    </select>
+                    <input
+                      v-else
+                      v-model="rerank.state.model"
+                      class="input"
+                      placeholder="Pro/BAAI/bge-reranker-v2-m3"
+                    />
+                    <button
+                      class="btn btn-ghost btn-sm"
+                      :disabled="fetchingModels === 'rerank'"
+                      @click="handleFetchModels('rerank')"
+                    >
+                      {{ fetchingModels === 'rerank' ? '获取中…' : '获取模型' }}
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -745,27 +781,42 @@ onUnmounted(() => {
                   <div class="settings-row__title">模型</div>
                   <div class="settings-row__desc">点「获取模型」拉取该服务的可用模型，从下拉选择</div>
                 </div>
-                <div class="settings-row__control settings-row__control--wide">
-                  <select
-                    v-if="llmUseSelect"
-                    v-model="chat.state.model"
-                    class="select"
-                  >
-                    <option v-for="m in llmModelOptions" :key="m" :value="m">{{ m }}</option>
-                  </select>
-                  <input
-                    v-else
-                    v-model="chat.state.model"
-                    class="input"
-                    placeholder="gpt-4o-mini"
-                  />
-                  <button
-                    class="btn btn-ghost btn-sm"
-                    :disabled="fetchingModels === 'chat'"
-                    @click="handleFetchModels('chat')"
-                  >
-                    {{ fetchingModels === 'chat' ? '获取中…' : '获取模型' }}
-                  </button>
+                <div class="settings-row__control settings-row__control--wide python-control">
+                  <div class="python-detected-chip model-chip">
+                    <span
+                      class="python-detected-chip__dot"
+                      :class="chat.state.model ? 'python-detected-chip__dot--ok' : 'python-detected-chip__dot--warn'"
+                    ></span>
+                    <span
+                      class="python-detected-chip__version"
+                      :class="{ 'python-detected-chip__version--warn': !chat.state.model }"
+                      :title="chat.state.model || '未选择模型'"
+                    >
+                      {{ chat.state.model || '未选择模型' }}
+                    </span>
+                  </div>
+                  <div class="python-control__foot">
+                    <select
+                      v-if="llmUseSelect"
+                      v-model="chat.state.model"
+                      class="select"
+                    >
+                      <option v-for="m in llmModelOptions" :key="m" :value="m">{{ m }}</option>
+                    </select>
+                    <input
+                      v-else
+                      v-model="chat.state.model"
+                      class="input"
+                      placeholder="gpt-4o-mini"
+                    />
+                    <button
+                      class="btn btn-ghost btn-sm"
+                      :disabled="fetchingModels === 'chat'"
+                      @click="handleFetchModels('chat')"
+                    >
+                      {{ fetchingModels === 'chat' ? '获取中…' : '获取模型' }}
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -1230,21 +1281,25 @@ onUnmounted(() => {
   color: var(--c-danger);
 }
 
-.settings-row__hint {
-  display: block;
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--c-text-tertiary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Python 路径控制区：检测结果 / 按钮 / 提示 竖排，避免挤在一行 */
+/* Python 路径控制区：检测结果 / 按钮 横排，避免挤出 */
 .python-control {
   flex-direction: column;
   align-items: stretch;
   gap: 6px;
+}
+.python-control__main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.python-control__main .python-detected-chip {
+  flex: 1;
+  margin-bottom: 0;
+  width: auto;
+}
+.python-control__pick {
+  flex-shrink: 0;
 }
 .python-control__foot {
   display: flex;
@@ -1252,10 +1307,9 @@ onUnmounted(() => {
   gap: 10px;
   min-width: 0;
 }
-.python-control__foot .settings-row__hint {
+.python-control__foot .select {
   flex: 1;
-  min-width: 0;
-  margin-top: 0;
+  width: auto;
 }
 
 .settings-row__msg {
@@ -1345,23 +1399,62 @@ onUnmounted(() => {
 .python-detected-chip__info {
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: 2px;
   min-width: 0;
   flex: 1;
 }
 .python-detected-chip__version {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   font-weight: 700;
   color: var(--c-success);
   font-size: 13px;
   white-space: nowrap;
+  flex-wrap: nowrap;
+  max-width: 100%;
+  width: 66.666%;
+  min-width: 0;
+  overflow: hidden;
+}
+.python-detected-chip__version-name {
+  flex-shrink: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.python-detected-chip__version-num {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.python-detected-chip__version--warn {
+  color: var(--c-warning);
+}
+.python-detected-chip__dot--warn {
+  background: var(--c-warning);
+  box-shadow: 0 0 0 3px var(--c-warning-soft);
 }
 .python-detected-chip__path {
+  max-width: 66.666%;
+  min-width: 0;
   color: var(--c-text-tertiary);
   font-family: var(--font-mono, monospace);
   font-size: 11.5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 模型 chip：与版本号一致显示，但模型名较长，用更宽的固定长度保证三块一致 */
+.model-chip .python-detected-chip__version {
+  display: block;
+  width: 24em;
+  text-overflow: ellipsis;
 }
 
 .settings-footer {

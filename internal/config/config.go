@@ -86,6 +86,9 @@ type Module struct {
 	cfg    *Config
 	path   string // config.json 绝对路径
 	events EventBus
+	// credStore 凭据存储（DPAPI/兜底）。注入后 UpsertSecrets 将密钥写入凭据存储，
+	// config.json 不再落明文（修复：此前只写 config 明文，凭据存储有旧值时新密钥被忽略）。
+	credStore credstore.Store
 }
 
 // EventBus config 模块使用的事件接口（避免 import events 包）
@@ -125,7 +128,7 @@ func defaultConfig() *Config {
 	c.Index.ScanIntervalSec = 60                   // 低频 reconcile 兜底间隔（P2-16）：实时变更由 watcher 驱动，全盘扫描仅作低频 reconcile
 	c.Recent.WindowHours = 24                      // 最近文件默认展示"最近 24 小时"内修改的文件
 	c.Rerank.Model = "Pro/BAAI/bge-reranker-v2-m3" // 重排模型默认值（SiliconFlow）
-	c.QA.MaxContextChars = 30000
+	c.QA.MaxContextChars = 8000
 	c.Stats.Enabled = true
 	c.Tray.Enabled = true
 	return c
@@ -596,20 +599,53 @@ func (m *Module) Snapshot() map[string]interface{} {
 }
 
 // UpsertSecrets 更新密钥（不回显）
+// 凭据存储已注入时写入凭据存储并清空 config 明文；未注入时回退 config 明文（保持可用）。
 func (m *Module) UpsertSecrets(llmKey, embedKey, rerankKey string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if llmKey != "" {
-		m.cfg.LLM.APIKey = llmKey
-	}
-	if embedKey != "" {
-		m.cfg.Embed.APIKey = embedKey
-	}
-	if rerankKey != "" {
-		m.cfg.Rerank.APIKey = rerankKey
+	if m.credStore != nil {
+		// 凭据存储优先：任一写入失败即返回错误（不回退明文，避免出现"config 有明文、credstore 有旧值"
+		// 导致新密钥不生效的静默不一致）。
+		if llmKey != "" {
+			if err := m.credStore.Set("llm", "api_key", llmKey); err != nil {
+				return fmt.Errorf("[config] 保存 LLM 密钥失败: %w", err)
+			}
+			m.cfg.LLM.APIKey = ""
+		}
+		if embedKey != "" {
+			if err := m.credStore.Set("embed", "api_key", embedKey); err != nil {
+				return fmt.Errorf("[config] 保存嵌入密钥失败: %w", err)
+			}
+			m.cfg.Embed.APIKey = ""
+		}
+		if rerankKey != "" {
+			if err := m.credStore.Set("rerank", "api_key", rerankKey); err != nil {
+				return fmt.Errorf("[config] 保存重排密钥失败: %w", err)
+			}
+			m.cfg.Rerank.APIKey = ""
+		}
+		// 标记迁移完成：凭据已入凭据库，启动时无需再迁移明文（即使失败也已在凭据库中）
+		_ = m.credStore.MarkPlaintextMigrated()
+	} else {
+		if llmKey != "" {
+			m.cfg.LLM.APIKey = llmKey
+		}
+		if embedKey != "" {
+			m.cfg.Embed.APIKey = embedKey
+		}
+		if rerankKey != "" {
+			m.cfg.Rerank.APIKey = rerankKey
+		}
 	}
 	return m.save()
+}
+
+// SetCredStore 注入凭据存储（装配层调用）。
+func (m *Module) SetCredStore(store credstore.Store) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.credStore = store
 }
 
 // MigrateSecretsToCredStore 将 config 中的明文 llm/embed/rerank api_key 迁移到凭据存储，

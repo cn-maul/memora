@@ -151,8 +151,8 @@ func TestExecuteStreamEmptyContextEmitsNotFound(t *testing.T) {
 	if resp.Answer != want {
 		t.Fatalf("answer=%q", resp.Answer)
 	}
-	if !reflect.DeepEqual(got, []string{want}) {
-		t.Fatalf("未找到文本未推给 sink: %v", got)
+	if !reflect.DeepEqual(got, []string{"__STAGE__:retrieving", want}) {
+		t.Fatalf("未找到文本未推给 sink（应含 stage + 未找到文本）: %v", got)
 	}
 	if resp.SessionID != 1 {
 		t.Fatalf("sessionId=%d", resp.SessionID)
@@ -164,7 +164,7 @@ func TestExecuteStreamEmptyContextEmitsNotFound(t *testing.T) {
 func TestExecuteStreamCancelRollsBack(t *testing.T) {
 	st := &recordingStorage{fakeStorage: newFileStorage()}
 	ev := &fakeEvents{}
-	m := New(st, &seqLLM{stream: []string{"你", "好"}}, ev, 30000)
+	m := New(st, &seqLLM{stream: []string{"你", "好"}}, ev, 30000, "")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 预先取消，确定性触发取消分支
@@ -198,7 +198,7 @@ func TestExecuteStreamCancelRollsBack(t *testing.T) {
 func TestAskStreamCancelDeliversCanceled(t *testing.T) {
 	st := &recordingStorage{fakeStorage: newFileStorage()}
 	ev := &fakeEvents{}
-	m := New(st, &seqLLM{stream: []string{"你", "好"}}, ev, 30000)
+	m := New(st, &seqLLM{stream: []string{"你", "好"}}, ev, 30000, "")
 
 	cancel := make(chan struct{})
 	close(cancel) // 预先取消

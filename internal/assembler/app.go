@@ -58,6 +58,9 @@ func (Browser) SearchByName(workspace, query string, limit int) ([]*browser.Sear
 func (Browser) PickDirectory(initial string) (string, error) {
 	return browser.PickDirectory(initial)
 }
+func (Browser) PickFile(title string, filters []string, initial string) (string, error) {
+	return browser.PickFile(title, filters, initial)
+}
 func (Browser) OpenFile(workspace, relPath string) error {
 	return browser.OpenFile(workspace, relPath)
 }
@@ -79,6 +82,10 @@ type App struct {
 	Stats     *stats.Module
 	TaskQueue *taskqueue.Module
 	Browser   Browser
+
+	// A6：打标并发上限（默认 4），打标任务在该通道上排队执行，避免重建索引时
+	// 逐个同步调 LLM 把任务队列全部占满；超过上限的任务自动排队等待。
+	tagSem chan struct{}
 
 	runtime   *RuntimeManager // 工作区运行时管理器（generation / 原子交换）
 	credStore credstore.Store // 凭据存储（Windows DPAPI / 其他平台兜底）
@@ -126,6 +133,7 @@ func NewApp(ctx context.Context, configPath string) (*App, error) {
 		Events: evt,
 		ctx:    runCtx,
 		cancel: runCancel,
+		tagSem: make(chan struct{}, 4), // A6：默认 4 并发打标
 	}
 
 	// 4. 创建基础网关模块（LLM / Git），供工作区模块引用
@@ -145,6 +153,7 @@ func NewApp(ctx context.Context, configPath string) (*App, error) {
 	if cs, cerr := credstore.New(dataDir); cerr == nil {
 		app.credStore = cs
 		app.LLM.SetCredStore(cs)
+		app.Config.SetCredStore(cs)
 		if cs.HasPlaintextMigration() {
 			if merr := cfg.MigrateSecretsToCredStore(cs); merr != nil {
 				logx.Warn("app", "凭据迁移失败，密钥继续使用配置明文", "err", merr.Error())
@@ -250,9 +259,14 @@ func (a *App) buildRuntime(gen, dataDir, workspace string) (*Runtime, error) {
 	maxCtxVal, _ := cfg.Get("qa.maxContextChars")
 	mcc := asInt(maxCtxVal)
 	if mcc == 0 {
-		mcc = 30000
+		mcc = 8000
 	}
-	qm := qa.New(st, a.LLM, a.Events, mcc)
+	sysPromptVal, _ := cfg.Get("qa.systemPrompt")
+	sysPrompt := ""
+	if v, ok := sysPromptVal.(string); ok {
+		sysPrompt = v
+	}
+	qm := qa.New(st, a.LLM, a.Events, mcc, sysPrompt)
 
 	// 统计模块
 	sm := stats.New(a.Git, st, cfg)
@@ -392,10 +406,19 @@ func (a *App) createTaskHandler() taskqueue.TaskHandler {
 				if fileID, ok := asInt64(payload["fileId"]); ok && fileID > 0 {
 					file, err := a.Storage.FilesGet(fileID)
 					if err == nil && file != nil {
-						return a.Tag.ProcessFile(file)
+						// A6：打标改为异步执行 + 并发上限 4（tagSem 容量 4）。
+						// <a.tagSem 阻塞获取一个槽位（容量已满时排队等待），ProcessFile 完成后通过 defer 归还。
+						// 主 handler 循环不阻塞，确保 taskqueue 不会被单文件打标拖死。
+						go func(f *contract.FileInfo) {
+							defer func() { <-a.tagSem }() // 归还槽位
+							a.tagSem <- struct{}{}        // 获取槽位（容量满时阻塞排队）
+							_ = a.Tag.ProcessFile(f)
+						}(file)
+						return nil
 					}
 				}
 			}
+			return nil
 		case "summarize":
 			if payload, ok := task.Payload.(map[string]interface{}); ok {
 				if hash, ok := payload["commitHash"].(string); ok {

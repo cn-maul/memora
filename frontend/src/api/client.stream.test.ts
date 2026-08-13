@@ -1,215 +1,178 @@
-// askQuestionStream SSE 分帧 / EOF 测试（P1-06）。
-// 通过 mock 全局 fetch（vi.stubGlobal）注入构造的 SSE 流，覆盖：
-//   - 分帧解析（含跨 chunk 拼接半帧）
-//   - event: done / event: error 回调
-//   - 异常 EOF（无 done/error 直接结束 → 回调"连接中断，请重试"，不悬挂）
-//   - data: JSON 字符串增量块 → onChunk 解码
-//   - 非 2xx 信封错误、网络异常、中止
+// askQuestionStream 流式测试（Wails v3 事件模型）。
+// 当前实现不依赖 fetch/SSE：前端生成事件 id（qa:chunk:<id> / qa:done:<id> / qa:error:<id>），
+// 经 Events.On 订阅，后端在流结束时经 QAService.AskStream 调用与全局事件回推。
+// 本测试 mock @wailsio/runtime 的 Events 与绑定调用，模拟后端事件推送，覆盖：
+//   - chunk/done/error 回调与事件 id 握手
+//   - 后端流结束但未发 done/error → 回调"连接中断，请重试"（不悬挂）
+//   - 中止 → 「已取消」且事件订阅被清理
+//   - AskStream 传输层异常 → onError
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { askQuestionStream } from '@/api/client'
 
-const mockFetch = vi.fn()
+// 捕获 Events.On 注册的事件处理器（name → handler），便于测试端模拟后端推送。
+// 所有 mock 状态经 vi.hoisted 声明，避免 vi.mock 提升导致的 TDZ 报错。
+const h = vi.hoisted(() => {
+  const eventHandlers = new Map<string, (payload: any) => void>()
+  return {
+    eventHandlers,
+    eventsOn: vi.fn((name: string, cb: (payload: any) => void) => { eventHandlers.set(name, cb) }),
+    eventsOff: vi.fn((name: string) => { eventHandlers.delete(name) }),
+    mockAskStream: vi.fn(),
+  }
+})
 
-function encode(chunk: string | Uint8Array): Uint8Array {
-  if (typeof chunk === 'string') return new TextEncoder().encode(chunk)
-  return chunk
-}
+vi.mock('@wailsio/runtime', () => ({
+  Events: { On: h.eventsOn, Off: h.eventsOff },
+}))
 
-// 构造一个 SSE 响应流：start 时一次性推入所有 chunk 并关闭
-function makeStream(chunks: (string | Uint8Array)[]): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      for (const c of chunks) controller.enqueue(encode(c))
-      controller.close()
-    },
-  })
-}
-
-function respondWithStream(chunks: (string | Uint8Array)[]) {
-  mockFetch.mockResolvedValueOnce(new Response(makeStream(chunks), { status: 200 }))
-}
+vi.mock('../../bindings/memora/internal/assembler/qaservice.js', () => ({
+  AskStream: (...args: unknown[]) => h.mockAskStream(...args),
+}))
 
 beforeEach(() => {
-  mockFetch.mockReset()
-  vi.stubGlobal('fetch', mockFetch)
+  h.eventHandlers.clear()
+  h.eventsOn.mockClear()
+  h.eventsOff.mockClear()
+  h.mockAskStream.mockReset()
+  h.mockAskStream.mockResolvedValue(undefined)
 })
 
 afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+type DoneCb = (result: { sessionId: number; sources: any[]; answer?: string }) => void
+
 interface StreamResult {
   chunks: string[]
-  done: (result: { sessionId: number; sources: any[] }) => void
+  done: ReturnType<typeof vi.fn<DoneCb>>
   errors: string[]
 }
 
-// 调用 askQuestionStream，收集回调并返回便于断言的句柄
-function runStream(chunks: (string | Uint8Array)[]): Promise<StreamResult> {
-  const result: StreamResult = { chunks: [], done: vi.fn<(result: { sessionId: number; sources: any[] }) => void>(), errors: [] }
-  respondWithStream(chunks)
-  const p = askQuestionStream(
+// 按前缀找到注册的处理器（事件 id 由实现内部生成，测试通过前缀定位）
+function handlerFor(prefix: string): { name: string; handler: (payload: any) => void } | null {
+  for (const [name, handler] of h.eventHandlers) {
+    if (name.startsWith(prefix)) return { name, handler }
+  }
+  return null
+}
+
+function emit(prefix: 'qa:chunk:' | 'qa:done:' | 'qa:error:', payload: any) {
+  const f = handlerFor(prefix)
+  if (!f) throw new Error(`未找到 ${prefix} 事件订阅`)
+  f.handler(payload)
+}
+
+// 发起一次流式请求，返回回调收集句柄与"模拟后端事件推送"的闭包
+function runStream(): { result: StreamResult; emit: (prefix: 'qa:chunk:' | 'qa:done:' | 'qa:error:', payload: any) => void; signal: AbortController } {
+  const result: StreamResult = { chunks: [], done: vi.fn(), errors: [] }
+  const ctrl = new AbortController()
+  askQuestionStream(
     { question: 'q', mode: 'chat' },
     (c) => result.chunks.push(c),
     result.done,
     (e) => result.errors.push(e),
-    new AbortController().signal,
+    ctrl.signal,
   )
-  return p.then(() => result)
+  return { result, emit, signal: ctrl }
 }
 
-describe('askQuestionStream SSE 分帧解析', () => {
-  it('完整帧解析：event: done → onDone 收到 sessionId/sources', async () => {
-    const result = await runStream(['event: done\ndata: {"sessionId":7,"sources":[{"fileId":1}]}\n\n'])
-    expect(result.chunks).toEqual([])
-    expect(result.done).toHaveBeenCalledTimes(1)
-    expect(result.done).toHaveBeenCalledWith({ sessionId: 7, sources: [{ fileId: 1 }] })
+describe('askQuestionStream 事件订阅', () => {
+  it('订阅 qa:chunk:/qa:done:/qa:error: 三组事件，并把 requestId 随 AskStream 回传', async () => {
+    const { result, emit } = runStream()
+    // 事件 id 由实现内部生成，三个事件必须共享同一 id（同源握手）
+    const chunk = handlerFor('qa:chunk:')
+    const done = handlerFor('qa:done:')
+    const error = handlerFor('qa:error:')
+    expect(chunk).not.toBeNull()
+    expect(done).not.toBeNull()
+    expect(error).not.toBeNull()
+    const id = chunk!.name.replace('qa:chunk:', '')
+    expect(done!.name).toBe('qa:done:' + id)
+    expect(error!.name).toBe('qa:error:' + id)
+    // AskStream 已携带 requestId 调用
+    expect(h.mockAskStream).toHaveBeenCalledTimes(1)
+    const [req] = h.mockAskStream.mock.calls[0]
+    expect(req.requestId).toBe(id)
+
+    emit('qa:done:', { sessionId: 7, sources: [{ fileId: 1 }] })
+    expect(result.done).toHaveBeenCalledWith({ sessionId: 7, sources: [{ fileId: 1 }], answer: '' })
     expect(result.errors).toEqual([])
   })
 
-  it('跨 chunk 拼接：半帧拆在两个 chunk 中也能正确解析', async () => {
-    const result = await runStream([
-      'event: done\ndata: {"se', // 前半帧
-      'ssionId":7,"sources":[{"fileId":1}]}\n\n', // 后半帧补全
-    ])
-    expect(result.done).toHaveBeenCalledWith({ sessionId: 7, sources: [{ fileId: 1 }] })
-    expect(result.errors).toEqual([])
-  })
-
-  it('跨 chunk 拼接：一个 chunk 含多帧 + 尾部半帧延后补全', async () => {
-    const result = await runStream([
-      'event: message\ndata: "你好"\n\nevent: mess', // 完整帧 + 下一帧开头
-      'age\ndata: "世界"\n\nevent: done\ndata: {"sessionId":3,"sources":[]}\n\n', // 补全
-    ])
-    expect(result.chunks).toEqual(['你好', '世界'])
-    expect(result.done).toHaveBeenCalledWith({ sessionId: 3, sources: [] })
-    expect(result.errors).toEqual([])
-  })
-
-  it('data: JSON 字符串增量块 → onChunk 拿到解码后的文本', async () => {
-    const result = await runStream([
-      'event: message\ndata: "你好，"\n\n',
-      'event: message\ndata: "世界"\n\n',
-      'event: done\ndata: {"sessionId":9,"sources":[]}\n\n',
-    ])
+  it('chunk 事件 → onChunk 收到原始文本', async () => {
+    const { result, emit } = runStream()
+    emit('qa:chunk:', '你好，')
+    emit('qa:chunk:', '世界')
+    emit('qa:done:', { sessionId: 3, sources: [] })
     expect(result.chunks).toEqual(['你好，', '世界'])
-    expect(result.done).toHaveBeenCalledWith({ sessionId: 9, sources: [] })
-    expect(result.errors).toEqual([])
+    expect(result.done).toHaveBeenCalledWith({ sessionId: 3, sources: [], answer: '' })
   })
 
-  it('event: error → onError 收到解码后的错误文案', async () => {
-    const result = await runStream(['event: error\ndata: "模型暂时不可用，请稍后重试"\n\n'])
+  it('payload 走 {data: ...} 包装时也能解出内容', async () => {
+    const { result, emit } = runStream()
+    emit('qa:chunk:', { data: '包装块' })
+    emit('qa:done:', { data: { sessionId: 5, sources: [], answer: '重试答案' } })
+    expect(result.chunks).toEqual(['包装块'])
+    expect(result.done).toHaveBeenCalledWith({ sessionId: 5, sources: [], answer: '重试答案' })
+  })
+
+  it('error 事件 → onError 收到错误文案', async () => {
+    const { result, emit } = runStream()
+    emit('qa:error:', '模型暂时不可用，请稍后重试')
     expect(result.done).not.toHaveBeenCalled()
     expect(result.errors).toEqual(['模型暂时不可用，请稍后重试'])
   })
 
-  it('event: error 的 data 不是合法 JSON → 按协议错误提示', async () => {
-    const result = await runStream(['event: error\ndata: 服务异常直接明文\n\n'])
+  it('error 事件 payload 无内容 → 按协议错误提示', async () => {
+    const { result, emit } = runStream()
+    emit('qa:error:', {})
     expect(result.errors).toEqual(['连接中断，请重试'])
   })
 
-  it('done 的 data 不是合法 JSON → 协议错误，不静默当空结果', async () => {
-    const result = await runStream(['event: done\ndata: not-json\n\n'])
-    expect(result.done).not.toHaveBeenCalled()
-    expect(result.errors).toEqual(['连接中断，请重试'])
-  })
-})
-
-describe('askQuestionStream 异常 EOF（P1-06）', () => {
-  it('无 done/error 事件直接结束 → 回调"连接中断，请重试"而非悬挂', async () => {
-    const result = await runStream(['event: message\ndata: "只发了一半"\n\n'])
-    expect(result.chunks).toEqual(['只发了一半'])
-    expect(result.done).not.toHaveBeenCalled()
-    expect(result.errors).toEqual(['连接中断，请重试'])
+  it('done 事件后订阅被清理（Events.Off 三组）', async () => {
+    const { emit } = runStream()
+    emit('qa:done:', { sessionId: 1, sources: [] })
+    expect(h.eventsOff).toHaveBeenCalledTimes(3)
+    expect(h.eventHandlers.size).toBe(0)
   })
 
-  it('EOF 时缓冲区残留半帧 → 同样判定连接中断', async () => {
-    const result = await runStream(['event: message\ndata: "未'])
-    expect(result.chunks).toEqual([])
-    expect(result.done).not.toHaveBeenCalled()
-    expect(result.errors).toEqual(['连接中断，请重试'])
-  })
-
-  it('空流直接结束 → 连接中断', async () => {
-    const result = await runStream([])
-    expect(result.errors).toEqual(['连接中断，请重试'])
-  })
-
-  it('收到 done 后正常关闭 → 不触发额外错误', async () => {
-    const result = await runStream(['event: done\ndata: {"sessionId":1,"sources":[]}\n\n'])
-    expect(result.done).toHaveBeenCalledTimes(1)
+  it('收到 done 后不再触发额外错误', async () => {
+    const { result, emit } = runStream()
+    emit('qa:done:', { sessionId: 1, sources: [] })
+    await Promise.resolve()
     expect(result.errors).toEqual([])
   })
 })
 
-describe('askQuestionStream 传输层失败', () => {
-  it('非 2xx：解析统一信封并把 requestId 附在消息后', async () => {
-    const result: StreamResult = { chunks: [], done: vi.fn<(result: { sessionId: number; sources: any[] }) => void>(), errors: [] }
-    mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ code: 'llm_error', message: 'LLM 服务异常', requestId: 'req-123' }), {
-        status: 502,
-      }),
-    )
-    await askQuestionStream(
-      { question: 'q', mode: 'chat' },
-      (c) => result.chunks.push(c),
-      result.done,
-      (e) => result.errors.push(e),
-      new AbortController().signal,
-    )
-    expect(result.errors).toEqual(['LLM 服务异常（错误编号 req-123）'])
+describe('askQuestionStream 异常路径', () => {
+  it('AskStream 返回但未发 done/error（后端异常）→ 回调"连接中断，请重试"而非悬挂', async () => {
+    const { result } = runStream()
+    await new Promise((r) => setTimeout(r, 0))
     expect(result.done).not.toHaveBeenCalled()
+    expect(result.errors).toEqual(['连接中断，请重试'])
+    expect(h.eventHandlers.size).toBe(0)
   })
 
-  it('非 2xx 且非 JSON 正文 → 通用文案', async () => {
-    const result: StreamResult = { chunks: [], done: vi.fn<(result: { sessionId: number; sources: any[] }) => void>(), errors: [] }
-    mockFetch.mockResolvedValueOnce(new Response('<html>gateway error</html>', { status: 502 }))
-    await askQuestionStream(
-      { question: 'q', mode: 'chat' },
-      (c) => result.chunks.push(c),
-      result.done,
-      (e) => result.errors.push(e),
-      new AbortController().signal,
-    )
-    expect(result.errors).toEqual(['请求失败（502）'])
-  })
-
-  it('fetch 网络异常 → onError 收到友好提示', async () => {
-    const result: StreamResult = { chunks: [], done: vi.fn<(result: { sessionId: number; sources: any[] }) => void>(), errors: [] }
-    mockFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'))
-    await askQuestionStream(
-      { question: 'q', mode: 'chat' },
-      (c) => result.chunks.push(c),
-      result.done,
-      (e) => result.errors.push(e),
-      new AbortController().signal,
-    )
-    expect(result.errors).toEqual(['无法连接服务，请检查网络或稍后重试'])
-  })
-
-  it('请求中止 → onError 收到「已取消」', async () => {
-    const result: StreamResult = { chunks: [], done: vi.fn<(result: { sessionId: number; sources: any[] }) => void>(), errors: [] }
-    mockFetch.mockRejectedValueOnce(new DOMException('The operation was aborted.', 'AbortError'))
-    await askQuestionStream(
-      { question: 'q', mode: 'chat' },
-      (c) => result.chunks.push(c),
-      result.done,
-      (e) => result.errors.push(e),
-      new AbortController().signal,
-    )
+  it('请求中止 → onError 收到「已取消」且订阅清理', async () => {
+    const { result, signal } = runStream()
+    signal.abort()
+    await new Promise((r) => setTimeout(r, 0))
     expect(result.errors).toEqual(['已取消'])
+    expect(h.eventHandlers.size).toBe(0)
   })
 
-  it('响应体不可读 → onError 收到明确提示', async () => {
-    const result: StreamResult = { chunks: [], done: vi.fn<(result: { sessionId: number; sources: any[] }) => void>(), errors: [] }
-    mockFetch.mockResolvedValueOnce({ ok: true, status: 200, headers: { get: () => null }, body: null })
-    await askQuestionStream(
-      { question: 'q', mode: 'chat' },
-      (c) => result.chunks.push(c),
-      result.done,
-      (e) => result.errors.push(e),
-      new AbortController().signal,
-    )
-    expect(result.errors).toEqual(['响应体不可读'])
+  it('AskStream 传输层异常 → onError 收到友好提示', async () => {
+    h.mockAskStream.mockRejectedValueOnce(new Error('聊天端点未配置'))
+    const { result } = runStream()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(result.errors).toEqual(['AI 助手还未连接，请到「设置 → AI 助手」里连接'])
+  })
+
+  it('AskStream 网络异常 → onError 收到网络提示', async () => {
+    h.mockAskStream.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const { result } = runStream()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(result.errors).toEqual(['无法连接服务，请检查网络或稍后重试'])
   })
 })

@@ -73,7 +73,8 @@ func (m *Module) SuggestCommitMessage() (string, error) {
 		return "", fmt.Errorf("[timeline] 当前没有未提交的变动")
 	}
 
-	system := "你是 Git 提交助手。根据下方列出的改动文件与内容摘要，用一句简洁的中文写出提交备注。要求：不超过 30 个汉字，不用引号，不解释，只输出备注本身。"
+	// C4：提交备注提示词（强调改动类型前缀 + 具体改动）
+	system := "你是 Git 提交助手。根据下方列出的改动文件与内容摘要，用一句中文写出提交备注。要求：①不超过 30 个汉字；②开头标明改动类型，用 [新增] [修改] [删除] [重构] [修复] [优化] [配置] [文档] 之一；③说明具体改了什么文件或功能，不写 完成/更新/修改 等空话；④不用引号，不解释，不列多行。示例：[新增] 添加用户登录模块；[修复] 修复文档索引 N+1 查询。只输出备注本身。"
 	user := diffText
 
 	opts := &contract.ChatOptions{
@@ -135,7 +136,7 @@ func (m *Module) GenerateSummary(commitHash string) (string, error) {
 	}
 
 	// 用 LLM 生成摘要
-	system := "你是版本记录助手。根据一次 Git 提交的文件改动，用 1~2 句中文总结这次提交做了什么。只输出总结文本，不要输出其他内容。"
+	system := "你是版本记录助手。根据一次 Git 提交的文件改动与改动统计，用 2~3 句中文总结这次提交。要求：①第一句说明改动范围和文件数量；②按文件分类简述每类文件的改动（新增/修改/删除）；③最后一句总结提交意图或影响；④不写 完成/更新/修改 等空话，只输出总结文本。"
 	user := fmt.Sprintf("修改文件：%s\n改动统计：新增 %d、修改 %d、删除 %d。",
 		filesChanged, stat.Added, stat.Modified, stat.Deleted)
 

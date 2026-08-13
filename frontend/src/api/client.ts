@@ -17,11 +17,62 @@ import * as TestService from '../../bindings/memora/internal/assembler/testservi
 import * as QueueService from '../../bindings/memora/internal/assembler/queueservice.js'
 
 import { AppError, ERROR_CODES } from '@/utils/errors'
+import type { InitRequest } from '@/types'
 
 export function translateApiError(msg: string): string {
-  if (msg.includes('canceled') || msg.includes('cancel')) return '操作已取消'
-  if (msg.includes('timeout')) return '请求超时'
-  return msg || '未知错误'
+  if (!msg || !msg.trim()) return '操作失败，请重试'
+  const m = msg.trim()
+  // 取消
+  if (m.includes('canceled') || m.includes('cancel') || m === '已取消') return '操作已取消'
+  // 网络 / 超时 / 连接失败
+  if (
+    m.includes('Network Error') ||
+    m.includes('timeout') ||
+    m.includes('无法连接') ||
+    m.includes('Failed to fetch') ||
+    m.includes('fetch failed') ||
+    m.includes('网络异常')
+  ) {
+    return '无法连接服务，请检查网络或稍后重试'
+  }
+  // 端点未配置 → 引导去设置对应区块
+  if (m.includes('聊天端点未配置') || m.includes('未配置聊天')) {
+    return 'AI 助手还未连接，请到「设置 → AI 助手」里连接'
+  }
+  if (m.includes('嵌入端点未配置') || m.includes('未配置嵌入')) {
+    return '「按内容搜索」还未连接，请到「设置 → 内容整理模型」里连接'
+  }
+  if (m.includes('重排端点未配置') || m.includes('未配置重排')) {
+    return '「排序优化」还未连接，请到「设置 → 排序优化」里连接'
+  }
+  // 工作区未初始化 → 引导去设置选择文件夹
+  if (m.includes('工作区未初始化') || m.includes('仓库未初始化') || m.includes('未选择工作区')) {
+    return '还没有选择要管理的文件夹，请到「设置」里选择'
+  }
+  // 鉴权失败 / API Key 问题
+  if (
+    m.includes('401') ||
+    m.includes('unauthorized') ||
+    m.includes('invalid api key') ||
+    m.includes('api key 不正确') ||
+    m.includes('API Key')
+  ) {
+    return 'API Key 不正确或已失效，请检查后重试'
+  }
+  // 403 无权限
+  if (m.includes('403') || m.includes('forbidden')) {
+    return '没有权限访问该服务，请检查账号权限或 API Key'
+  }
+  // 429 限流
+  if (m.includes('429') || m.includes('rate limit') || m.includes('too many requests')) {
+    return '请求太频繁被限流了，稍等片刻再试'
+  }
+  // 模型不存在
+  if (m.includes('model not found') || m.includes('模型不存在') || /model\s+"[^"]+"\s+not found/.test(m)) {
+    return '模型名称不正确，请检查模型设置'
+  }
+  // 未匹配：原样返回（不吞掉可读信息）
+  return m
 }
 
 function fromBindingError(err: unknown, fallback: string = '请求失败'): AppError {
@@ -35,8 +86,38 @@ function fromBindingError(err: unknown, fallback: string = '请求失败'): AppE
 export async function getWorkspaceInfo(): Promise<any> {
   try { return await WorkspaceService.Info() } catch (e) { throw fromBindingError(e) }
 }
-export async function initWorkspace(req: { workspacePath: string }): Promise<void> {
-  try { await WorkspaceService.Init({ workspace: req.workspacePath }) } catch (e) { throw fromBindingError(e) }
+export async function initWorkspace(req: InitRequest): Promise<void> {
+  try {
+    // 完整传递工作区路径 + markitdown/llm/embed/rerank 配置区块，
+    // 后端在初始化时一并落盘（修复：此前只传 workspace，AI 配置被静默丢弃）
+    await WorkspaceService.Init({
+      workspace: req.workspacePath,
+      markitdown: {
+        pythonPath: req.markitdown?.pythonPath || '',
+        command: req.markitdown?.command || '',
+      },
+      // 绑定签名：llm 可空（null）；embed/rerank 为必填对象，未配置时传空对象
+      llm: req.llm
+        ? {
+            baseUrl: req.llm.baseUrl || '',
+            apiKey: req.llm.apiKey || '',
+            model: req.llm.model || '',
+            temperature: req.llm.temperature || 0,
+          }
+        : null,
+      embed: {
+        baseUrl: req.embed?.baseUrl || '',
+        apiKey: req.embed?.apiKey || '',
+        model: req.embed?.model || '',
+        dimensions: req.embed?.dimensions || 0,
+      },
+      rerank: {
+        baseUrl: req.rerank?.baseUrl || '',
+        apiKey: req.rerank?.apiKey || '',
+        model: req.rerank?.model || '',
+      },
+    })
+  } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 文件 ────────
@@ -46,14 +127,14 @@ export async function listFiles(
   _opts?: { signal?: AbortSignal },
 ): Promise<any> {
   try {
-    const res = await FilesService.List({ status: params.status || '', tag: params.tag || '', page: params.page || 0, pageSize: params.pageSize || 50, sort: params.sort || '' })
-    return { data: { code: 'ok', data: res } }
+    // Wails 绑定直接返回 { items, total, page }，不再包装 HTTP 信封
+    return await FilesService.List({ status: params.status || '', tag: params.tag || '', page: params.page || 0, pageSize: params.pageSize || 50, sort: params.sort || '', windowHours: 0 })
   } catch (e) { throw fromBindingError(e) }
 }
 export async function getRecentFiles(params?: { window?: number; limit?: number }): Promise<any> {
   try {
-    const res = await FilesService.Recent({ status: '', tag: '', page: 0, pageSize: params?.limit || 20, sort: '' })
-    return { data: { code: 'ok', data: res } }
+    // windowHours 透传后端换算时间窗（修复：此前 window 参数被丢弃、时间窗筛选失效）
+    return await FilesService.Recent({ status: '', tag: '', page: 0, pageSize: params?.limit || 50, sort: '', windowHours: params?.window || 0 })
   } catch (e) { throw fromBindingError(e) }
 }
 export async function getFile(id: number): Promise<any> {
@@ -62,7 +143,7 @@ export async function getFile(id: number): Promise<any> {
 export async function getFileHistory(id: number): Promise<any> {
   try {
     const res = await FilesService.History(id)
-    return { data: { code: 'ok', data: { commits: res?.commits || [] } } }
+    return { commits: res?.commits || [] }
   } catch (e) { throw fromBindingError(e) }
 }
 export async function downloadHistoryVersion(relPath: string, hash: string): Promise<Blob> {
@@ -88,8 +169,7 @@ export async function updateFileTags(id: number, add: string[], remove: string[]
 
 export async function searchFiles(params: { q: string; tag?: string; page?: number }): Promise<any> {
   try {
-    const res = await SearchService.Search({ q: params.q, tag: params.tag || '', page: params.page || 0, tagFilter: [] })
-    return { data: { code: 'ok', data: res } }
+    return await SearchService.Search({ q: params.q, tag: params.tag || '', page: params.page || 0, tagFilter: [] })
   } catch (e) { throw fromBindingError(e) }
 }
 export async function reindexAll(): Promise<void> {
@@ -103,21 +183,24 @@ export async function retryFile(id: number): Promise<void> {
 
 export async function browseDir(path?: string): Promise<any> {
   try {
-    const res = await BrowseService.Dir({ path: path || '' })
-    return { data: { code: 'ok', data: res } }
+    return await BrowseService.Dir({ path: path || '' })
   } catch (e) { throw fromBindingError(e) }
 }
 export async function browseSearch(q: string, limit?: number): Promise<any> {
   try {
     const res = await BrowseService.SearchByName({ q, limit: limit || 100 })
-    return { data: { code: 'ok', data: res } }
+    // 后端返回 { results, total }，前端统一按 { items, total } 消费（与语义搜索形状一致）
+    return { items: res?.results || [], total: res?.total || 0 }
   } catch (e) { throw fromBindingError(e) }
 }
 export async function browseOpen(relPath: string): Promise<void> {
   try { await BrowseService.OpenFile(relPath) } catch (e) { throw fromBindingError(e) }
 }
-export async function browsePickDir(initial?: string): Promise<any> {
-  try { return await BrowseService.PickDir(initial || '') } catch (e) { throw fromBindingError(e) }
+export async function browsePickDir(initial?: string, kind?: string): Promise<any> {
+  try {
+    const res: any = await BrowseService.PickDir({ initial: initial || "", kind: kind || "dir" })
+    return { path: res?.path || "", cancelled: !res?.path }
+  } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 标签 ────────
@@ -125,13 +208,13 @@ export async function browsePickDir(initial?: string): Promise<any> {
 export async function listTags(): Promise<any> {
   try {
     const res = await TagsService.List()
-    return { data: { code: 'ok', data: { tags: res?.tags || [] } } }
+    return res?.tags || []
   } catch (e) { throw fromBindingError(e) }
 }
 export async function listTagSuggestions(): Promise<any> {
   try {
     const res = await TagsService.Suggestions()
-    return { data: { code: 'ok', data: { suggestions: res?.suggestions || [] } } }
+    return res?.suggestions || []
   } catch (e) { throw fromBindingError(e) }
 }
 export async function acceptSuggestion(id: number): Promise<void> {
@@ -146,27 +229,38 @@ export async function rejectSuggestion(id: number): Promise<void> {
 export async function listQASessions(): Promise<any> {
   try {
     const res = await QAService.Sessions()
-    return { data: { code: 'ok', data: { sessions: res?.sessions || [] } } }
+    return res?.sessions || []
   } catch (e) { throw fromBindingError(e) }
 }
 export async function getQAMessages(sessionId: number): Promise<any> {
   try {
     const res = await QAService.Messages(sessionId)
-    return { data: { code: 'ok', data: { messages: res?.messages || [] } } }
+    return res?.messages || []
   } catch (e) { throw fromBindingError(e) }
 }
 export async function askQuestionStream(
   params: { question: string; mode: string; fileId?: number; sessionId?: number },
   onChunk: (chunk: string) => void,
-  onDone: (result: { sessionId: number; sources: any[] }) => void,
+  onDone: (result: { sessionId: number; sources: any[]; answer?: string }) => void,
   onError: (err: string) => void,
   signal: AbortSignal,
 ): Promise<void> {
+  // 流式事件 id 由前端生成并随请求回传后端（qa:chunk:<id> / qa:done:<id> / qa:error:<id>）。
+  // 事件名是订阅/emit 双向握手，id 必须同源，否则后端 emit 的事件前端永远收不到
+  // （修复：此前两端各自生成 id，问答事件永不匹配、sending 卡死）。
   const id = Date.now() + '-' + Math.random().toString(36).slice(2, 8)
   const evChunk = 'qa:chunk:' + id, evDone = 'qa:done:' + id, evError = 'qa:error:' + id
   let cancelled = false
-  const cleanup = () => { cancelled = true; Events.Off(evChunk); Events.Off(evDone); Events.Off(evError) }
-  signal.addEventListener('abort', () => { if (!cancelled) { cleanup(); onError('已取消') } })
+  const cleanup = () => {
+    if (cancelled) return
+    cancelled = true
+    signal.removeEventListener('abort', onAbort)
+    Events.Off(evChunk)
+    Events.Off(evDone)
+    Events.Off(evError)
+  }
+  const onAbort = () => { if (!cancelled) { cleanup(); onError('已取消') } }
+  signal.addEventListener('abort', onAbort)
   try {
     Events.On(evChunk, (payload: any) => {
       if (cancelled) return
@@ -177,7 +271,7 @@ export async function askQuestionStream(
       if (cancelled) return
       cleanup()
       const data = typeof payload === 'string' ? JSON.parse(payload) : payload?.data || payload
-      onDone({ sessionId: data?.sessionId || 0, sources: data?.sources || [] })
+      onDone({ sessionId: data?.sessionId || 0, sources: data?.sources || [], answer: data?.answer || '' })
     })
     Events.On(evError, (payload: any) => {
       if (cancelled) return
@@ -185,10 +279,15 @@ export async function askQuestionStream(
       const err = typeof payload === 'string' ? payload : payload?.data || '连接中断，请重试'
       onError(err as string)
     })
-    await QAService.AskStream({ question: params.question, mode: params.mode, fileId: params.fileId || 0, sessionId: params.sessionId || 0 }, '')
+    await QAService.AskStream({ question: params.question, mode: params.mode, fileId: params.fileId || 0, sessionId: params.sessionId || 0, requestId: id }, '')
+    // 后端流已结束但未发出 done/error（异常路径）：视为连接中断，避免 sending 永久卡死
+    if (!cancelled) {
+      cleanup()
+      onError('连接中断，请重试')
+    }
   } catch (e) {
     cleanup()
-    onError(fromBindingError(e, '请求失败').message)
+    onError(translateApiError(fromBindingError(e, '请求失败').message))
   }
 }
 export async function deleteQASession(id: number): Promise<void> {
@@ -199,8 +298,7 @@ export async function deleteQASession(id: number): Promise<void> {
 
 export async function getStats(params?: { range?: string; from?: number; to?: number }): Promise<any> {
   try {
-    const res = await StatsService.Get({ range: params?.range || '', from: params?.from || 0, to: params?.to || 0 })
-    return { data: { code: 'ok', data: res } }
+    return await StatsService.Get({ range: params?.range || '', from: params?.from || 0, to: params?.to || 0 })
   } catch (e) { throw fromBindingError(e) }
 }
 export async function exportStats(format: string, params?: { range?: string }): Promise<Blob> {
@@ -250,10 +348,10 @@ export async function getCommitFiles(commitHash: string): Promise<any[]> {
     return res?.files || []
   } catch (e) { throw fromBindingError(e) }
 }
-export async function getCommitDiff(commitHash: string): Promise<any> {
+export async function getCommitDiff(commitHash: string): Promise<any[]> {
   try {
     const res = await CommitsService.TreeAt(commitHash)
-    return { data: { code: 'ok', data: { files: res?.files || [] } } }
+    return res?.files || []
   } catch (e) { throw fromBindingError(e) }
 }
 
@@ -293,10 +391,16 @@ export async function fetchModels(params: { kind: 'chat' | 'embed' | 'rerank'; b
   } catch (e) { throw fromBindingError(e) }
 }
 export interface PythonDetectResult {
-  path: string; ok: boolean; version?: string; markitdownCmd?: string; error?: string
+  path: string; ok: boolean; version?: string; markitdownCmd?: string; markitdownVersion?: string; error?: string
 }
 export async function detectPython(): Promise<PythonDetectResult> {
   try { return (await TestService.DetectPython()) as PythonDetectResult } catch (e) { throw fromBindingError(e) }
+}
+export interface MarkitdownProbeResult {
+  path: string; version?: string; ok: boolean; error?: string
+}
+export async function probeMarkitdown(pythonPath?: string): Promise<MarkitdownProbeResult> {
+  try { return (await TestService.ProbeMarkitdown(pythonPath || '')) as MarkitdownProbeResult } catch (e) { throw fromBindingError(e) }
 }
 
 // ──────── 任务队列 ────────

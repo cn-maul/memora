@@ -17,8 +17,8 @@ export function OpenFile(relPath: string): $CancellablePromise<void> {
     return $Call.ByID(1256274500, relPath);
 }
 
-export function PickDir(initial: string): $CancellablePromise<$models.PickDirectoryResult | null> {
-    return $Call.ByID(1834131498, initial);
+export function PickDir(req: $models.PickDirRequest): $CancellablePromise<$models.PickDirectoryResult | null> {
+    return $Call.ByID(1834131498, req);
 }
 
 export function SearchByName(req: $models.BrowseSearchRequest): $CancellablePromise<$models.BrowseSearchResponse | null> {

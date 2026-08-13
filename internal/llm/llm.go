@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,23 @@ import (
 	"memora/internal/logx"
 )
 
+// rateLimiter 按服务独立限频器，互不阻塞（A4：重建索引时嵌入流量不再挤占聊天）
+type rateLimiter struct {
+	mu          sync.Mutex
+	lastReqTime time.Time
+	rate        time.Duration
+}
+
+func (r *rateLimiter) wait() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	elapsed := time.Since(r.lastReqTime)
+	if elapsed < r.rate {
+		time.Sleep(r.rate - elapsed)
+	}
+	r.lastReqTime = time.Now()
+}
+
 // Module 模型网关
 type Module struct {
 	httpClient   *http.Client // 普通请求（整体 60s 超时）
@@ -26,9 +44,10 @@ type Module struct {
 	config       ConfigProvider
 	credStore    credstore.Store // 凭据存储（DPAPI 加密），未注入时回退 config 明文
 
-	mu          sync.Mutex
-	lastReqTime time.Time
-	rateLimit   time.Duration // 限频间隔（默认 50ms = 20 rps）
+	// A4：按服务拆分独立限频器，互不阻塞
+	chatLimiter   rateLimiter
+	embedLimiter  rateLimiter
+	rerankLimiter rateLimiter
 }
 
 // New 创建模型网关模块
@@ -40,7 +59,10 @@ func New(cfg ConfigProvider) *Module {
 		httpClient:   newHTTPClient(transport),
 		streamClient: newStreamClient(transport),
 		config:       cfg,
-		rateLimit:    50 * time.Millisecond, // 20 rps
+		chatLimiter:  rateLimiter{rate: 50 * time.Millisecond},
+		// 嵌入/重排是批量高频调用（索引 & 全局检索），放宽限频避免拖累吞吐
+		embedLimiter:  rateLimiter{rate: 20 * time.Millisecond},
+		rerankLimiter: rateLimiter{rate: 20 * time.Millisecond},
 	}
 }
 
@@ -132,7 +154,7 @@ func (m *Module) Chat(system, user string, opts *contract.ChatOptions) (string, 
 
 	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
 
-	data, err := m.retry(func() ([]byte, error) {
+	data, err := m.retry(&m.chatLimiter, func() ([]byte, error) {
 		return m.doRequest("POST", url, reqBody, apiKey)
 	})
 	if err != nil {
@@ -229,7 +251,7 @@ func (m *Module) ChatStream(system, user string, opts *contract.ChatOptions, can
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
 
-		m.rateLimitWait()
+		m.chatLimiter.wait()
 
 		// 流式请求用 streamClient（无整体超时，长回答不被截断）
 		resp, err = m.streamClient.Do(req)
@@ -440,9 +462,28 @@ func (m *Module) ChatJSON(system, user, schemaDesc string, result interface{}) e
 	}
 
 	if err := json.Unmarshal([]byte(content), result); err != nil {
+		// C3：宽松 JSON 清洗——提取首个 { ... } 块重试解析，
+		// 应对模型在 JSON 外包裹 Markdown 或多余前缀导致解析失败的情况
+		if cleaned, ok := extractJSONBlock(content); ok {
+			if perr := json.Unmarshal([]byte(cleaned), result); perr == nil {
+				return nil
+			}
+		}
 		return fmt.Errorf("[llm] 解析 JSON 响应失败: %w\n原文: %s", err, content)
 	}
 	return nil
+}
+
+// extractJSONBlock 从含 Markdown/多余前缀的文本中提取首个 { ... } 块。
+// 返回 ok=false 表示未找到合法闭合块。
+var jsonBlockRe = regexp.MustCompile(`[{][^{].*?[}]`)
+
+func extractJSONBlock(s string) (string, bool) {
+	m := jsonBlockRe.FindStringIndex(s)
+	if m == nil {
+		return "", false
+	}
+	return strings.TrimSpace(s[m[0]:m[1]]), true
 }
 
 // TestChat 测试聊天端点（使用已保存配置）
@@ -471,7 +512,7 @@ func (m *Module) TestChatWith(baseURL, apiKey, model string, temperature float64
 		Temperature: temperature,
 		MaxTokens:   10,
 	}
-	data, err := m.retry(func() ([]byte, error) {
+	data, err := m.retry(&m.chatLimiter, func() ([]byte, error) {
 		return m.doRequest("POST", url, reqBody, apiKey)
 	})
 	if err != nil {

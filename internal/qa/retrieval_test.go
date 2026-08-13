@@ -125,7 +125,7 @@ func TestBuildContextFileModeBatchFilters(t *testing.T) {
 		},
 	}
 	st := &batchFakeStorage{fakeStorage: inner}
-	m := New(st, &fakeLLM{}, &fakeEvents{}, 100)
+	m := New(st, &fakeLLM{}, &fakeEvents{}, 100, "")
 
 	blocks, sources, err := m.buildContext(&contract.QARequest{Question: "问题", Mode: "file", FileID: 1})
 	if err != nil {
