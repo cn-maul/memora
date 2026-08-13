@@ -5,11 +5,11 @@
 	"info": {
 		"0000": {
 			"ProductVersion": "0.1.0",
-			"CompanyName": "My Company",
-			"FileDescription": "A memora-test application",
-			"LegalCopyright": "© 2026, My Company",
-			"ProductName": "My Product",
-			"Comments": "This is a comment"
+			"CompanyName": "Memora",
+			"FileDescription": "Memora 智能文档库 - 本地知识库与 RAG 问答",
+			"LegalCopyright": "© 2025, Memora",
+			"ProductName": "Memora",
+			"Comments": "Memora 智能文档库"
 		}
 	}
 }

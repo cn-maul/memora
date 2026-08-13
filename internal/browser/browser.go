@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 
 	"memora/internal/documentpolicy"
 )
@@ -213,7 +214,8 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 	Write-Output $dialog.SelectedPath
 }
 `
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-STA", "-Command", script)
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("[browser] 打开目录选择失败: %w", err)

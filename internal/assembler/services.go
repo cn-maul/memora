@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -789,6 +791,7 @@ func (s *TestService) TestLLM(req LLMTestRequest) (*LLMTestResult, error) {
 }
 
 func (s *TestService) DetectPython() (*PythonDetectResult, error) {
+	// 1. 先查 PATH（排除 Windows Store 假 python）
 	candidates := []string{"python", "python3", "py"}
 	for _, c := range candidates {
 		p, err := exec.LookPath(c)
@@ -799,16 +802,89 @@ func (s *TestService) DetectPython() (*PythonDetectResult, error) {
 			continue
 		}
 		if _, err := os.Stat(p); err == nil {
-			found := &PythonDetectResult{
+			return &PythonDetectResult{
 				Path:          p,
 				Ok:            true,
 				Version:       probePyVersion(p),
-				MarkitdownCmd: strings.Replace(`python -m markitdown "{file}"`, "python", p, 1),
-			}
-			return found, nil
+				MarkitdownCmd: formatMarkitdownCmd(p),
+			}, nil
 		}
 	}
+
+	// 2. 搜索 Windows 常见 Python 安装目录
+	if runtime.GOOS == "windows" {
+		localAppData := os.Getenv("LOCALAPPDATA")
+		if localAppData == "" {
+			u, err := user.Current()
+			if err == nil {
+				localAppData = filepath.Join(u.HomeDir, "AppData", "Local")
+			}
+		}
+		if localAppData != "" {
+			// 2a. Windows Store Python: %LOCALAPPDATA%\Python\pythoncore-<version>-64\python.exe
+			pythonDir := filepath.Join(localAppData, "Python")
+			if entries, err := os.ReadDir(pythonDir); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() && strings.HasPrefix(entry.Name(), "pythoncore-") {
+						candidate := filepath.Join(pythonDir, entry.Name(), "python.exe")
+						if _, err := os.Stat(candidate); err == nil {
+							return &PythonDetectResult{
+								Path:          candidate,
+								Ok:            true,
+								Version:       probePyVersion(candidate),
+								MarkitdownCmd: formatMarkitdownCmd(candidate),
+							}, nil
+						}
+					}
+				}
+			}
+			// 2b. 常规安装器: %LOCALAPPDATA%\Programs\Python\Python<version>\python.exe
+			programsDir := filepath.Join(localAppData, "Programs", "Python")
+			if entries, err := os.ReadDir(programsDir); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() && strings.HasPrefix(entry.Name(), "Python") {
+						candidate := filepath.Join(programsDir, entry.Name(), "python.exe")
+						if _, err := os.Stat(candidate); err == nil {
+							return &PythonDetectResult{
+								Path:          candidate,
+								Ok:            true,
+								Version:       probePyVersion(candidate),
+								MarkitdownCmd: formatMarkitdownCmd(candidate),
+							}, nil
+						}
+					}
+				}
+			}
+		}
+		// 2c. Program Files: C:\Program Files\Python<version>\python.exe
+		programFiles := os.Getenv("PROGRAMFILES")
+		if programFiles != "" {
+			pythonDir := filepath.Join(programFiles, "Python")
+			if entries, err := os.ReadDir(pythonDir); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() && strings.HasPrefix(entry.Name(), "Python") {
+						candidate := filepath.Join(pythonDir, entry.Name(), "python.exe")
+						if _, err := os.Stat(candidate); err == nil {
+							return &PythonDetectResult{
+								Path:          candidate,
+								Ok:            true,
+								Version:       probePyVersion(candidate),
+								MarkitdownCmd: formatMarkitdownCmd(candidate),
+							}, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return &PythonDetectResult{Ok: false, Error: "未检测到 Python"}, nil
+}
+
+func formatMarkitdownCmd(path string) string {
+	// Windows 路径用反斜杠，需要转义
+	p := strings.ReplaceAll(filepath.ToSlash(path), `/`, `\\`)
+	return fmt.Sprintf(`"%s" -m markitdown "{file}"`, p)
 }
 
 func probePyVersion(path string) string {
